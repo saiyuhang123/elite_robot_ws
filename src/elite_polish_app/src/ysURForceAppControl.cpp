@@ -104,6 +104,11 @@ namespace elite_robot {
           contact_timeout_ = this->declare_parameter<double>("contact_timeout", 90.0);
           contact_ik_max_failures_ = std::max(
             1, static_cast<int>(this->declare_parameter<int>("contact_ik_max_failures", 5)));
+          // TRAC-IK 原先只有 5ms：定位/Nav2 并行运行时，线程调度抖动会把本来可解的
+          // 目标误报为无解。50ms 对慢速打磨几乎无时序影响，同时仍限制故障求解开销。
+          ik_timeout_ = std::max(0.005, this->declare_parameter<double>("ik_timeout", 0.05));
+          startup_ik_attempts_ = std::max(
+            1, static_cast<int>(this->declare_parameter<int>("startup_ik_attempts", 3)));
           debug_approach_time_ = this->declare_parameter<double>("debug_approach_time", 4.0);//空跑接近轨迹时长(s)
           control_dt_index_ = 0;
           //polish data
@@ -145,6 +150,7 @@ namespace elite_robot {
 
           ys_cur_q_.resize(joint_size_);
           ys_cur_vel.resize(joint_size_);
+          polish_startup_target_q_.resize(joint_size_);
           for (int i = 0; i < joint_size_; ++i) {
               ys_cur_q_(i) = 0;
               ys_cur_vel(i) = 0;
@@ -260,9 +266,12 @@ namespace elite_robot {
                   RCLCPP_FATAL(this->get_logger(),"Couldn't find chain %s to %s", ys_base.c_str(), ys_tip_link.c_str());
                 }
                 //ik tcp
-                double timeout=0.005;
                 double joint_eps = 1e-5;
-                ys_tcp_tracik_solver_ = new TRAC_IK::TRAC_IK(ys_base, ys_tip_link, xml_string, timeout, joint_eps);
+                ys_tcp_tracik_solver_ = new TRAC_IK::TRAC_IK(
+                  ys_base, ys_tip_link, xml_string, ik_timeout_, joint_eps);
+                RCLCPP_INFO(this->get_logger(),
+                  "TRAC-IK configured: timeout=%.1f ms, startup_attempts=%d",
+                  ik_timeout_ * 1000.0, startup_ik_attempts_);
             } else {
                 RCLCPP_FATAL(this->get_logger(),"Failed to extract kdl tree from xml robot description");
             }
@@ -1004,19 +1013,38 @@ namespace elite_robot {
           moveFrame.M = KDL::Rotation::RPY(0,0,0);
           upFrame = startPos * moveFrame;
           KDL::JntArray ys_resultJnt(joint_size_);
-          int rc = ys_tcp_tracik_solver_->CartToJnt(ys_polishBase_q_, upFrame, ys_resultJnt);
-          // IK 失败(rc!=1)时 ys_resultJnt 是未初始化垃圾；构型跳变时机械臂会猛甩。
+          ys_resultJnt = ys_polishBase_q_;
+          polish_startup_target_valid_ = false;
+          int rc = -1;
+          for (int attempt = 1; attempt <= startup_ik_attempts_; ++attempt) {
+            ys_resultJnt = ys_polishBase_q_;
+            const auto solve_start = std::chrono::steady_clock::now();
+            rc = ys_tcp_tracik_solver_->CartToJnt(
+              ys_polishBase_q_, upFrame, ys_resultJnt);
+            const double solve_ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - solve_start).count();
+            if (rc > 0) {
+              RCLCPP_INFO(this->get_logger(),
+                "polish start-up IK solved: rc=%d attempt=%d/%d elapsed=%.3f ms",
+                rc, attempt, startup_ik_attempts_, solve_ms);
+              break;
+            }
+            RCLCPP_WARN(this->get_logger(),
+              "polish start-up IK attempt failed: rc=%d attempt=%d/%d elapsed=%.3f ms timeout=%.1f ms",
+              rc, attempt, startup_ik_attempts_, solve_ms, ik_timeout_ * 1000.0);
+          }
+          // IK 失败(rc<=0)时绝不使用输出；构型跳变时机械臂会猛甩。
           // 两种情况都中止流程，绝不把目标发出去（2026-07-27 悬空狂晃事故的修复）
           // 分关节检查: 关节1~5 限 90°（防翻肩/翻肘/翻腕），wrist_3 放宽到 170°——
           // 打磨头是旋转体，工具绕自身 z 多转不影响功能（2026-07-27 误伤修复）
           bool branch_jump = false;
-          if (rc == 1) {
+          if (rc > 0) {
             for (int j = 0; j < joint_size_; j++) {
               double lim = (j == joint_size_ - 1) ? M_PI * 0.95 : M_PI / 2;
               if (std::fabs(ys_polishBase_q_(j) - ys_resultJnt(j)) > lim) { branch_jump = true; break; }
             }
           }
-          if (rc != 1 || branch_jump) {
+          if (rc <= 0 || branch_jump) {
             RCLCPP_ERROR(this->get_logger(),
               "polish start up target unreachable or branch jump (rc=%d, branch_jump=%d), polish aborted. "
               "Check vision frame / polishBase seed.", rc, (int)branch_jump);
@@ -1027,6 +1055,8 @@ namespace elite_robot {
             abortPolishing("打磨预备目标 IK 不可达或发生跳支", false);
             return;
           }
+          polish_startup_target_q_ = ys_resultJnt;
+          polish_startup_target_valid_ = true;
           RCLCPP_INFO(this->get_logger()," polish start up target, %f, %f, %f, %f, %f, %f", 
             ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
           //polish start up point
@@ -1076,6 +1106,7 @@ namespace elite_robot {
         approach_lateral_done_ = false;
         contact_hold_started_ = false;
         contact_ik_failure_count_ = 0;
+        polish_startup_target_valid_ = false;
         force_mode_verify_stable_ = false;
         force_mode_overforce_active_ = false;
         force_mode_hard_overforce_active_ = false;
@@ -1123,7 +1154,7 @@ namespace elite_robot {
         // 位置保持当前TCP点、姿态转到 rot: 402逼近前需把姿态从示教值转到视觉拟合值再重新去皮。
         KDL::JntArray targetJnt(joint_size_);
         const KDL::Frame target(rot, ys_curP_tcp_.p);
-        if (ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, target, targetJnt) != 1) {
+        if (ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, target, targetJnt) <= 0) {
           RCLCPP_WARN(this->get_logger(), "orientation hold IK failed; holding current joints");
           publishCurrentPositionHold(duration_sec);
           return;
@@ -1147,20 +1178,18 @@ namespace elite_robot {
           return;
         }
 
-        KDL::Frame startPos = frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
-        KDL::Frame moveFrame;
-        moveFrame.p = KDL::Vector(0, 0, dz_polish_startup_tool_);
-        moveFrame.M = KDL::Rotation::Identity();
-        const KDL::Frame upFrame = startPos * moveFrame;
-        KDL::JntArray targetJnt(joint_size_);
-        const int rc = ys_tcp_tracik_solver_->CartToJnt(ys_polishBase_q_, upFrame, targetJnt);
-        if (rc != 1) {
-          RCLCPP_ERROR(this->get_logger(), "polish start-up IK failed while waiting; polish aborted");
-          abortPolishing("等待打磨预备位时 IK 求解失败", false);
+        // 400 已经对该目标完成 IK、重试和跳支检查。等待阶段只检查缓存的关节目标，
+        // 避免在 4ms 定时器内反复求同一个 IK，因 CPU 调度抖动产生假性“无解”。
+        if (!polish_startup_target_valid_
+            || polish_startup_target_q_.rows() != static_cast<unsigned int>(joint_size_)) {
+          RCLCPP_ERROR(this->get_logger(),
+            "polish start-up target cache invalid while waiting; polish aborted");
+          abortPolishing("等待打磨预备位时目标缓存无效", false);
           return;
         }
 
-        const bool pose_reached = KDL::Equal(ys_cur_q_, targetJnt, joint_eps_);
+        const bool pose_reached = KDL::Equal(
+          ys_cur_q_, polish_startup_target_q_, joint_eps_);
         const bool robot_still = maxJointSpeed() <= contact_joint_velocity_limit_;
         if (!pose_reached || !robot_still) {
           contact_settle_started_ = false;
@@ -1351,7 +1380,7 @@ namespace elite_robot {
               KDL::Frame startPos = frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
               KDL::JntArray targetJnt(joint_size_);
               int rc = ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, startPos, targetJnt);
-              if (rc != 1) {
+              if (rc <= 0) {
                 RCLCPP_ERROR(this->get_logger(),"DEBUG approach IK failed (rc=%d), abort", rc);
                 abortPolishing("空跑接近目标 IK 求解失败", false);
                 return;
@@ -1629,7 +1658,7 @@ namespace elite_robot {
               approach_lateral_start_ = now;
               KDL::JntArray latJnt(joint_size_);
               const KDL::Frame latTarget(curFrame.M, ys_curP_tcp_.p + lateral);
-              if (ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, latTarget, latJnt) != 1) {
+              if (ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, latTarget, latJnt) <= 0) {
                 RCLCPP_WARN(this->get_logger(),
                   "402 lateral align IK failed; descending without lateral correction");
                 approach_lateral_done_ = true;
@@ -1678,7 +1707,7 @@ namespace elite_robot {
             const KDL::Frame targetFrame = curFrame * moveFrame;
             targetJnt = ys_cur_q_;
             last_rc = ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, targetFrame, targetJnt);
-            if (last_rc == 1 && KDL::Equal(ys_cur_q_, targetJnt, M_PI / 10)) {
+            if (last_rc > 0 && KDL::Equal(ys_cur_q_, targetJnt, M_PI / 10)) {
               solved_attempt = attempt;
               solved_step = contact_step_ * step_scale;
               break;
@@ -1860,7 +1889,7 @@ namespace elite_robot {
             moveFrame.M = KDL::Rotation::RPY(0,0,0);
             upFrame = moveFrame * curFrame;
             int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, upFrame, ys_resultJnt);
-            if (rc == 1) {
+            if (rc > 0) {
               if (!KDL::Equal(lastQ, ys_resultJnt, M_PI/10)) {
                 RCLCPP_FATAL(this->get_logger()," ys_resultJnt  lastQ, %f, %f, %f, %f, %f, %f", 
                   lastQ(0)*180/M_PI, lastQ(1)*180/M_PI, lastQ(2)*180/M_PI, lastQ(3)*180/M_PI, lastQ(4)*180/M_PI, lastQ(5)*180/M_PI);
@@ -2204,7 +2233,7 @@ namespace elite_robot {
               return;
             }
             int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, tmpFrame, ys_resultJnt);
-            if (rc == 1) {
+            if (rc > 0) {
               if (!KDL::Equal(lastQ, ys_resultJnt, M_PI/10)) {
                 RCLCPP_FATAL(this->get_logger()," curve polish target %d lastQ, %f, %f, %f, %f, %f, %f", i+1,
                   lastQ(0)*180/M_PI, lastQ(1)*180/M_PI, lastQ(2)*180/M_PI, lastQ(3)*180/M_PI, lastQ(4)*180/M_PI, lastQ(5)*180/M_PI);

@@ -320,6 +320,10 @@ namespace elite_robot {
             KDL::Chain ys_tcp_chain_;
             KDL::ChainFkSolverPos_recursive *ys_tcp_fk_solver_;
             TRAC_IK::TRAC_IK *ys_tcp_tracik_solver_;
+            double ik_timeout_ = 0.05;//TRAC-IK 单次求解最长时间(s)
+            int startup_ik_attempts_ = 3;//打磨预备位发布前的有限重试次数
+            KDL::JntArray polish_startup_target_q_;//已通过跳支检查的预备位关节目标
+            bool polish_startup_target_valid_ = false;
 
             //topic and service
             //app cmd

@@ -26,6 +26,9 @@ ysURForceAppControl:
     contact_max_travel: 0.25         # 从预备点沿拟合法向最大搜索距离(m)；2026-08-02 地面板预备点距板20cm
     contact_timeout: 180.0           # 实测约1.9mm/s；搜索250mm约130s，预留控制器余量
     contact_ik_max_failures: 5       # 端点IK连续失败5个周期才中止；单次超时自动缩步重试
+    # 定位/Nav2并行时5ms容易受CPU调度抖动影响；预备位求解成功后会缓存，不在4ms周期重复求解。
+    ik_timeout: 0.05                 # TRAC-IK单次最长求解时间(s)，50ms
+    startup_ik_attempts: 3           # 发布预备位轨迹前最多尝试次数；失败期间机械臂不动作
     # 空跑模式接近轨迹起点的时长(s)，越大越慢
     debug_approach_time: 4.0
 
