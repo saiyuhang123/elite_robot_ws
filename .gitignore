@@ -1,0 +1,140 @@
+# ==============================
+# ROS2 / Colcon
+# ==============================
+build/
+install/
+log/
+colcon.meta
+
+# ==============================
+# CMake
+# ==============================
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+*.cmake
+!CMakeLists.txt
+
+# ==============================
+# C / C++ build artifacts
+# ==============================
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.out
+*.app
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+*.whl
+.eggs/
+
+# ==============================
+# IDE / Editor
+# ==============================
+# VSCode
+.vscode/
+*.code-workspace
+
+# CLion / JetBrains
+.idea/
+*.iml
+cmake-build-*/
+
+# Eclipse
+.cproject
+.project
+.settings/
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+tags
+.tags
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# ==============================
+# OS generated files
+# ==============================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==============================
+# Documentation build
+# ==============================
+doc/_build/
+doc/html/
+doc/latex/
+Doxyfile.bak
+html/
+latex/
+
+# ==============================
+# Testing / Coverage
+# ==============================
+*.gcda
+*.gcno
+*.gcov
+coverage/
+htmlcov/
+.tox/
+.pytest_cache/
+
+# ==============================
+# Misc
+# ==============================
+*.log
+*.bak
+*.tmp
+*.temp
+*.orig
+core
+core.*
