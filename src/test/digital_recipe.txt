@@ -1,0 +1,2 @@
+standard_digital_output_mask
+standard_digital_output
