@@ -12,9 +12,10 @@
 1. 启动机械臂驱动：
    ros2 launch eli_cs_robot_driver elite_control.launch.py robot_ip:=192.168.1.212 cs_type:=cs66
 
-2. 启动 ROS 相机（内参由驱动按分辨率自动匹配，与标定同一条链路）：
+2. 启动 ROS 相机（开深度并与彩色对齐，目标点坐标优先从深度图直接读取）：
    ros2 launch realsense2_camera rs_launch.py camera_namespace:=camera \
-     enable_color:=true enable_depth:=false rgb_camera.color_profile:=1280x720x30 align_depth.enable:=false
+     enable_color:=true enable_depth:=true rgb_camera.color_profile:=1280x720x30 \
+     depth_module.depth_profile:=640x480x30 align_depth.enable:=true
 
 3. 运行本脚本：
    python3 visual_grasp_test.py
@@ -79,7 +80,8 @@ obj_points = np.array([
 
 
 class CameraDetector(Node):
-    """订阅相机话题，检测目标标记并解算其在相机坐标系下的位置"""
+    """订阅相机话题，检测目标标记并解算其在相机坐标系下的位置。
+    视角正(<50°)用 solvePnP（与标定同一测量体系）；斜视角用对齐深度图直接取点。"""
 
     def __init__(self):
         super().__init__('grasp_camera_detector')
@@ -87,6 +89,7 @@ class CameraDetector(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self.latest_frame = None
+        self.latest_depth = None     # 16UC1，单位 mm，与彩色图对齐
         self.latest_p_cam = None
         self.create_subscription(
             CameraInfo, '/camera/camera/color/camera_info',
@@ -94,12 +97,45 @@ class CameraDetector(Node):
         self.create_subscription(
             Image, '/camera/camera/color/image_raw',
             self.image_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            Image, '/camera/camera/aligned_depth_to_color/image_raw',
+            self.depth_cb, qos_profile_sensor_data)
 
     def camera_info_cb(self, msg):
         if self.camera_matrix is None:
             self.camera_matrix = np.array(msg.k).reshape(3, 3)
             self.dist_coeffs = np.array(msg.d)
             self.get_logger().info(f'Camera info received ({msg.width}x{msg.height})')
+
+    def depth_cb(self, msg):
+        try:
+            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1')
+        except Exception:
+            pass
+
+    def position_from_depth(self, u, v, fw, fh):
+        """用对齐深度图取 (u,v) 处的 3D 坐标（小窗口中值滤波，去零值）"""
+        if self.latest_depth is None or self.camera_matrix is None:
+            return None
+        d = self.latest_depth
+        dh, dw = d.shape
+        ud = int(u * dw / fw)
+        vd = int(v * dh / fh)
+        r = 7
+        ud = min(max(ud, r), dw - r - 1)
+        vd = min(max(vd, r), dh - r - 1)
+        win = d[vd - r:vd + r + 1, ud - r:ud + r + 1].astype(np.float32)
+        valid = win[win > 0]
+        if valid.size < 20:
+            return None
+        z = float(np.median(valid)) / 1000.0
+        if z < 0.15 or z > 3.0:
+            return None
+        fx = self.camera_matrix[0, 0]
+        fy = self.camera_matrix[1, 1]
+        cx = self.camera_matrix[0, 2]
+        cy = self.camera_matrix[1, 2]
+        return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z])
 
     def image_cb(self, msg):
         if self.camera_matrix is None:
@@ -108,6 +144,7 @@ class CameraDetector(Node):
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception:
             return
+        fh, fw = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
         self.latest_p_cam = None
@@ -115,14 +152,41 @@ class CameraDetector(Node):
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
             for idx, mid in enumerate(ids.flatten()):
                 if mid == TARGET_MARKER_ID:
+                    pts = corners[idx][0]
+                    u = float(np.mean(pts[:, 0]))
+                    v = float(np.mean(pts[:, 1]))
+
+                    # 先跑 PnP（与手眼标定同一测量体系，正视时最准）
+                    p_cam = None
+                    source = None
+                    face_angle_deg = None
                     ok, rvec, tvec = cv2.solvePnP(
-                        obj_points, corners[idx][0], self.camera_matrix, self.dist_coeffs,
+                        obj_points, pts, self.camera_matrix, self.dist_coeffs,
                         flags=cv2.SOLVEPNP_IPPE_SQUARE)
                     if ok:
                         cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
-                        self.latest_p_cam = tvec.flatten()
+                        # 入射角：标记法线与"标记->相机"视线的夹角，越小越正视
+                        normal = cv2.Rodrigues(rvec)[0][:, 2]
+                        ray = -tvec.flatten() / np.linalg.norm(tvec)
+                        face_angle_deg = float(np.degrees(np.arccos(np.clip(normal @ ray, -1, 1))))
+
+                    # 视角正(<50°)用 PnP；斜视角 PnP 误差爆炸，换深度图直接取点
+                    if ok and face_angle_deg is not None and face_angle_deg < 50.0:
+                        p_cam = tvec.flatten()
+                        source = f'pnp {face_angle_deg:.0f}°'
+                    else:
+                        p_cam = self.position_from_depth(u, v, fw, fh)
+                        if p_cam is not None:
+                            source = f'depth{"" if face_angle_deg is None else f" {face_angle_deg:.0f}°"}'
+                        elif ok:
+                            # 深度无效，只能退回 PnP（斜视角下误差大，提示用户）
+                            p_cam = tvec.flatten()
+                            source = f'pnp {face_angle_deg:.0f}°(斜视角,慎用)'
+
+                    if p_cam is not None:
+                        self.latest_p_cam = p_cam
                         cv2.putText(frame,
-                                    f"Target ID={TARGET_MARKER_ID}: [{tvec[0][0]:.3f}, {tvec[1][0]:.3f}, {tvec[2][0]:.3f}]",
+                                    f"ID={TARGET_MARKER_ID}[{source}]: [{p_cam[0]:.3f}, {p_cam[1]:.3f}, {p_cam[2]:.3f}]",
                                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         cv2.putText(frame, "Press 'G' to grasp", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -188,7 +252,8 @@ def main():
     if cam_node.camera_matrix is None:
         print("错误：收不到相机 camera_info，请检查相机驱动是否已启动：")
         print("  ros2 launch realsense2_camera rs_launch.py camera_namespace:=camera \\")
-        print("    enable_color:=true enable_depth:=false rgb_camera.color_profile:=1280x720x30 align_depth.enable:=false")
+        print("    enable_color:=true enable_depth:=true rgb_camera.color_profile:=1280x720x30 \\")
+        print("    depth_module.depth_profile:=640x480x30 align_depth.enable:=true")
         robot_node.destroy_node()
         cam_node.destroy_node()
         rclpy.shutdown()
