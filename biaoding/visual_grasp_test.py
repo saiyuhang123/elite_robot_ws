@@ -3,7 +3,7 @@
 视觉引导抓取测试脚本（集成 Elite Robot SDK）
 
 功能：
-1. 检测 ArUco 标定板 (ID=2)
+1. 检测 ArUco 标定板 (ID=0)
 2. 通过手眼标定结果计算目标在基座坐标系下的位置
 3. 使用 Elite Robot SDK (RobotCartesianControl) 控制机械臂运动到目标上方
 4. 支持夹爪控制
@@ -12,7 +12,11 @@
 1. 启动机械臂驱动：
    ros2 launch eli_cs_robot_driver elite_control.launch.py robot_ip:=192.168.1.212 cs_type:=cs66
 
-2. 运行本脚本：
+2. 启动 ROS 相机（内参由驱动按分辨率自动匹配，与标定同一条链路）：
+   ros2 launch realsense2_camera rs_launch.py camera_namespace:=camera \
+     enable_color:=true enable_depth:=false rgb_camera.color_profile:=1280x720x30 align_depth.enable:=false
+
+3. 运行本脚本：
    python3 visual_grasp_test.py
 """
 
@@ -22,7 +26,11 @@ import json
 from scipy.spatial.transform import Rotation as Rot
 
 import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.executors import MultiThreadedExecutor
+from sensor_msgs.msg import Image, CameraInfo
+from cv_bridge import CvBridge
 import sys
 import os
 import time
@@ -38,49 +46,24 @@ from elite_robot_example.robot_cartesian_control import RobotCartesianControl
 ROBOT_IP = "192.168.1.212"
 CARTESIAN_TOOL = os.path.join(os.path.dirname(__file__), "cartesian_move")
 
+# 手动补偿量（米）：改正 TCP/标定的固定偏移
+# 正值为正方向偏移，试出来之后填这里，不用重新标定
+MANUAL_OFFSET_X = 0.00  # 机器人基座 X 方向
+MANUAL_OFFSET_Y = 0.00  # 机器人基座 Y 方向
+MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
+
+# 接近高度（米）：移动到目标点"正上方"这么高；设为 0 = 直接移动到目标点（用于验证到位精度）
+APPROACH_HEIGHT = 0.00
+
+# CS66 几何参数（用于可达性预检，见 default_kinematics.yaml）
+SHOULDER_Z = 0.1625   # 肩关节距基座高度
+ARM_REACH = 0.92      # 大臂0.427 + 小臂0.3905 + 腕部余量，约等于最大臂展
+
 
 # ==========================================================
-# 1. 从 RealSense 相机获取真实内参
+# 1. ArUco 检测节点（走 ROS 相机话题，内参来自 camera_info，
+#    与手眼标定/验证用的是同一条链路，分辨率自动匹配）
 # ==========================================================
-def get_realsense_intrinsics():
-    """从 RealSense 相机获取出厂标定内参"""
-    try:
-        import pyrealsense2 as rs
-        pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        pipe.start(cfg)
-        # 等待几帧稳定
-        for _ in range(30):
-            pipe.wait_for_frames()
-        profile = pipe.get_active_profile()
-        color_profile = rs.video_stream_profile(profile.get_stream(rs.stream.color))
-        intr = color_profile.get_intrinsics()
-        pipe.stop()
-        camera_matrix = np.array(
-            [[intr.fx, 0, intr.ppx],
-             [0, intr.fy, intr.ppy],
-             [0, 0, 1]], dtype=np.float32)
-        dist_coeffs = np.array(intr.coeffs, dtype=np.float32)
-        print(f"RealSense 内参: fx={intr.fx:.2f}, fy={intr.fy:.2f}, "
-              f"cx={intr.ppx:.2f}, cy={intr.ppy:.2f}")
-        print(f"畸变系数: {intr.coeffs}")
-        return camera_matrix, dist_coeffs
-    except ImportError:
-        print("警告: pyrealsense2 未安装，使用默认内参")
-    except Exception as e:
-        print(f"警告: 获取 RealSense 内参失败 ({e})，使用默认内参")
-
-    # 回退到默认值
-    camera_matrix = np.array([[611.69867, 0.0, 326.48343],
-                              [0.0, 610.4816, 242.60501],
-                              [0.0, 0.0, 1.0]], dtype=np.float32)
-    dist_coeffs = np.zeros((5, 1), dtype=np.float32)
-    return camera_matrix, dist_coeffs
-
-
-camera_matrix, dist_coeffs = get_realsense_intrinsics()
-
 marker_size = 0.123  # 标定板物理尺寸 (米)
 TARGET_MARKER_ID = 0  # 目标 ArUco 标定板 ID (根据实际标定板修改：0, 2, 等)
 
@@ -93,6 +76,57 @@ obj_points = np.array([
     [ marker_size/2.0, -marker_size/2.0, 0.0],
     [-marker_size/2.0, -marker_size/2.0, 0.0]
 ], dtype=np.float32)
+
+
+class CameraDetector(Node):
+    """订阅相机话题，检测目标标记并解算其在相机坐标系下的位置"""
+
+    def __init__(self):
+        super().__init__('grasp_camera_detector')
+        self.bridge = CvBridge()
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.latest_frame = None
+        self.latest_p_cam = None
+        self.create_subscription(
+            CameraInfo, '/camera/camera/color/camera_info',
+            self.camera_info_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            Image, '/camera/camera/color/image_raw',
+            self.image_cb, qos_profile_sensor_data)
+
+    def camera_info_cb(self, msg):
+        if self.camera_matrix is None:
+            self.camera_matrix = np.array(msg.k).reshape(3, 3)
+            self.dist_coeffs = np.array(msg.d)
+            self.get_logger().info(f'Camera info received ({msg.width}x{msg.height})')
+
+    def image_cb(self, msg):
+        if self.camera_matrix is None:
+            return
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception:
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+        self.latest_p_cam = None
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            for idx, mid in enumerate(ids.flatten()):
+                if mid == TARGET_MARKER_ID:
+                    ok, rvec, tvec = cv2.solvePnP(
+                        obj_points, corners[idx][0], self.camera_matrix, self.dist_coeffs,
+                        flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                    if ok:
+                        cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
+                        self.latest_p_cam = tvec.flatten()
+                        cv2.putText(frame,
+                                    f"Target ID={TARGET_MARKER_ID}: [{tvec[0][0]:.3f}, {tvec[1][0]:.3f}, {tvec[2][0]:.3f}]",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cv2.putText(frame, "Press 'G' to grasp", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        self.latest_frame = frame
 
 
 def main():
@@ -143,77 +177,38 @@ def main():
     print("机械臂已就绪，可以执行运动指令。")
 
     # ==========================================================
-    # 4. 初始化相机（尝试多个索引，自动选择可用的相机）
+    # 4. 初始化相机检测节点（订阅 ROS 相机话题，需先启动相机驱动）
     # ==========================================================
-    CAMERA_INDEX = 2  # 相机索引：2=Realsense RGB(1280x720), 4=Realsense(1920x1080)
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-
-    if not cap.isOpened():
-        print(f"警告：无法打开相机索引 {CAMERA_INDEX}，自动探测中...")
-        # 尝试常见索引（本机可用: 2, 4）
-        for test_idx in [2, 4, 0]:
-            cap = cv2.VideoCapture(test_idx)
-            if cap.isOpened():
-                print(f"已自动选择相机索引: {test_idx}")
-                break
-        else:
-            print("错误：所有相机索引均无法打开！请检查相机连接。")
-            robot_node.destroy_node()
-            rclpy.shutdown()
-            return
+    cam_node = CameraDetector()
+    # 等 camera_info 到达（内参）
+    for _ in range(100):  # 最多等 10 秒
+        rclpy.spin_once(cam_node, timeout_sec=0.1)
+        if cam_node.camera_matrix is not None:
+            break
+    if cam_node.camera_matrix is None:
+        print("错误：收不到相机 camera_info，请检查相机驱动是否已启动：")
+        print("  ros2 launch realsense2_camera rs_launch.py camera_namespace:=camera \\")
+        print("    enable_color:=true enable_depth:=false rgb_camera.color_profile:=1280x720x30 align_depth.enable:=false")
+        robot_node.destroy_node()
+        cam_node.destroy_node()
+        rclpy.shutdown()
+        return
+    print("相机已就绪（内参来自 camera_info，与标定链路一致）")
 
     print("\n【运行提示】：")
-    print("1. 让相机对准标定板 (ID=2)。")
+    print(f"1. 让相机对准标定板 (ID={TARGET_MARKER_ID})。")
     print("2. 在画面窗口按下键盘 'G' 键，机械臂将尝试移动到标定板上方。")
     print("3. 按 'C' 键关闭夹爪，按 'O' 键打开夹爪。")
     print("4. 按 'H' 键机械臂回到零位。")
     print("5. 按 'Q' 键退出程序。")
 
-    # 存储最新检测到的目标
-    detected_p_cam = None
-
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # 检查是否为灰度图，如果是则直接使用，否则转换
-            if len(frame.shape) == 2:
-                gray = frame
-            else:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
-
-            target_detected = False
-
-            if ids is not None and len(ids) > 0:
-                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-                detected_ids = ids.flatten()
-                # 调试：打印检测到的所有 ID
-                print(f"\r检测到标记 IDs: {detected_ids}", end="", flush=True)
-
-                for idx, marker_id in enumerate(detected_ids):
-                    if marker_id == TARGET_MARKER_ID:
-                        img_points = corners[idx][0]
-                        success, rvec, tvec = cv2.solvePnP(
-                            obj_points, img_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE
-                        )
-
-                        if success:
-                            cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, 0.05)
-
-                            # 实时获取标定板在相机下的 3D 坐标
-                            detected_p_cam = tvec.flatten()  # [X_c, Y_c, Z_c]
-                            target_detected = True
-
-                            # 在画面上显示检测状态和坐标
-                            cv2.putText(frame, f"Target ID={TARGET_MARKER_ID}: [{detected_p_cam[0]:.3f}, {detected_p_cam[1]:.3f}, {detected_p_cam[2]:.3f}]",
-                                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            cv2.putText(frame, "Press 'G' to grasp", (10, 60),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            else:
-                print("\r未检测到任何标记      ", end="", flush=True)
+            # 泵相机回调，刷新画面与检测结果
+            rclpy.spin_once(cam_node, timeout_sec=0.001)
+            frame = cam_node.latest_frame
+            if frame is None:
+                continue
 
             # 显示画面
             cv2.imshow("Grasp Pipeline Testing", frame)
@@ -228,6 +223,7 @@ def main():
 
             # 按 G 触发视觉引导抓取运动
             if key == ord('g') or key == ord('G'):
+                detected_p_cam = cam_node.latest_p_cam
                 if detected_p_cam is None:
                     print(f"\n未检测到标定板 (目标 ID={TARGET_MARKER_ID})，请确认标定板 ID 是否正确！")
                     continue
@@ -271,11 +267,23 @@ def main():
                 P_base = np.dot(R_tool2base, P_tool) + t_tool2base
                 target_in_base = P_base.flatten()
 
-                # 为了安全，让机械臂在目标上方 10 厘米（0.1米）处停下
-                safe_target_z = target_in_base[2] 
+                # 应用手动补偿
+                target_in_base[0] += MANUAL_OFFSET_X
+                target_in_base[1] += MANUAL_OFFSET_Y
+                target_in_base[2] += MANUAL_OFFSET_Z
+
+                # 接近高度：0 = 直接到目标点；>0 = 抬高到目标上方
+                if APPROACH_HEIGHT > 0:
+                    target_in_base[2] += APPROACH_HEIGHT
 
                 print(f"2. 计算目标在基座坐标系: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={target_in_base[2]:.4f}")
-                print(f"   安全高度 (目标上方+0.1m): X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={safe_target_z:.4f}")
+
+                # 可达性预检：目标到肩关节的斜距超过臂展就必然无解，直接给出人话提示
+                slant = np.linalg.norm(target_in_base - np.array([0.0, 0.0, SHOULDER_Z]))
+                if slant > ARM_REACH:
+                    print(f"   !! 目标不可达：距肩关节 {slant:.2f}m，超过 CS66 臂展约 {ARM_REACH}m")
+                    print("   !! 请把目标放近一点（建议距基座水平 0.7m 以内）或降低目标高度，本次不运动")
+                    continue
 
                 # ----------------------------------------------------
                 # 【步骤三】：通过 C++ SDK 工具发送笛卡尔运动指令
@@ -286,14 +294,14 @@ def main():
                 # 先释放 ROS2 控制权，避免与 C++ 工具冲突
                 print("   释放 ROS2 控制权...")
                 robot_node._hand_back_control()
-                time.sleep(0.5)
+                time.sleep(3.0)  # 等 ROS2 dashboard 完全释放
 
                 # 姿态保持当前不变，转为旋转向量
                 rotvec = Rot.from_quat(current_ori).as_rotvec()
 
                 target_x = target_in_base[0]
                 target_y = target_in_base[1]
-                target_z = safe_target_z
+                target_z = target_in_base[2]
 
                 move_dist = np.linalg.norm(
                     np.array([target_x, target_y, target_z]) - np.array(current_pos)
@@ -301,8 +309,8 @@ def main():
                 move_time = max(8.0, move_dist / 0.05)  # 慢速：0.05 m/s，至少 8 秒
                 print(f"   运动距离: {move_dist:.3f}m, 预计时间: {move_time:.1f}s")
 
-                # 构建 C++ 工具命令
-                cmd = [
+                # 构建 C++ 工具命令；先试笛卡尔，失败则换关节空间模式重开进程再试
+                base_cmd = [
                     CARTESIAN_TOOL,
                     ROBOT_IP,
                     f"{target_x:.6f}",
@@ -315,18 +323,31 @@ def main():
                     "0.15",              # acceleration (m/s²) — 柔和加速
                     f"{move_time:.1f}",  # time (s)
                 ]
+                joints = robot_node._joint_positions  # rad，JOINT_NAMES 顺序
 
-                print(f"   执行: {' '.join(cmd)}")
-
-                try:
-                    result = subprocess.run(
+                def run_move(mode):
+                    cmd = base_cmd + [mode]
+                    if mode == "joint":
+                        cmd += [f"{j:.6f}" for j in joints]
+                    print(f"   执行({mode}): {' '.join(cmd)}")
+                    return subprocess.run(
                         cmd,
                         cwd=os.path.dirname(CARTESIAN_TOOL),
                         timeout=move_time + 30,
                         capture_output=True,
                         text=True
                     )
+
+                try:
+                    result = run_move("cartesian")
                     print(result.stdout)
+                    if result.returncode != 0:
+                        if joints is not None and len(joints) == 6:
+                            print("   笛卡尔失败（多为奇异位姿），切换关节空间模式重试...")
+                            result = run_move("joint")
+                            print(result.stdout)
+                        else:
+                            print("   警告：拿不到当前关节角，无法切换关节空间模式")
                     if result.returncode == 0:
                         print("4. 机械臂已到达目标上方！")
                     else:
@@ -359,8 +380,8 @@ def main():
         print("\n用户中断")
     finally:
         # 清理资源
-        cap.release()
         cv2.destroyAllWindows()
+        cam_node.destroy_node()
         robot_node.destroy_node()
         rclpy.shutdown()
         print("资源已清理，程序退出。")

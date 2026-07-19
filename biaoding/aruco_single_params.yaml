@@ -1,0 +1,7 @@
+aruco_single_tf:
+  ros__parameters:
+    marker_size: 0.123
+    marker_id: 0
+    marker_dict: DICT_6X6_250
+    parent_frame: camera_color_optical_frame
+    child_frame: aruco_marker_frame

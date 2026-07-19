@@ -113,44 +113,110 @@ class AutoHandEyeCalibration:
         print("ROS2 已连接，机械臂状态正常\n")
 
     def get_robot_pose(self):
-        """获取机械臂当前末端位姿 [x, y, z, rx, ry, rz]（米, 弧度）"""
+        """获取机械臂当前末端位姿 (pos_xyz, quat_xyzw) — 直接用四元数，和抓取脚本保持一致"""
         for _ in range(10):
             rclpy.spin_once(self.robot, timeout_sec=0.05)
 
-        pos = self.robot.get_tcp_position()
-        euler = self.robot.get_tcp_orientation_euler()
-
-        if pos is None or euler is None:
+        tcp = self.robot.get_tcp_pose()
+        if tcp is None:
             return None
 
-        return [pos[0], pos[1], pos[2], euler[0], euler[1], euler[2]]
+        pos, quat = tcp  # pos=[x,y,z], quat=[qx,qy,qz,qw]
+        return [pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]]
+
+    def _wait_stable(self, tolerance=0.002, timeout=3.0):
+        """等待机械臂停稳（位置变化 < tolerance 米）"""
+        prev = None
+        start = time.time()
+        while time.time() - start < timeout:
+            pos = self.robot.get_tcp_position()
+            if pos is None:
+                time.sleep(0.2)
+                continue
+            if prev is not None:
+                dist = np.linalg.norm(np.array(pos) - np.array(prev))
+                if dist < tolerance:
+                    return True
+            prev = pos
+            time.sleep(0.3)
+        return False  # 超时
+
+    def _compute_reproj_error(self, rvec, tvec, img_points):
+        """计算 solvePnP 重投影误差（像素）"""
+        proj, _ = cv2.projectPoints(
+            self.obj_points, rvec, tvec,
+            self.camera_matrix, self.dist_coeffs
+        )
+        return np.mean(np.linalg.norm(img_points - proj.reshape(-1, 2), axis=1))
+
+    def _detect_marker(self):
+        """取一帧新图像并检测标定板，返回 (rvec, tvec, img_points) 或 None"""
+        frames = self.pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            return None
+        frame = np.asanyarray(color_frame.get_data())
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.aruco_params)
+        if ids is not None:
+            for idx, marker_id in enumerate(ids.flatten()):
+                if marker_id == TARGET_MARKER_ID:
+                    success, rvec, tvec = cv2.solvePnP(
+                        self.obj_points, corners[idx][0],
+                        self.camera_matrix, self.dist_coeffs,
+                        flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                    if success:
+                        return rvec, tvec, corners[idx][0]
+        return None
 
     def capture_sample(self):
-        """采集一组标定数据"""
+        """采集一组标定数据 —— 停稳后同时读取相机和机械臂数据"""
         if not self.marker_detected:
             print("\n[错误] 未检测到标定板，无法采集！")
             return False
+
+        # 等机械臂停稳
+        print("  等待机械臂停稳...", end="", flush=True)
+        if not self._wait_stable():
+            print(" 超时（可能仍在运动）")
+        else:
+            print(" 已停稳")
+
+        # ★ 关键修复：停稳后重新取一帧相机数据，确保相机和机械臂是同一时刻
+        result = self._detect_marker()
+        if result is None:
+            print("\n[错误] 停稳后未检测到标定板！")
+            return False
+        fresh_rvec, fresh_tvec, fresh_img_pts = result
 
         robot_pose = self.get_robot_pose()
         if robot_pose is None:
             print("\n[错误] 无法获取机械臂位姿！")
             return False
 
-        self.samples.append((
-            robot_pose,
-            self.current_rvec.copy(),
-            self.current_tvec.copy()
-        ))
+        # 计算重投影误差
+        reproj_err = self._compute_reproj_error(fresh_rvec, fresh_tvec, fresh_img_pts)
+
+        self.samples.append({
+            'robot_pose': robot_pose,
+            'rvec': fresh_rvec.copy(),
+            'tvec': fresh_tvec.copy(),
+            'reproj_err': reproj_err
+        })
 
         n = len(self.samples)
-        rv = self.current_rvec.flatten()
-        tv = self.current_tvec.flatten()
+        rv = fresh_rvec.flatten()
+        tv = fresh_tvec.flatten()
+
+        err_flag = " ⚠️ 重投影偏大!" if reproj_err > 1.0 else ""
         print(f"\n{'='*50}")
         print(f"[采集成功] 第 {n} 组")
         print(f"  机械臂: pos=({robot_pose[0]:.4f},{robot_pose[1]:.4f},{robot_pose[2]:.4f})m")
-        print(f"           euler(rx,ry,rz)=({robot_pose[3]:.4f},{robot_pose[4]:.4f},{robot_pose[5]:.4f})rad")
+        print(f"           quat=({robot_pose[3]:.4f},{robot_pose[4]:.4f},{robot_pose[5]:.4f},{robot_pose[6]:.4f})")
         print(f"  标定板: tvec=({tv[0]:.4f},{tv[1]:.4f},{tv[2]:.4f})m")
         print(f"           rvec=({rv[0]:.4f},{rv[1]:.4f},{rv[2]:.4f})")
+        print(f"  重投影误差: {reproj_err:.3f} px{err_flag}")
         need = max(0, MIN_SAMPLES - n)
         if need > 0:
             print(f"  还需 {need} 组 (当前 {n}/{MIN_SAMPLES})")
@@ -162,10 +228,43 @@ class AutoHandEyeCalibration:
     def delete_last_sample(self):
         """删除最后一组数据"""
         if self.samples:
-            self.samples.pop()
-            print(f"已删除，剩余 {len(self.samples)} 组")
+            s = self.samples.pop()
+            print(f"已删除第 {len(self.samples)+1} 组 (reproj={s['reproj_err']:.3f}px)，剩余 {len(self.samples)} 组")
         else:
             print("无数据可删")
+
+    def list_samples(self):
+        """列出所有样本的重投影误差，标记异常"""
+        if not self.samples:
+            print("无样本")
+            return
+        print(f"\n{'='*60}")
+        print(f"  样本列表 (共 {len(self.samples)} 组)")
+        print(f"  {'索引':>4s}  {'重投影误差(px)':>16s}  {'状态'}")
+        print(f"  {'-'*40}")
+        errors = [s['reproj_err'] for s in self.samples]
+        mean_err = np.mean(errors)
+        std_err = np.std(errors)
+        for i, s in enumerate(self.samples):
+            e = s['reproj_err']
+            flag = ""
+            if e > mean_err + 3 * std_err:
+                flag = " ❌ 离群! (建议删除)"
+            elif e > 1.0:
+                flag = " ⚠️ 偏大"
+            print(f"  {i:4d}  {e:16.4f}{flag}")
+        print(f"  {'-'*40}")
+        print(f"  均值: {mean_err:.4f} px, 标准差: {std_err:.4f} px")
+        print(f"  删除命令: 按 X 后输入索引号")
+        print(f"{'='*60}\n")
+
+    def delete_by_index(self, idx):
+        """删除指定索引的样本"""
+        if 0 <= idx < len(self.samples):
+            s = self.samples.pop(idx)
+            print(f"已删除第 {idx} 组 (reproj={s['reproj_err']:.3f}px)，剩余 {len(self.samples)} 组")
+        else:
+            print(f"索引 {idx} 无效 (范围 0-{len(self.samples)-1})")
 
     def compute_calibration(self):
         """计算手眼标定"""
@@ -174,6 +273,13 @@ class AutoHandEyeCalibration:
             print(f"\n[警告] 只有 {n} 组，建议至少 {MIN_SAMPLES} 组")
             return
 
+        # 打印重投影误差汇总
+        errors = [s['reproj_err'] for s in self.samples]
+        bad_samples = [i for i, e in enumerate(errors) if e > 1.0]
+        if bad_samples:
+            print(f"\n⚠️  警告: 第 {bad_samples} 组重投影误差 > 1px，可能 solvePnP 解错（翻转歧义）")
+            print(f"   建议: 先按 L 查看，再按 X 删除这几组重试\n")
+
         print(f"\n正在用 {n} 组数据计算手眼标定...")
 
         R_gripper2base = []
@@ -181,10 +287,13 @@ class AutoHandEyeCalibration:
         R_target2cam = []
         t_target2cam = []
 
-        for robot_pose, cam_rvec, cam_tvec in self.samples:
-            x, y, z, rx, ry, rz = robot_pose
+        for s in self.samples:
+            robot_pose = s['robot_pose']
+            cam_rvec = s['rvec']
+            cam_tvec = s['tvec']
+            x, y, z, qx, qy, qz, qw = robot_pose
             t_g2b = np.array([x, y, z]).reshape(3, 1)
-            R_g2b = Rot.from_euler('xyz', [rx, ry, rz], degrees=False).as_matrix()
+            R_g2b = Rot.from_quat([qx, qy, qz, qw]).as_matrix()
 
             R_t2c, _ = cv2.Rodrigues(cam_rvec)
             t_t2c = np.array(cam_tvec).reshape(3, 1)
@@ -282,7 +391,8 @@ class AutoHandEyeCalibration:
         """主循环"""
         print("\n" + "="*60)
         print("  自动化手眼标定 (Eye-in-Hand)")
-        print("  S = 采集  |  D = 删除上组  |  C = 计算  |  Q = 退出")
+        print("  S = 采集  |  D = 删上组  |  L = 列表  |  X = 删指定")
+        print("  C = 计算  |  Q = 退出")
         print(f"  目标: 至少 {MIN_SAMPLES} 组，越多越准")
         print("="*60 + "\n")
 
@@ -315,6 +425,7 @@ class AutoHandEyeCalibration:
                                 self.marker_detected = True
                                 self.current_rvec = rvec
                                 self.current_tvec = tvec
+                                self.current_img_points = img_points
                                 cv2.drawFrameAxes(frame, self.camera_matrix,
                                                   self.dist_coeffs, rvec, tvec, 0.05)
 
@@ -341,6 +452,15 @@ class AutoHandEyeCalibration:
                     self.capture_sample()
                 elif key == ord('d') or key == ord('D'):
                     self.delete_last_sample()
+                elif key == ord('l') or key == ord('L'):
+                    self.list_samples()
+                elif key == ord('x') or key == ord('X'):
+                    try:
+                        idx_str = input("输入要删除的样本索引: ").strip()
+                        idx = int(idx_str)
+                        self.delete_by_index(idx)
+                    except ValueError:
+                        print("无效输入")
                 elif key == ord('c') or key == ord('C'):
                     self.compute_calibration()
 
