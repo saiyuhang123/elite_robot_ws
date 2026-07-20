@@ -18,6 +18,7 @@
 import cv2
 import numpy as np
 import json
+import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as Rot
 
 import rclpy
@@ -32,12 +33,11 @@ from elite_robot_example.robot_cartesian_control import RobotCartesianControl
 
 
 # ==========================================================
-# 1. 基础配置 (与标定板生成参数、相机内参保持一致)
+# 1. 基础配置 (与标定板生成参数保持一致)
 # ==========================================================
-camera_matrix = np.array([[611.69867, 0.0, 326.48343],
-                          [0.0, 610.4816, 242.60501],
-                          [0.0, 0.0, 1.0]], dtype=np.float32)  # 替换为您的真实内参
-dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+# 注意：相机内参不再硬编码。main() 里通过 pyrealsense2 按实际分辨率
+# 从 SDK 读取出厂内参。旧代码按 640x480 硬编码内参，若实际画面是
+# 1280x720，横向定位会成比例偏差。
 
 marker_size = 0.123  # 标定板物理尺寸 (米)
 
@@ -91,7 +91,19 @@ def main():
     # ==========================================================
     # 4. 初始化相机与主循环
     # ==========================================================
-    cap = cv2.VideoCapture(2)  # 使用 /dev/video2
+    # 显式使用 1280x720，并从 SDK 读取该分辨率下的出厂内参。
+    # 注意：相机是独占设备，运行前需先关闭 realsense ROS 相机节点。
+    pipeline = rs.pipeline()
+    rs_config = rs.config()
+    rs_config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    profile = pipeline.start(rs_config)
+    intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    camera_matrix = np.array([[intrinsics.fx, 0.0, intrinsics.ppx],
+                              [0.0, intrinsics.fy, intrinsics.ppy],
+                              [0.0, 0.0, 1.0]], dtype=np.float32)
+    dist_coeffs = np.array(intrinsics.coeffs, dtype=np.float32).reshape(5, 1)
+    print(f"相机: {intrinsics.width}x{intrinsics.height}, "
+          f"fx={intrinsics.fx:.2f}, fy={intrinsics.fy:.2f}, cx={intrinsics.ppx:.2f}, cy={intrinsics.ppy:.2f}")
 
     print("\n【运行提示】：")
     print("1. 让相机对准标定板。")
@@ -104,9 +116,11 @@ def main():
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
+            frame = np.asanyarray(color_frame.get_data())
 
             # 检查是否为灰度图，如果是则直接使用，否则转换
             if len(frame.shape) == 2:
@@ -223,7 +237,7 @@ def main():
         print("\n用户中断")
     finally:
         # 清理资源
-        cap.release()
+        pipeline.stop()
         cv2.destroyAllWindows()
         robot_node.destroy_node()
         rclpy.shutdown()
