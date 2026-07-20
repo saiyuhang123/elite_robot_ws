@@ -9,6 +9,12 @@
  * 注意：同一连接里一条轨迹失败后通道会进入错误状态，无法再 START 新轨迹，
  *       所以本工具刻意设计为一次运行只发一条；需要换模式时请重新调用本程序。
  *
+ * 安装补偿：机械臂斜装（先绕世界Z轴转 253°，再绕新的Y轴倾斜 42.4°）。
+ *       控制器的 movel 和本文件的 KDL 链都工作在【机械臂基座系】，
+ *       而本工具输入的 x/y/z/rx/ry/rz 一律视为【世界系(地面)】位姿，
+ *       发送/求IK之前先在内部换算到基座系（worldPoseToBase）。
+ *       若输入已经是基座系位姿，把 MOUNT_YAW_DEG / MOUNT_TILT_DEG 置 0 即可。
+ *
  * 编译: g++ -O2 -o cartesian_move cartesian_move.cpp -lelite-cs-series-sdk -lorocos-kdl -ldl -lpthread \
  *       -I/home/nvidia/Documents/elite_robot_ws/build/elite_cs_series_sdk/include -I/usr/include/eigen3
  *
@@ -49,6 +55,40 @@ static const std::string SCRIPT_FILE = "external_control.script";
 static const vector6d_t MDH_ALPHA = {0, 1.5708, 0, 0, 1.5708, -1.5708};
 static const vector6d_t MDH_A = {0, 0, -0.42752, -0.391601, 0, 0};
 static const vector6d_t MDH_D = {0.160861, 0, 0, 0.147568, 0.0964976, 0.112116};
+
+// 安装姿态（世界系/地面 -> 机械臂基座系）：先绕世界Z轴转 253°，再绕新的Y轴倾斜 42.4°
+// p_world = R_world_base * p_base（安装点重合，只有旋转没有平移）
+static const double MOUNT_YAW_DEG  = 253.0;
+static const double MOUNT_TILT_DEG = 42.4;
+
+/**
+ * 世界系位姿(x,y,z + rx,ry,rz 旋转向量) -> 基座系位姿
+ *   p_base = R_wb^T * p_world
+ *   R_base = R_wb^T * R_world （再转回旋转向量）
+ */
+static void worldPoseToBase(const vector6d_t& world_pose, vector6d_t& base_pose) {
+    KDL::Rotation R_wb = KDL::Rotation::RotZ(MOUNT_YAW_DEG * M_PI / 180.0) *
+                         KDL::Rotation::RotY(MOUNT_TILT_DEG * M_PI / 180.0);
+    KDL::Rotation R_bw = R_wb.Inverse();
+
+    KDL::Vector p_w(world_pose[0], world_pose[1], world_pose[2]);
+    KDL::Vector p_b = R_bw * p_w;
+
+    KDL::Vector rv_w(world_pose[3], world_pose[4], world_pose[5]);
+    double ang = rv_w.Norm();
+    KDL::Rotation R_w = KDL::Rotation::Identity();
+    if (ang > 1e-12) {
+        R_w = KDL::Rotation::Rot(KDL::Vector(rv_w.x() / ang, rv_w.y() / ang, rv_w.z() / ang), ang);
+    }
+    KDL::Vector rv_b = (R_bw * R_w).GetRot();
+
+    base_pose[0] = p_b.x();
+    base_pose[1] = p_b.y();
+    base_pose[2] = p_b.z();
+    base_pose[3] = rv_b.x();
+    base_pose[4] = rv_b.y();
+    base_pose[5] = rv_b.z();
+}
 
 /**
  * 按 SDK 插件同款方式建 KDL 链：每关节 = RotX(alpha)*Trans(a,0,d) 固定段 + RotZ 关节
@@ -117,18 +157,24 @@ int main(int argc, const char** argv) {
         std::cerr << "用法: " << argv[0]
                   << " <robot_ip> <x> <y> <z> <rx> <ry> <rz> [speed] [accel] [time] [mode] [j1..j6]\n"
                   << "  mode: cartesian(默认) | joint\n"
-                  << "  j1..j6: 当前关节角(rad)，joint 模式必填（IK 种子）" << std::endl;
+                  << "  j1..j6: 当前关节角(rad)，joint 模式必填（IK 种子）\n"
+                  << "  坐标系: 输入位姿为世界(地面)系，内部自动换算到基座系\n"
+                  << "          (安装: 绕Z轴 253° + 绕新Y轴倾斜 42.4°，见 MOUNT_YAW_DEG/MOUNT_TILT_DEG)" << std::endl;
         return 1;
     }
 
     std::string robot_ip = argv[1];
     vector6d_t pose;
-    pose[0] = std::stod(argv[2]);  // x
+    pose[0] = std::stod(argv[2]);  // x（世界系）
     pose[1] = std::stod(argv[3]);  // y
     pose[2] = std::stod(argv[4]);  // z
-    pose[3] = std::stod(argv[5]);  // rx (rotation vector)
+    pose[3] = std::stod(argv[5]);  // rx (rotation vector，世界系)
     pose[4] = std::stod(argv[6]);  // ry
     pose[5] = std::stod(argv[7]);  // rz
+
+    // 控制器 movel 与 KDL 链都工作在基座系 → 先把世界系目标变换到基座系
+    vector6d_t base_pose;
+    worldPoseToBase(pose, base_pose);
 
     float speed = (argc >= 9)  ? std::stof(argv[8])  : 0.15f;
     float accel = (argc >= 10) ? std::stof(argv[9])  : 0.3f;
@@ -148,18 +194,20 @@ int main(int argc, const char** argv) {
         for (int i = 0; i < 6; i++) {
             seed_joints[i] = std::stod(argv[12 + i]);
         }
-        if (!computeIkJoints(pose, seed_joints, traj_point)) {
+        if (!computeIkJoints(base_pose, seed_joints, traj_point)) {
             return 1;
         }
         cartesian = false;
     } else {
-        traj_point = pose;
+        traj_point = base_pose;
     }
 
     std::cout << "=== Elite CS Move Tool (mode: " << (cartesian ? "cartesian" : "joint") << ") ===" << std::endl;
     std::cout << "Robot IP: " << robot_ip << std::endl;
-    std::cout << "Target:   [" << pose[0] << ", " << pose[1] << ", " << pose[2]
+    std::cout << "Target(world): [" << pose[0] << ", " << pose[1] << ", " << pose[2]
               << ", " << pose[3] << ", " << pose[4] << ", " << pose[5] << "]" << std::endl;
+    std::cout << "Target(base):  [" << base_pose[0] << ", " << base_pose[1] << ", " << base_pose[2]
+              << ", " << base_pose[3] << ", " << base_pose[4] << ", " << base_pose[5] << "]" << std::endl;
     std::cout << "Speed: " << speed << " m/s, Accel: " << accel << " m/s^2, Time: " << time << "s" << std::endl;
 
     // 1. 配置并连接 Dashboard

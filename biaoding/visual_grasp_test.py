@@ -56,6 +56,19 @@ MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 # 接近高度（米）：移动到目标点"正上方"这么高；设为 0 = 直接移动到目标点（用于验证到位精度）
 APPROACH_HEIGHT = 0.00
 
+# 运动模式：
+#   "joint"     - 只到位置、姿态随意（关节空间，几乎不会失败；路径是关节插值的弧线）
+#   "cartesian" - 笛卡尔直线（配合下面的姿态策略，失败后会自动转 joint）
+MOVE_MODE = "cartesian"
+
+# 终点姿态策略（MOVE_MODE="cartesian" 时生效）：
+#   "fixed" - 固定为常用抓取姿态（底座斜装，"竖直向下"≠ base -Z，此值来自实测常用位姿，推荐）
+#   "keep"  - 保持当前姿态（姿态别扭时容易奇异失败）
+GRASP_ORIENTATION_MODE = "fixed"
+
+# 常用抓取姿态（法兰朝下，来自实测位姿的 FK，rotvec 格式）
+FIXED_GRASP_ROTVEC = np.array([-0.286496, 2.242937, 0.043244])
+
 # CS66 几何参数（用于可达性预检，见 default_kinematics.yaml）
 SHOULDER_Z = 0.1625   # 肩关节距基座高度
 ARM_REACH = 0.92      # 大臂0.427 + 小臂0.3905 + 腕部余量，约等于最大臂展
@@ -361,8 +374,12 @@ def main():
                 robot_node._hand_back_control()
                 time.sleep(3.0)  # 等 ROS2 dashboard 完全释放
 
-                # 姿态保持当前不变，转为旋转向量
-                rotvec = Rot.from_quat(current_ori).as_rotvec()
+                # 终点姿态：fixed = 固定的常用抓取姿态（已按斜装底座校正）；keep = 保持当前姿态
+                if GRASP_ORIENTATION_MODE == "fixed":
+                    rotvec = FIXED_GRASP_ROTVEC
+                    print("   终点姿态: 固定抓取姿态（法兰朝下, 已按底座倾斜校正）")
+                else:
+                    rotvec = Rot.from_quat(current_ori).as_rotvec()
 
                 target_x = target_in_base[0]
                 target_y = target_in_base[1]
@@ -389,6 +406,9 @@ def main():
                     f"{move_time:.1f}",  # time (s)
                 ]
                 joints = robot_node._joint_positions  # rad，JOINT_NAMES 顺序
+                if MOVE_MODE == "joint" and (joints is None or len(joints) != 6):
+                    print("   错误：joint 模式需要当前关节角，但拿不到，本次不运动")
+                    continue
 
                 def run_move(mode):
                     cmd = base_cmd + [mode]
@@ -404,9 +424,9 @@ def main():
                     )
 
                 try:
-                    result = run_move("cartesian")
+                    result = run_move(MOVE_MODE)
                     print(result.stdout)
-                    if result.returncode != 0:
+                    if result.returncode != 0 and MOVE_MODE != "joint":
                         if joints is not None and len(joints) == 6:
                             print("   笛卡尔失败（多为奇异位姿），切换关节空间模式重试...")
                             result = run_move("joint")
