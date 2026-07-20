@@ -262,6 +262,7 @@ class RobotCartesianControl(Node):
         self._joint_positions: Optional[List[float]] = None
         self._joint_velocities: Optional[List[float]] = None
         self._tcp_pose: Optional[Tuple[List[float], List[float]]] = None  # (position, orientation)
+        self._joint_name_map: Optional[Dict[str, str]] = None  # 期望关节名 -> 实际关节名（兼容 tf_prefix）
 
         # ========== 订阅器 ==========
         # 订阅关节状态
@@ -343,13 +344,26 @@ class RobotCartesianControl(Node):
     # ========== 回调函数 ==========
 
     def _joint_state_callback(self, msg: JointState):
-        """关节状态回调"""
+        """关节状态回调（兼容带 tf_prefix 的关节名，如 cs66_shoulder_pan_joint）"""
         name_to_pos = dict(zip(msg.name, msg.position))
         name_to_vel = dict(zip(msg.name, msg.velocity))
 
+        # 首次收到时建立 期望名 -> 实际名 映射（驱动带 tf_prefix 时关节名有前缀）
+        if self._joint_name_map is None:
+            mapping = {}
+            for expected in JOINT_NAMES:
+                for actual in msg.name:
+                    if actual == expected or actual.endswith("_" + expected):
+                        mapping[expected] = actual
+                        break
+            if len(mapping) != len(JOINT_NAMES):
+                return  # 关节名还没认全，等下一帧
+            self._joint_name_map = mapping
+            self.get_logger().info(f"关节名映射: {self._joint_name_map}")
+
         try:
-            self._joint_positions = [float(name_to_pos[j]) for j in JOINT_NAMES]
-            self._joint_velocities = [float(name_to_vel[j]) for j in JOINT_NAMES]
+            self._joint_positions = [float(name_to_pos[self._joint_name_map[j]]) for j in JOINT_NAMES]
+            self._joint_velocities = [float(name_to_vel[self._joint_name_map[j]]) for j in JOINT_NAMES]
         except KeyError:
             pass
 
@@ -468,9 +482,9 @@ class RobotCartesianControl(Node):
             self.get_logger().error("轨迹服务器不可用")
             return False
 
-        # 构建轨迹目标
+        # 构建轨迹目标（用驱动实际的关节名，可能带 tf_prefix 前缀）
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = JOINT_NAMES
+        goal.trajectory.joint_names = [self._joint_name_map.get(j, j) for j in JOINT_NAMES]
 
         # 起点：当前位置
         start_point = JointTrajectoryPoint()

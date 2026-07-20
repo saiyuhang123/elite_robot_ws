@@ -32,6 +32,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
+from grasp_moveit_msgs.srv import MoveToPose
 import sys
 import os
 import time
@@ -51,8 +52,15 @@ MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 # 接近高度（米）：移动到目标点"正上方"这么高；设为 0 = 直接移动到目标点（用于验证到位精度）
 APPROACH_HEIGHT = 0.00
 
-# 运动模式：只使用笛卡尔解算（cartesian_move 的 cartesian 模式，控制器 movel）。
-# 关节空间回退已关闭：笛卡尔解算失败时只打印错误信息，不执行任何运动。
+# 运动方式：MoveIt 服务节点（grasp_move_server）关节空间规划 + 执行。
+# 失败只打印错误信息，不执行运动。需先启动 move_group 与 grasp_move_server。
+MOVEIT_SERVICE = "/grasp_move_server/move_to_pose"
+MOVEIT_BASE_FRAME = "cs66_base_link"
+MOVEIT_VEL_SCALING = 0.2   # 速度缩放 0~1，想更快加大
+MOVEIT_ACC_SCALING = 0.2   # 加速度缩放 0~1
+
+# 零位关节角（rad，H 键回零用，同样走 MoveIt 服务）
+HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 
 # 终点姿态策略（笛卡尔运动时生效）：
 #   "fixed" - 固定为常用抓取姿态（底座斜装，"竖直向下"≠ base -Z，此值来自实测常用位姿，推荐）
@@ -236,15 +244,22 @@ def main():
     print("机械臂已连接！")
     robot_node.print_status()
 
-    # 确保机械臂上电并释放抱闸
-    print("\n正在检查机械臂状态...")
-    if not robot_node.power_on():
-        print("警告：上电失败，可能已上电")
-    time.sleep(1.0)
-    if not robot_node.brake_release():
-        print("警告：释放抱闸失败，可能已释放")
-    time.sleep(1.0)
-    print("机械臂已就绪，可以执行运动指令。")
+    # 就绪检查：本脚本【不】调用 power_on/brake_release！
+    # 这两个 dashboard 命令会停止机器人侧正在运行的外部控制脚本，
+    # 导致 controller_stopper 随即停用 scaled_joint_trajectory_controller
+    # （表现为机械臂接受指令却纹丝不动）。
+    # 上电/松闸请在启动前于示教器完成（驱动启动时也会自行上电），
+    # 确认示教器显示 RUNNING 后再使用本脚本。
+    print("\n提示：本脚本不执行上电/松闸（避免停止机器人侧脚本）。")
+    print("      请确认示教器上机械臂处于 RUNNING 状态。")
+
+    # MoveIt 规划服务客户端（需已启动 move_group + grasp_move_server）
+    moveit_node = rclpy.create_node("grasp_moveit_client")
+    moveit_cli = moveit_node.create_client(MoveToPose, MOVEIT_SERVICE)
+    if not moveit_cli.wait_for_service(timeout_sec=3.0):
+        print(f"警告：MoveIt 服务 {MOVEIT_SERVICE} 暂不可用，按 G 将无法运动。")
+        print("      请先启动: ros2 launch my_elite_robot_cell_moveit_config move_group.launch.py")
+        print("             ros2 run hello_moveit grasp_move_server")
 
     # ==========================================================
     # 4. 初始化相机检测节点（订阅 ROS 相机话题，需先启动相机驱动）
@@ -349,26 +364,23 @@ def main():
 
                 print(f"2. 计算目标在基座坐标系: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={target_in_base[2]:.4f}")
 
-                # 可达性预检：目标到肩关节的斜距超过臂展就必然无解，直接给出人话提示
-                slant = np.linalg.norm(target_in_base - np.array([0.0, 0.0, SHOULDER_Z]))
-                if slant > ARM_REACH:
-                    print(f"   !! 目标不可达：距肩关节 {slant:.2f}m，超过 CS66 臂展约 {ARM_REACH}m")
-                    print("   !! 请把目标放近一点（建议距基座水平 0.7m 以内）或降低目标高度，本次不运动")
-                    continue
+                # 可达性预检：目标到肩关节的斜距超过臂展就必然无解，直接给出人话提示  去掉
+                # slant = np.linalg.norm(target_in_base - np.array([0.0, 0.0, SHOULDER_Z]))
+                # if slant > ARM_REACH:
+                #     print(f"   !! 目标不可达：距肩关节 {slant:.2f}m，超过 CS66 臂展约 {ARM_REACH}m")
+                #     print("   !! 请把目标放近一点（建议距基座水平 0.7m 以内）或降低目标高度，本次不运动")
+                #     continue
 
                 # ----------------------------------------------------
-                # 【步骤三】：通过 ROS2 action 发送运动指令
-                #   用出厂标定 DH 的 IK 解算目标位姿对应的关节角，
-                #   走 scaled_joint_trajectory_controller 执行。
-                #   不再调用 cartesian_move 子进程（它会与驱动争抢 30001
-                #   主端口，把驱动踢下线导致 Deactivated control）。
-                #   解算失败只打印信息，不执行运动。
+                # 【步骤三】：通过 MoveIt 服务节点规划并执行运动
+                #   OMPL 关节空间采样规划，自动绕开奇异位姿；
+                #   失败只打印信息，不执行运动。
                 # ----------------------------------------------------
-                print("3. 正在通过 ROS2 action 解算并执行运动...")
+                print("3. 正在通过 MoveIt 规划并执行运动...")
 
                 # 终点姿态：fixed = 固定的常用抓取姿态（已按斜装底座校正）；keep = 保持当前姿态
                 if GRASP_ORIENTATION_MODE == "fixed":
-                    target_quat = Rot.from_rotvec(FIXED_GRASP_ROTVEC).as_quat().tolist()
+                    target_quat = Rot.from_rotvec(FIXED_GRASP_ROTVEC).as_quat()
                     print("   终点姿态: 固定抓取姿态（法兰朝下, 已按底座倾斜校正）")
                 else:
                     target_quat = current_ori
@@ -380,18 +392,31 @@ def main():
                 move_dist = np.linalg.norm(
                     np.array([target_x, target_y, target_z]) - np.array(current_pos)
                 )
-                move_time = max(8.0, move_dist / 0.05)  # 慢速：0.05 m/s，至少 8 秒
-                print(f"   运动距离: {move_dist:.3f}m, 预计时间: {move_time:.1f}s")
+                print(f"   运动距离: {move_dist:.3f}m")
 
-                success = robot_node.move_to_cartesian_pose(
-                    [target_x, target_y, target_z],
-                    target_quat,
-                    duration=move_time
-                )
-                if success:
-                    print("4. 机械臂已到达目标上方！")
+                req = MoveToPose.Request()
+                req.target_pose.header.frame_id = MOVEIT_BASE_FRAME
+                req.target_pose.pose.position.x = float(target_x)
+                req.target_pose.pose.position.y = float(target_y)
+                req.target_pose.pose.position.z = float(target_z)
+                req.target_pose.pose.orientation.x = float(target_quat[0])
+                req.target_pose.pose.orientation.y = float(target_quat[1])
+                req.target_pose.pose.orientation.z = float(target_quat[2])
+                req.target_pose.pose.orientation.w = float(target_quat[3])
+                req.velocity_scaling = MOVEIT_VEL_SCALING
+                req.acceleration_scaling = MOVEIT_ACC_SCALING
+
+                if not moveit_cli.service_is_ready():
+                    print("4. MoveIt 服务不可用（grasp_move_server 未启动），本次不运动")
                 else:
-                    print("4. 笛卡尔解算/运动失败，本次不运动（原因见上方日志）")
+                    future = moveit_cli.call_async(req)
+                    rclpy.spin_until_future_complete(moveit_node, future)
+                    resp = future.result()
+                    if resp is not None and resp.success:
+                        print("4. 机械臂已到达目标上方！")
+                    else:
+                        detail = resp.message if resp is not None else "服务无响应"
+                        print(f"4. MoveIt 规划/执行失败: {detail}，本次不运动")
 
                 print("================================\n")
 
@@ -405,10 +430,24 @@ def main():
                 print("打开夹爪...")
                 robot_node.open_gripper(pin=0)
 
-            # 按 H 回到零位
+            # 按 H 回到零位（走 MoveIt 服务，不直接占用控制器）
             if key == ord('h') or key == ord('H'):
                 print("回到零位...")
-                robot_node.move_to_home(duration=5.0)
+                req = MoveToPose.Request()
+                req.joint_target = [float(j) for j in HOME_JOINTS]
+                req.velocity_scaling = MOVEIT_VEL_SCALING
+                req.acceleration_scaling = MOVEIT_ACC_SCALING
+                if not moveit_cli.service_is_ready():
+                    print("MoveIt 服务不可用（grasp_move_server 未启动），无法回零")
+                else:
+                    future = moveit_cli.call_async(req)
+                    rclpy.spin_until_future_complete(moveit_node, future)
+                    resp = future.result()
+                    if resp is not None and resp.success:
+                        print("已回到零位")
+                    else:
+                        detail = resp.message if resp is not None else "服务无响应"
+                        print(f"回零失败: {detail}")
 
     except KeyboardInterrupt:
         print("\n用户中断")
@@ -417,6 +456,7 @@ def main():
         cv2.destroyAllWindows()
         cam_node.destroy_node()
         robot_node.destroy_node()
+        moveit_node.destroy_node()
         rclpy.shutdown()
         print("资源已清理，程序退出。")
 

@@ -1,0 +1,63 @@
+#!/bin/bash
+# 视觉抓取一键启动：驱动 -> MoveIt -> 抓取服务 -> 相机 -> 抓取脚本
+# 每个命令间隔 2 秒；抓取脚本的按键窗口会正常弹出。
+# 日志输出到 biaoding/logs/ 下；按 Ctrl+C 停止所有进程。
+# 注意：不要用 set -u，ROS 的 setup.bash 会引用未定义变量导致报错。
+
+WS=~/Documents/elite_robot_ws
+LOG_DIR="$WS/biaoding/logs"
+mkdir -p "$LOG_DIR"
+
+source /opt/ros/humble/setup.bash
+source "$WS/install/setup.bash"
+
+PIDS=()
+cleanup() {
+    echo ""
+    echo "正在停止所有进程..."
+    kill "${PIDS[@]}" 2>/dev/null
+    wait 2>/dev/null
+    echo "已全部停止。"
+}
+trap cleanup INT TERM
+
+echo "[1/5] 启动机械臂驱动 (无头模式)..."
+ros2 launch my_elite_robot_cell_control start_robot.launch.py headless_mode:=true launch_rviz:=false \
+    > "$LOG_DIR/1_driver.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+
+echo "[2/5] 启动 MoveIt move_group..."
+ros2 launch my_elite_robot_cell_moveit_config move_group.launch.py \
+    > "$LOG_DIR/2_move_group.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+
+echo "[3/5] 启动 MoveIt 抓取服务节点..."
+ros2 run hello_moveit grasp_move_server \
+    > "$LOG_DIR/3_grasp_move_server.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+
+echo "[4/5] 启动 RealSense 相机..."
+ros2 launch realsense2_camera rs_launch.py \
+    camera_namespace:=camera \
+    enable_color:=true \
+    enable_depth:=true \
+    rgb_camera.color_profile:=1280x720x30 \
+    depth_module.depth_profile:=640x480x30 \
+    align_depth.enable:=true \
+    > "$LOG_DIR/4_camera.log" 2>&1 &
+PIDS+=($!)
+sleep 2
+
+echo "[5/5] 启动抓取脚本 (按键: G=抓取 C=闭爪 O=开爪 H=回零 Q=退出)..."
+cd "$WS/biaoding"
+python3 visual_grasp_test.py 2>&1 | tee "$LOG_DIR/5_visual_grasp.log" &
+PIDS+=($!)
+
+echo ""
+echo "全部启动完成。日志目录: $LOG_DIR"
+echo "抓取脚本画面窗口弹出后即可操作；按 Ctrl+C 停止所有进程。"
+
+wait

@@ -1,0 +1,12 @@
+# 运动请求：MoveIt 关节空间规划 + 执行
+# 二选一目标：
+#   - joint_target 为空：位姿目标，tip_link 在 target_pose.header.frame_id 下的位姿
+#   - joint_target 非空：关节目标（6 个关节角，rad），忽略 target_pose
+geometry_msgs/PoseStamped target_pose
+float64[] joint_target
+# 速度/加速度缩放（0~1；为 0 或超出范围时服务端用默认值）
+float32 velocity_scaling
+float32 acceleration_scaling
+---
+bool success
+string message
