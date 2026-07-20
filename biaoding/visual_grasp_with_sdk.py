@@ -39,7 +39,7 @@ camera_matrix = np.array([[611.69867, 0.0, 326.48343],
                           [0.0, 0.0, 1.0]], dtype=np.float32)  # 替换为您的真实内参
 dist_coeffs = np.zeros((5, 1), dtype=np.float32)
 
-marker_size = 0.10  # 标定板物理尺寸 (米)
+marker_size = 0.123  # 标定板物理尺寸 (米)
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
 parameters = cv2.aruco.DetectorParameters_create()
@@ -50,18 +50,6 @@ obj_points = np.array([
     [ marker_size/2.0, -marker_size/2.0, 0.0],
     [-marker_size/2.0, -marker_size/2.0, 0.0]
 ], dtype=np.float32)
-
-# ==========================================================
-# 安装姿态：世界系(地面) -> 机械臂基座系
-# 先绕世界Z轴转 253°，再绕新的Y轴倾斜 42.4°（与 cartesian_move.cpp 一致）
-# 斜装后基座Z不再是竖直方向，"目标上方抬高"必须沿世界系竖直方向换算
-# ==========================================================
-MOUNT_YAW_DEG = 253.0
-MOUNT_TILT_DEG = 42.4
-R_world2base = (Rot.from_euler('z', MOUNT_YAW_DEG, degrees=True)
-                * Rot.from_euler('y', MOUNT_TILT_DEG, degrees=True)).inv()
-# 世界系竖直向上方向在基座系中的表达（单位向量）
-WORLD_UP_IN_BASE = R_world2base.apply([0.0, 0.0, 1.0])
 
 
 def main():
@@ -203,18 +191,15 @@ def main():
                 P_base = np.dot(R_tool2base, P_tool) + t_tool2base
                 target_in_base = P_base.flatten()
 
-                # 为了安全，让机械臂停在目标上方 10 厘米处，避免直接撞击桌面。
-                # 斜装后基座Z不是竖直方向，必须沿【世界系竖直向上】抬高，
-                # 再把该方向换算到基座系下叠加
-                safe_target = target_in_base + 0.10 * WORLD_UP_IN_BASE
+                # 为了安全，我们让机械臂在目标上方 10 厘米（0.1米）处停下，避免直接撞击桌面
+                safe_target_z = target_in_base[2] + 0.10
 
-                print(f"2. 目标在基座系下: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={target_in_base[2]:.4f}")
-                print(f"   沿世界竖直方向抬高 0.10m 后: X={safe_target[0]:.4f}, Y={safe_target[1]:.4f}, Z={safe_target[2]:.4f}")
+                print(f"2. 计算出目标在基座下的坐标: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={safe_target_z:.4f}")
                 print("3. 正在向机械臂发送运动指令...")
 
                 # 【步骤三】：使用 SDK 控制机械臂运动
                 # 保持当前姿态，只改变位置
-                target_position = safe_target.tolist()
+                target_position = [target_in_base[0], target_in_base[1], safe_target_z]
                 target_orientation = current_ori  # 保持当前姿态
 
                 success = robot_node.move_to_cartesian_pose(
