@@ -10,7 +10,7 @@
 using namespace ELITE;
 using namespace std::chrono;
 
-static std::string s_robot_ip = "192.168.51.127";
+static std::string s_robot_ip = "192.168.1.212";
 
 TEST(PrimaryPortTest, multiple_connect) {
     std::unique_ptr<PrimaryPort> primary =  std::make_unique<PrimaryPort>();

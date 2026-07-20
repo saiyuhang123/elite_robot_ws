@@ -35,17 +35,12 @@ from cv_bridge import CvBridge
 import sys
 import os
 import time
-import subprocess
 import signal
 
 # 添加 elite_robot_example 包路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'elite_robot_example'))
 
 from elite_robot_example.robot_cartesian_control import RobotCartesianControl
-
-# 机械臂 IP 与 C++ 工具路径
-ROBOT_IP = "192.168.1.212"
-CARTESIAN_TOOL = os.path.join(os.path.dirname(__file__), "cartesian_move")
 
 # 手动补偿量（米）：改正 TCP/标定的固定偏移
 # 正值为正方向偏移，试出来之后填这里，不用重新标定
@@ -362,22 +357,21 @@ def main():
                     continue
 
                 # ----------------------------------------------------
-                # 【步骤三】：通过 C++ SDK 工具发送笛卡尔运动指令
-                #   保持当前姿态不变，只改变末端位置到目标上方
+                # 【步骤三】：通过 ROS2 action 发送运动指令
+                #   用出厂标定 DH 的 IK 解算目标位姿对应的关节角，
+                #   走 scaled_joint_trajectory_controller 执行。
+                #   不再调用 cartesian_move 子进程（它会与驱动争抢 30001
+                #   主端口，把驱动踢下线导致 Deactivated control）。
+                #   解算失败只打印信息，不执行运动。
                 # ----------------------------------------------------
-                print("3. 正在通过 Elite SDK 发送笛卡尔运动指令...")
-
-                # 先释放 ROS2 控制权，避免与 C++ 工具冲突
-                print("   释放 ROS2 控制权...")
-                robot_node._hand_back_control()
-                time.sleep(3.0)  # 等 ROS2 dashboard 完全释放
+                print("3. 正在通过 ROS2 action 解算并执行运动...")
 
                 # 终点姿态：fixed = 固定的常用抓取姿态（已按斜装底座校正）；keep = 保持当前姿态
                 if GRASP_ORIENTATION_MODE == "fixed":
-                    rotvec = FIXED_GRASP_ROTVEC
+                    target_quat = Rot.from_rotvec(FIXED_GRASP_ROTVEC).as_quat().tolist()
                     print("   终点姿态: 固定抓取姿态（法兰朝下, 已按底座倾斜校正）")
                 else:
-                    rotvec = Rot.from_quat(current_ori).as_rotvec()
+                    target_quat = current_ori
 
                 target_x = target_in_base[0]
                 target_y = target_in_base[1]
@@ -389,44 +383,15 @@ def main():
                 move_time = max(8.0, move_dist / 0.05)  # 慢速：0.05 m/s，至少 8 秒
                 print(f"   运动距离: {move_dist:.3f}m, 预计时间: {move_time:.1f}s")
 
-                # 构建 C++ 工具命令（仅笛卡尔模式）
-                base_cmd = [
-                    CARTESIAN_TOOL,
-                    ROBOT_IP,
-                    f"{target_x:.6f}",
-                    f"{target_y:.6f}",
-                    f"{target_z:.6f}",
-                    f"{rotvec[0]:.6f}",
-                    f"{rotvec[1]:.6f}",
-                    f"{rotvec[2]:.6f}",
-                    "0.05",              # speed (m/s) — 慢速
-                    "0.15",              # acceleration (m/s²) — 柔和加速
-                    f"{move_time:.1f}",  # time (s)
-                ]
-                def run_move():
-                    cmd = base_cmd + ["cartesian"]
-                    print(f"   执行(cartesian): {' '.join(cmd)}")
-                    return subprocess.run(
-                        cmd,
-                        cwd=os.path.dirname(CARTESIAN_TOOL),
-                        timeout=move_time + 30,
-                        capture_output=True,
-                        text=True
-                    )
-
-                try:
-                    result = run_move()
-                    print(result.stdout)
-                    if result.returncode == 0:
-                        print("4. 机械臂已到达目标上方！")
-                    else:
-                        print(f"4. 笛卡尔解算/运动失败 (exit code {result.returncode})，本次不运动")
-                        if result.stderr:
-                            print(f"   错误: {result.stderr.strip()}")
-                except subprocess.TimeoutExpired:
-                    print("4. 运动超时！")
-                except FileNotFoundError:
-                    print(f"4. 错误：找不到 cartesian_move 工具 ({CARTESIAN_TOOL})，请先编译")
+                success = robot_node.move_to_cartesian_pose(
+                    [target_x, target_y, target_z],
+                    target_quat,
+                    duration=move_time
+                )
+                if success:
+                    print("4. 机械臂已到达目标上方！")
+                else:
+                    print("4. 笛卡尔解算/运动失败，本次不运动（原因见上方日志）")
 
                 print("================================\n")
 

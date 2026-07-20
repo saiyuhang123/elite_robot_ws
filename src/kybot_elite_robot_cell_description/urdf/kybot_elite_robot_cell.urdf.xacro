@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+
+<robot name="kybot_elite_robot_cell"
+       xmlns:xacro="http://ros.org/wiki/xacro">
+
+    <!-- 导入 Workcell 宏 -->
+    <xacro:include filename="$(find kybot_elite_robot_cell_description)/urdf/kybot_elite_robot_cell_macro.xacro"/>
+
+    <!-- 机器人型号 -->
+    <xacro:arg name="cs_type" default="cs66"/>
+
+    <!-- Elite 官方参数文件 -->
+    <xacro:arg
+        name="joint_limits_parameters_file"
+        default="$(find eli_cs_robot_description)/config/$(arg cs_type)/joint_limits.yaml"/>
+
+    <xacro:arg
+        name="kinematics_parameters_file"
+        default="$(find eli_cs_robot_description)/config/$(arg cs_type)/default_kinematics.yaml"/>
+
+    <xacro:arg
+        name="physical_parameters_file"
+        default="$(find eli_cs_robot_description)/config/$(arg cs_type)/physical_parameters.yaml"/>
+
+    <xacro:arg
+        name="visual_parameters_file"
+        default="$(find eli_cs_robot_description)/config/$(arg cs_type)/visual_parameters.yaml"/>
+
+    <!-- 世界坐标系 -->
+    <link name="world"/>
+
+    <!-- 创建整个 Workcell -->
+    <xacro:my_elite_robot_cell
+        parent="world"
+        cs_type="$(arg cs_type)"
+        joint_limits_parameters_file="$(arg joint_limits_parameters_file)"
+        kinematics_parameters_file="$(arg kinematics_parameters_file)"
+        physical_parameters_file="$(arg physical_parameters_file)"
+        visual_parameters_file="$(arg visual_parameters_file)">
+
+        <origin xyz="0 0 1" rpy="0 0 0"/>
+
+    </xacro:my_elite_robot_cell>
+
+</robot>

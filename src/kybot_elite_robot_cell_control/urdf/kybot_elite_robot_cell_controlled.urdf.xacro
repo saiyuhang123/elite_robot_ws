@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+
+<robot name="kybot_elite_robot_cell"
+       xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- 引入我们自己的 Workcell -->
+  <xacro:include filename="$(find kybot_elite_robot_cell_description)/urdf/kybot_elite_robot_cell_macro.xacro"/>
+
+  <!-- 引入 Elite 官方 ros2_control 宏 -->
+  <xacro:include filename="$(find eli_cs_robot_description)/urdf/cs.ros2_control.xacro"/>
+
+  <!-- Robot model -->
+  <xacro:arg name="cs_type" default="cs66"/>
+
+  <!-- Robot parameter files -->
+  <xacro:arg name="joint_limit_params"
+             default="$(find kybot_elite_robot_cell_control)/config/$(arg cs_type)/joint_limits.yaml"/>
+
+  <xacro:arg name="kinematics_params"
+             default="$(find kybot_elite_robot_cell_control)/config/$(arg cs_type)/default_kinematics.yaml"/>
+
+  <xacro:arg name="physical_params"
+             default="$(find kybot_elite_robot_cell_control)/config/$(arg cs_type)/physical_parameters.yaml"/>
+
+  <xacro:arg name="visual_params"
+             default="$(find kybot_elite_robot_cell_control)/config/$(arg cs_type)/visual_parameters.yaml"/>
+
+  <!-- Driver parameters -->
+  <xacro:arg name="robot_ip" default="192.168.1.212"/>
+  <xacro:arg name="local_ip" default="192.168.1.102"/>
+  <xacro:arg name="headless_mode" default="false"/>
+
+  <xacro:arg
+      name="cs_script_filename"
+      default="$(find eli_cs_robot_driver)/resources/external_control.script"/>
+
+  <xacro:arg
+      name="cs_output_recipe_filename"
+      default="$(find eli_cs_robot_driver)/resources/output_recipe.txt"/>
+
+  <xacro:arg
+      name="cs_input_recipe_filename"
+      default="$(find eli_cs_robot_driver)/resources/input_recipe.txt"/>
+
+  <xacro:arg name="use_fake_hardware" default="false"/>
+
+  <xacro:arg name="fake_sensor_commands" default="false"/>
+
+  <!-- kinematics hash -->
+  <xacro:property
+      name="kinematics_params_file"
+      value="$(arg kinematics_params)"/>
+
+  <!-- World -->
+  <link name="world"/>
+
+  <!-- 创建整个 Workcell -->
+  <xacro:my_elite_robot_cell
+      parent="world"
+      cs_type="$(arg cs_type)"
+      joint_limits_parameters_file="$(arg joint_limit_params)"
+      kinematics_parameters_file="$(arg kinematics_params)"
+      physical_parameters_file="$(arg physical_params)"
+      visual_parameters_file="$(arg visual_params)">
+
+      <origin xyz="0 0 1" rpy="0 0 0"/>
+
+  </xacro:my_elite_robot_cell>
+
+  <!-- 创建 ros2_control -->
+  <xacro:cs_ros2_control
+      name="$(arg cs_type)"
+      tf_prefix="$(arg cs_type)_"
+      robot_ip="$(arg robot_ip)"
+      local_ip="$(arg local_ip)"
+      script_filename="$(arg cs_script_filename)"
+      output_recipe_filename="$(arg cs_output_recipe_filename)"
+      input_recipe_filename="$(arg cs_input_recipe_filename)"
+      use_fake_hardware="$(arg use_fake_hardware)"
+      fake_sensor_commands="$(arg fake_sensor_commands)"
+      headless_mode="$(arg headless_mode)"/>
+
+</robot>
