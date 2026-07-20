@@ -55,13 +55,16 @@ READY_POSITION = [0.0, -1.2, 0.8, -1.57, -1.57, 0.0]  # 准备位置
 # CS66 DH 参数与运动学
 # ==========================================================
 # DH 参数 (Modified DH convention)
+# 出厂标定值（由控制器 30001 端口读取的 MDH，与 cartesian_move.cpp 一致）。
+# 注意：不要使用型录标称值，旧值 d6=0.0920 与实测 0.112116 差约 2cm，
+# 会直接导致末端定位偏差。
 CS66_DH = {
-    'd1': 0.1625,   # 底座高度
-    'a2': -0.4270,  # 上臂长度
-    'a3': -0.3905,  # 前臂长度
-    'd4': 0.1475,   # 腕部偏移
-    'd5': 0.0965,   # 腕部2偏移
-    'd6': 0.0920,   # 末端到法兰
+    'd1': 0.160861,   # 底座高度
+    'a2': -0.42752,   # 上臂长度
+    'a3': -0.391601,  # 前臂长度
+    'd4': 0.147568,   # 腕部偏移
+    'd5': 0.0964976,  # 腕部2偏移
+    'd6': 0.112116,   # 末端到法兰
 }
 
 
@@ -134,7 +137,7 @@ def cs66_inverse_kinematics(
     q_guess: List[float],
     max_iter: int = 200,
     tolerance: float = 1e-4,
-    joint_margin: float = 2 * math.pi / 3  # ±120° 范围
+    joint_margin: float = math.pi  # ±180° 范围
 ) -> Optional[List[float]]:
     """
     CS66 逆运动学（数值法，Levenberg-Marquardt + 正则化）
@@ -145,7 +148,7 @@ def cs66_inverse_kinematics(
         q_guess: 初始关节角度猜测（弧度）
         max_iter: 最大迭代次数
         tolerance: 收敛精度
-        joint_margin: 关节偏离初始值的最大范围（弧度），默认 π/2
+        joint_margin: 关节偏离初始值的最大范围（弧度），默认 ±π
 
     Returns:
         6 个关节角度（弧度），失败返回 None
@@ -551,25 +554,26 @@ class RobotCartesianControl(Node):
         joint_target = cs66_inverse_kinematics(target_pos, target_rot, q_guess)
 
         if joint_target is None:
-            # 放宽约束重试（±π 即 180°）
+            # 放宽约束重试（±2π 即 360°）
             self.get_logger().info("紧约束 IK 失败，尝试放宽边界...")
             joint_target = cs66_inverse_kinematics(
                 target_pos, target_rot, q_guess,
-                max_iter=500, tolerance=1e-3, joint_margin=math.pi
+                max_iter=500, tolerance=1e-3, joint_margin=2 * math.pi
             )
 
         if joint_target is not None:
-            # 验证 IK 结果
-            fk_pos, _ = cs66_forward_kinematics(joint_target)
+            # 验证 IK 结果（位置 + 姿态）
+            fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
             fk_err = np.linalg.norm(fk_pos - target_pos)
-            self.get_logger().info(f"IK 成功，位置误差: {fk_err:.4f}m")
+            rot_err = np.linalg.norm(fk_rot - target_rot)
+            self.get_logger().info(f"IK 成功，位置误差: {fk_err:.4f}m, 姿态误差: {rot_err:.4f}")
             self.get_logger().info(f"目标关节(度): {[f'{math.degrees(j):.1f}' for j in joint_target]}")
 
-            if fk_err < 0.10:  # FK 模型有 ~2cm 误差，放宽到 10cm
+            if fk_err < 0.01 and rot_err < 0.05:  # FK 已用出厂标定参数，残差应在 mm 级
                 self.get_logger().info("使用关节轨迹控制执行运动...")
                 return self.move_to_joint_positions(joint_target, duration)
             else:
-                self.get_logger().warn(f"IK 误差过大 ({fk_err:.4f}m)，目标可能不可达")
+                self.get_logger().warn(f"IK 误差过大 (位置 {fk_err:.4f}m, 姿态 {rot_err:.4f})，目标可能不可达")
 
         # IK 完全失败
         self.get_logger().error("IK 解算失败，目标不可达")

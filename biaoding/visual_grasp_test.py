@@ -64,7 +64,7 @@ MOVE_MODE = "cartesian"
 # 终点姿态策略（MOVE_MODE="cartesian" 时生效）：
 #   "fixed" - 固定为常用抓取姿态（底座斜装，"竖直向下"≠ base -Z，此值来自实测常用位姿，推荐）
 #   "keep"  - 保持当前姿态（姿态别扭时容易奇异失败）
-GRASP_ORIENTATION_MODE = "fixed"
+GRASP_ORIENTATION_MODE = "keep"
 
 # 常用抓取姿态（法兰朝下，来自实测位姿的 FK，rotvec 格式）
 FIXED_GRASP_ROTVEC = np.array([-0.286496, 2.242937, 0.043244])
