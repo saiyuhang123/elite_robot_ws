@@ -56,12 +56,10 @@ MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 # 接近高度（米）：移动到目标点"正上方"这么高；设为 0 = 直接移动到目标点（用于验证到位精度）
 APPROACH_HEIGHT = 0.00
 
-# 运动模式：
-#   "joint"     - 只到位置、姿态随意（关节空间，几乎不会失败；路径是关节插值的弧线）
-#   "cartesian" - 笛卡尔直线（配合下面的姿态策略，失败后会自动转 joint）
-MOVE_MODE = "cartesian"
+# 运动模式：只使用笛卡尔解算（cartesian_move 的 cartesian 模式，控制器 movel）。
+# 关节空间回退已关闭：笛卡尔解算失败时只打印错误信息，不执行任何运动。
 
-# 终点姿态策略（MOVE_MODE="cartesian" 时生效）：
+# 终点姿态策略（笛卡尔运动时生效）：
 #   "fixed" - 固定为常用抓取姿态（底座斜装，"竖直向下"≠ base -Z，此值来自实测常用位姿，推荐）
 #   "keep"  - 保持当前姿态（姿态别扭时容易奇异失败）
 GRASP_ORIENTATION_MODE = "keep"
@@ -391,7 +389,7 @@ def main():
                 move_time = max(8.0, move_dist / 0.05)  # 慢速：0.05 m/s，至少 8 秒
                 print(f"   运动距离: {move_dist:.3f}m, 预计时间: {move_time:.1f}s")
 
-                # 构建 C++ 工具命令；先试笛卡尔，失败则换关节空间模式重开进程再试
+                # 构建 C++ 工具命令（仅笛卡尔模式）
                 base_cmd = [
                     CARTESIAN_TOOL,
                     ROBOT_IP,
@@ -405,16 +403,9 @@ def main():
                     "0.15",              # acceleration (m/s²) — 柔和加速
                     f"{move_time:.1f}",  # time (s)
                 ]
-                joints = robot_node._joint_positions  # rad，JOINT_NAMES 顺序
-                if MOVE_MODE == "joint" and (joints is None or len(joints) != 6):
-                    print("   错误：joint 模式需要当前关节角，但拿不到，本次不运动")
-                    continue
-
-                def run_move(mode):
-                    cmd = base_cmd + [mode]
-                    if mode == "joint":
-                        cmd += [f"{j:.6f}" for j in joints]
-                    print(f"   执行({mode}): {' '.join(cmd)}")
+                def run_move():
+                    cmd = base_cmd + ["cartesian"]
+                    print(f"   执行(cartesian): {' '.join(cmd)}")
                     return subprocess.run(
                         cmd,
                         cwd=os.path.dirname(CARTESIAN_TOOL),
@@ -424,19 +415,12 @@ def main():
                     )
 
                 try:
-                    result = run_move(MOVE_MODE)
+                    result = run_move()
                     print(result.stdout)
-                    if result.returncode != 0 and MOVE_MODE != "joint":
-                        if joints is not None and len(joints) == 6:
-                            print("   笛卡尔失败（多为奇异位姿），切换关节空间模式重试...")
-                            result = run_move("joint")
-                            print(result.stdout)
-                        else:
-                            print("   警告：拿不到当前关节角，无法切换关节空间模式")
                     if result.returncode == 0:
                         print("4. 机械臂已到达目标上方！")
                     else:
-                        print(f"4. 运动失败 (exit code {result.returncode})")
+                        print(f"4. 笛卡尔解算/运动失败 (exit code {result.returncode})，本次不运动")
                         if result.stderr:
                             print(f"   错误: {result.stderr.strip()}")
                 except subprocess.TimeoutExpired:
