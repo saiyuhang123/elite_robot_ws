@@ -122,6 +122,10 @@ private:
     }
 
     RCLCPP_INFO(get_logger(), "规划成功，开始执行...");
+    rclcpp::sleep_for(std::chrono::milliseconds(200));  // 等 TF 稳定
+    auto current = move_group_->getCurrentPose(tip_link_).pose.position;
+        RCLCPP_INFO(get_logger(), "运动前的位置: [%.4f, %.4f, %.4f]",
+        current.x, current.y, current.z);
     const auto exec_code = move_group_->execute(plan);
     move_group_->clearPoseTargets();
     if (exec_code != moveit::core::MoveItErrorCode::SUCCESS) {
@@ -133,6 +137,11 @@ private:
 
     res->success = true;
     res->message = "OK";
+    rclcpp::sleep_for(std::chrono::milliseconds(200));  // 等 TF 稳定
+    auto final_pos = move_group_->getCurrentPose(tip_link_).pose.position;
+            RCLCPP_INFO(get_logger(), "运动后的位置: [%.4f, %.4f, %.4f]",
+            final_pos.x, final_pos.y, final_pos.z);
+
     RCLCPP_INFO(get_logger(), "执行完成");
   }
 
