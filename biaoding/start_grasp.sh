@@ -56,6 +56,13 @@ cd "$WS/biaoding"
 python3 visual_grasp_test.py 2>&1 | tee "$LOG_DIR/5_visual_grasp.log" &
 PIDS+=($!)
 
+# 自检：机器人侧脚本可能启动即死（上电未就绪竞态），没连上 50001 就补发一次
+sleep 5
+if ! ss -tn 2>/dev/null | grep -q ":50001 .*192.168.1.212"; then
+    echo "检测到机器人侧脚本未连接，补发 external control script..."
+    ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/Trigger || true
+fi
+
 echo ""
 echo "全部启动完成。日志目录: $LOG_DIR"
 echo "抓取脚本画面窗口弹出后即可操作；按 Ctrl+C 停止所有进程。"

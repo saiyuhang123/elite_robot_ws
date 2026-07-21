@@ -32,7 +32,7 @@ public:
     planning_group_ = declare_parameter<std::string>("planning_group", "elite_arm");
     tip_link_ = declare_parameter<std::string>("tip_link", "cs66_tool0");
     base_frame_ = declare_parameter<std::string>("base_frame", "cs66_base_link");
-    planning_time_ = declare_parameter<double>("planning_time", 5.0);
+    planning_time_ = declare_parameter<double>("planning_time", 8.0);
     planning_attempts_ = declare_parameter<int>("planning_attempts", 5);
     default_vel_scaling_ = declare_parameter<double>("velocity_scaling", 0.2);
     default_acc_scaling_ = declare_parameter<double>("acceleration_scaling", 0.2);

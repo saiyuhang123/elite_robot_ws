@@ -185,7 +185,7 @@ class CameraDetector(Node):
                         face_angle_deg = float(np.degrees(np.arccos(np.clip(normal @ ray, -1, 1))))
 
                     # 视角正(<50°)用 PnP；斜视角 PnP 误差爆炸，换深度图直接取点
-                    if ok and face_angle_deg is not None and face_angle_deg < 50.0:
+                    if ok and face_angle_deg is not None :  # and face_angle_deg < 50.0 去掉深度图
                         p_cam = tvec.flatten()
                         source = f'pnp {face_angle_deg:.0f}°'
                     else:
