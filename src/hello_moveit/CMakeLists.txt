@@ -36,6 +36,9 @@ ament_target_dependencies(
 install(TARGETS hello_moveit grasp_move_server
   DESTINATION lib/${PROJECT_NAME})
 
+install(PROGRAMS scripts/manual_move_client.py scripts/joint_jog_gui.py
+  DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

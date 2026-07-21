@@ -3,21 +3,23 @@
  *
  * 提供 service ~/move_to_pose (grasp_moveit_msgs/srv/MoveToPose)：
  *   输入：基座系(cs66_base_link)下 cs66_tool0 的目标位姿(位置+姿态) + 速度/加速度缩放
- *   行为：setPoseTarget -> OMPL 关节空间规划 -> execute
+ *         + motion_type: "movej"(默认, OMPL 关节空间规划, 带避障)
+ *                        "movel"(computeCartesianPath 末端直线插值, 无避障, 仅短距离)
+ *   行为：movej -> setPoseTarget/setJointValueTarget -> plan -> execute
+ *         movel -> computeCartesianPath(检查覆盖率) -> execute
  *   输出：success + message（规划/执行失败的原因）
- *
- * 与控制器 movel 不同，MoveIt 在关节空间采样规划，只要求终点可达，
- * 自动绕开奇异位姿，成功率远高于严格直线 movel。
  *
  * 前提：my_elite_robot_cell_moveit_config 的 move_group 已启动。
  * 运行：ros2 run hello_moveit grasp_move_server
  */
 
+#include <algorithm>
 #include <memory>
 #include <string>
 
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <grasp_moveit_msgs/srv/move_to_pose.hpp>
 
 using MoveToPose = grasp_moveit_msgs::srv::MoveToPose;
@@ -36,6 +38,9 @@ public:
     planning_attempts_ = declare_parameter<int>("planning_attempts", 5);
     default_vel_scaling_ = declare_parameter<double>("velocity_scaling", 0.2);
     default_acc_scaling_ = declare_parameter<double>("acceleration_scaling", 0.2);
+    // MoveL 参数：笛卡尔插值步长(m)、最小路径覆盖率
+    cartesian_step_ = declare_parameter<double>("cartesian_step", 0.005);
+    min_cartesian_fraction_ = declare_parameter<double>("min_cartesian_fraction", 0.99);
 
     srv_ = create_service<MoveToPose>(
         "~/move_to_pose",
@@ -80,8 +85,27 @@ private:
     move_group_->setMaxAccelerationScalingFactor(as);
     move_group_->setStartStateToCurrentState();
 
+    // 解析运动方式：空或 "movej" -> 关节空间规划；"movel" -> 末端直线
+    std::string motion_type = req->motion_type;
+    std::transform(motion_type.begin(), motion_type.end(), motion_type.begin(), ::tolower);
+    if (motion_type.empty()) motion_type = "movej";
+    if (motion_type != "movej" && motion_type != "movel") {
+      res->success = false;
+      res->message = "motion_type 只能是 movej 或 movel，收到: " + req->motion_type;
+      RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
+      return;
+    }
+
+    bool use_cartesian = false;       // true 时走 computeCartesianPath（MoveL）
+    geometry_msgs::msg::Pose target_pose;  // MoveL 的直线终点（位姿目标时有效）
     if (!req->joint_target.empty()) {
-      // 关节空间目标（如回零位）
+      // 关节空间目标（如回零位），只有 MoveJ
+      if (motion_type == "movel") {
+        res->success = false;
+        res->message = "关节目标只支持 movej（movel 需要位姿目标）";
+        RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
+        return;
+      }
       if (req->joint_target.size() != 6) {
         res->success = false;
         res->message = "joint_target 需要 6 个关节角(rad)，收到 " +
@@ -105,20 +129,46 @@ private:
         RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
         return;
       }
-      move_group_->setPoseTarget(target, tip_link_);
-      RCLCPP_INFO(get_logger(), "收到位姿目标: [%.4f, %.4f, %.4f] (v=%.2f, a=%.2f)",
+      use_cartesian = (motion_type == "movel");
+      if (!use_cartesian) {
+        move_group_->setPoseTarget(target, tip_link_);
+      } else {
+        target_pose = target.pose;
+      }
+      RCLCPP_INFO(get_logger(), "收到位姿目标(%s): [%.4f, %.4f, %.4f] (v=%.2f, a=%.2f)",
+                  motion_type.c_str(),
                   target.pose.position.x, target.pose.position.y, target.pose.position.z, vs, as);
     }
 
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-    const auto plan_code = move_group_->plan(plan);
-    if (plan_code != moveit::core::MoveItErrorCode::SUCCESS) {
+    moveit_msgs::msg::RobotTrajectory trajectory;
+    if (use_cartesian) {
+      // ---- MoveL：末端直线插值，无避障，仅适合短距离 ----
+      std::vector<geometry_msgs::msg::Pose> waypoints;
+      waypoints.push_back(target_pose);
+      const double fraction = move_group_->computeCartesianPath(
+          waypoints, cartesian_step_, 0.0 /* jump_threshold 关闭 */, trajectory);
+      RCLCPP_INFO(get_logger(), "笛卡尔路径覆盖率: %.1f%%", fraction * 100.0);
+      if (fraction < min_cartesian_fraction_) {
+        res->success = false;
+        res->message = "MoveL 路径覆盖率不足: " + std::to_string(fraction * 100.0) +
+                       "%（中途 IK 无解/超限/奇异），已放弃执行";
+        RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
+        return;
+      }
+    } else {
+      // ---- MoveJ：OMPL 关节空间采样规划，带避障 ----
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      const auto plan_code = move_group_->plan(plan);
+      if (plan_code != moveit::core::MoveItErrorCode::SUCCESS) {
+        move_group_->clearPoseTargets();
+        res->success = false;
+        res->message = "MoveIt 规划失败, error_code=" + std::to_string(plan_code.val) +
+                       "（多为目标不可达/姿态受限/碰撞）";
+        RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
+        return;
+      }
+      trajectory = plan.trajectory_;
       move_group_->clearPoseTargets();
-      res->success = false;
-      res->message = "MoveIt 规划失败, error_code=" + std::to_string(plan_code.val) +
-                     "（多为目标不可达/姿态受限/碰撞）";
-      RCLCPP_WARN(get_logger(), "%s", res->message.c_str());
-      return;
     }
 
     RCLCPP_INFO(get_logger(), "规划成功，开始执行...");
@@ -126,8 +176,7 @@ private:
     auto current = move_group_->getCurrentPose(tip_link_).pose.position;
         RCLCPP_INFO(get_logger(), "运动前的位置: [%.4f, %.4f, %.4f]",
         current.x, current.y, current.z);
-    const auto exec_code = move_group_->execute(plan);
-    move_group_->clearPoseTargets();
+    const auto exec_code = move_group_->execute(trajectory);
     if (exec_code != moveit::core::MoveItErrorCode::SUCCESS) {
       res->success = false;
       res->message = "MoveIt 执行失败, error_code=" + std::to_string(exec_code.val);
@@ -147,6 +196,7 @@ private:
 
   std::string planning_group_, tip_link_, base_frame_;
   double planning_time_, default_vel_scaling_, default_acc_scaling_;
+  double cartesian_step_, min_cartesian_fraction_;
   int planning_attempts_;
   std::unique_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
   rclcpp::Service<MoveToPose>::SharedPtr srv_;
