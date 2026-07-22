@@ -53,6 +53,21 @@ JOINT_ORDER = [
     "cs66_wrist_3_joint",        # 关节6
 ]
 
+# ---- 倾斜安装补偿 ----
+# 基座向前倾斜 TILT_ANGLE_DEG 度（绕基座 Y 轴）。
+# 世界系三个轴在基座系下的方向：
+#   世界 X = ( cos, 0, sin)   （有 z 分量！世界系水平移动时基座 z 会变）
+#   世界 Y = ( 0,   1, 0  )   （倾斜绕 Y 轴，Y 不变）
+#   世界 Z = (-sin, 0, cos)   （竖直向上；下降 = x 增加 h*sin、z 减小 h*cos）
+# MoveL 的 X/Y/Z 步进均沿世界系方向（可用 GUI 上的开关关闭）。
+TILT_ANGLE_DEG = 45.0
+_S = math.sin(math.radians(TILT_ANGLE_DEG))
+_C = math.cos(math.radians(TILT_ANGLE_DEG))
+V_UP_IN_BASE = (-_S, 0.0, _C)   # 世界 Z（上）≈ (-0.7071, 0, 0.7071)
+V_X_IN_BASE = (_C, 0.0, _S)     # 世界 X      ≈ ( 0.7071, 0, 0.7071)
+V_Y_IN_BASE = (0.0, 1.0, 0.0)   # 世界 Y      =  ( 0,      1, 0     )
+WORLD_AXES_IN_BASE = (V_X_IN_BASE, V_Y_IN_BASE, V_UP_IN_BASE)
+
 
 def quat_to_rotvec(x, y, z, w):
     """四元数 -> 旋转向量 (rx, ry, rz)，模长归一化到 <= pi。"""
@@ -104,6 +119,21 @@ class JogNode(Node):
         q = t.transform.rotation
         rx, ry, rz = quat_to_rotvec(q.x, q.y, q.z, q.w)
         return p.x, p.y, p.z, rx, ry, rz
+
+    def current_tcp_quat(self):
+        """返回当前 TCP 四元数 (x,y,z,w)，查询失败返回 None。
+        用于标定竖直方向：四元数->矩阵无解释歧义，比解析示教器数字可靠。"""
+        if not self.tf_buffer:
+            return None
+        try:
+            t = self.tf_buffer.lookup_transform(
+                BASE_FRAME, TCP_FRAME, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+        except Exception as e:
+            self.get_logger().warn(f"查询 TCP 失败: {e}")
+            return None
+        q = t.transform.rotation
+        return q.x, q.y, q.z, q.w
 
     def send_script(self, script):
         msg = String()
@@ -259,7 +289,18 @@ class JogGUI:
                        command=lambda i=idx: self.jog_cartesian(i, -1)).pack(side=tk.LEFT, padx=2)
             ttk.Button(jog_frame, text=f"{axis}+", width=4,
                        command=lambda i=idx: self.jog_cartesian(i, +1)).pack(side=tk.LEFT, padx=2)
-        ttk.Label(jog_frame, text="（从当前位置出发，姿态保持）").pack(side=tk.LEFT, padx=8)
+
+        tilt_frame = ttk.Frame(root, padding=4)
+        tilt_frame.pack(fill=tk.X)
+        # Z 步进的竖直方向：默认用文件顶部常量，点“标定”按钮用实测姿态重算
+        self.v_up = tuple(V_UP_IN_BASE)
+        self.use_tilt = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tilt_frame, text="倾斜补偿-世界系XYZ（关=基座系）",
+                        variable=self.use_tilt).pack(side=tk.LEFT, padx=4)
+        ttk.Button(tilt_frame, text="标定竖直方向（法兰先调水平）",
+                   command=self.calibrate_up).pack(side=tk.LEFT, padx=8)
+        self.tilt_var = tk.StringVar(value=self._tilt_text(self.v_up))
+        ttk.Label(tilt_frame, textvariable=self.tilt_var).pack(side=tk.LEFT, padx=8)
 
         self.status_var = tk.StringVar(value="等待 /joint_states ...")
         ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN,
@@ -385,7 +426,8 @@ class JogGUI:
         self.node.send_movel(pose, *lav)
 
     def jog_cartesian(self, axis, direction):
-        """从当前 TCP 出发沿基座系 axis 走一条短直线，姿态不变。"""
+        """从当前 TCP 出发走一条短直线，姿态不变。
+        补偿开启时 X/Y/Z 均沿世界系方向（倾斜安装），关闭时沿基座系。"""
         lav = self.get_lav()
         if not lav:
             return
@@ -398,8 +440,40 @@ class JogGUI:
         except ValueError:
             step_m = 0.01
         pose = list(tcp)
-        pose[axis] += direction * step_m
+        if self.use_tilt.get():
+            # 世界系方向（基座倾斜安装）；Z 可被“标定竖直方向”覆盖
+            vec = self.v_up if axis == 2 else WORLD_AXES_IN_BASE[axis]
+            for i in range(3):
+                pose[i] += direction * step_m * vec[i]
+        else:
+            pose[axis] += direction * step_m
         self.node.send_movel(pose, *lav)
+        # 运动结束后自动刷新当前 TCP 显示
+        self.root.after(1500, self.refresh_tcp)
+
+    # ---- 竖直方向标定 ----
+    @staticmethod
+    def _tilt_text(v_up):
+        tilt = math.degrees(math.acos(max(-1.0, min(1.0, v_up[2]))))
+        return f"竖直方向=[{v_up[0]:.3f}, {v_up[1]:.3f}, {v_up[2]:.3f}]  倾斜角={tilt:.1f}°"
+
+    def calibrate_up(self):
+        """用当前姿态标定世界竖直方向（前提：法兰已用水平尺调水平）。
+        四元数直接转矩阵，无 rotvec/RPY 解释歧义。"""
+        quat = self.node.current_tcp_quat()
+        if not quat:
+            self.status_var.set("查询当前 TCP 失败，无法标定")
+            return
+        x, y, z, w = quat
+        n = math.sqrt(x * x + y * y + z * z + w * w)
+        x, y, z, w = x / n, y / n, z / n, w / n
+        # 旋转矩阵第三列 = 工具Z轴在基座系下的方向 = 世界的"下"（法兰水平时）
+        tool_z = (2 * (x * z + w * y),
+                  2 * (y * z - w * x),
+                  1 - 2 * (x * x + y * y))
+        self.v_up = (-tool_z[0], -tool_z[1], -tool_z[2])
+        self.tilt_var.set(self._tilt_text(self.v_up))
+        self.status_var.set("竖直方向已用当前姿态重新标定")
 
     # ---- 从 ROS 线程更新 UI ----
     def poll_queue(self):

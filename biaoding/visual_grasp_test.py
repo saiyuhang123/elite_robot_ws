@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-视觉引导抓取测试脚本（集成 Elite Robot SDK）
+视觉引导抓取测试脚本（控制器原生 movej 版）
 
 功能：
 1. 检测 ArUco 标定板 (ID=0)
 2. 通过手眼标定结果计算目标在基座坐标系下的位置
-3. 使用 Elite Robot SDK (RobotCartesianControl) 控制机械臂运动到目标上方
+3. 通过 /script_sender/script_command 向控制器直接发 movej 脚本
+   （不经过 MoveIt；IK 和轨迹规划都在控制器内部完成）
 4. 支持夹爪控制
 
 使用方法：
-1. 启动机械臂驱动：
+1. 启动机械臂驱动（本脚本依赖驱动的 script_sender 节点和 TF）：
    ros2 launch eli_cs_robot_driver elite_control.launch.py robot_ip:=192.168.1.212 cs_type:=cs66
 
 2. 启动 ROS 相机（开深度并与彩色对齐，目标点坐标优先从深度图直接读取）：
@@ -19,6 +20,9 @@
 
 3. 运行本脚本：
    python3 visual_grasp_test.py
+
+注意：movej 走 def 主脚本，会打断驱动的外部控制程序；脚本退出时会自动
+调用 resend_external_script 恢复（也可以手动恢复后再用 MoveIt）。
 """
 
 import cv2
@@ -31,8 +35,9 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
-from grasp_moveit_msgs.srv import MoveToPose
 import sys
 import os
 import time
@@ -52,14 +57,13 @@ MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 # 接近高度（米）：移动到目标点"正上方"这么高；设为 0 = 直接移动到目标点（用于验证到位精度）
 APPROACH_HEIGHT = 0.00
 
-# 运动方式：MoveIt 服务节点（grasp_move_server）关节空间规划 + 执行。
-# 失败只打印错误信息，不执行运动。需先启动 move_group 与 grasp_move_server。
-MOVEIT_SERVICE = "/grasp_move_server/move_to_pose"
-MOVEIT_BASE_FRAME = "cs66_base_link"
-MOVEIT_VEL_SCALING = 0.2   # 速度缩放 0~1，想更快加大
-MOVEIT_ACC_SCALING = 0.2   # 加速度缩放 0~1
+# 运动方式：控制器原生 movej，通过驱动的 script_sender 节点发送脚本。
+# IK 和轨迹规划都在控制器内部完成；无碰撞检查，目标不可达时控制器报错不执行。
+SCRIPT_TOPIC = "/script_sender/script_command"
+MOVEJ_A = 1.0    # 关节加速度 (rad/s^2)
+MOVEJ_V = 0.2    # 关节速度 (rad/s)，想更快加大
 
-# 零位关节角（rad，H 键回零用，同样走 MoveIt 服务）
+# 零位关节角（rad，H 键回零用）
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 
 # 终点姿态策略（笛卡尔运动时生效）：
@@ -207,6 +211,71 @@ class CameraDetector(Node):
         self.latest_frame = frame
 
 
+# ==========================================================
+# 2. 控制器原生 movej：通过 /script_sender/script_command 发脚本
+# ==========================================================
+class ControllerMover(Node):
+    """向控制器直接发送 movej 脚本（def 主脚本，IK/规划在控制器内部）。"""
+
+    def __init__(self):
+        super().__init__('grasp_script_mover')
+        self.script_pub = self.create_publisher(String, SCRIPT_TOPIC, 10)
+
+    def _send_script(self, script):
+        msg = String()
+        msg.data = script
+        self.script_pub.publish(msg)
+        self.get_logger().info(f"已发送脚本:\n{script}")
+
+    def send_movej_joints(self, joints_rad, a=MOVEJ_A, v=MOVEJ_V):
+        j = ", ".join(f"{x:.6f}" for x in joints_rad)
+        self._send_script(f"def prog():\n    movej([{j}], a={a:.3f}, v={v:.3f}, r=0)\nend")
+
+    def send_movej_pose(self, pos, rotvec, a=MOVEJ_A, v=MOVEJ_V):
+        """位姿目标 movej：pos=(x,y,z) 米，rotvec=(rx,ry,rz) 旋转向量。"""
+        p = ", ".join(f"{x:.6f}" for x in (*pos, *rotvec))
+        self._send_script(f"def prog():\n    movej([{p}], a={a:.3f}, v={v:.3f}, r=0)\nend")
+
+    def wait_motion_done(self, robot_node, timeout=30.0, settle_eps=0.0008):
+        """轮询 TCP 位姿，连续多次基本不动视为运动结束。
+        前 1 秒为宽限期（等脚本到达控制器、机器人启动），期间不算完成。"""
+        start = time.time()
+        last = None
+        stable = 0
+        while time.time() - start < timeout:
+            for _ in range(5):
+                rclpy.spin_once(robot_node, timeout_sec=0.02)
+            tcp = robot_node.get_tcp_pose()
+            if tcp is None:
+                continue
+            pos = np.array(tcp[0])
+            if (last is not None and time.time() - start > 1.0
+                    and np.linalg.norm(pos - last) < settle_eps):
+                stable += 1
+                if stable >= 5:
+                    return True
+            else:
+                stable = 0
+            last = pos
+            time.sleep(0.05)
+        return False
+
+    def resend_external_script(self):
+        """恢复驱动的外部控制程序（def 脚本会把它打断）。"""
+        cli = self.create_client(Trigger, "/io_and_status_controller/resend_external_script")
+        if not cli.wait_for_service(timeout_sec=2.0):
+            return False
+        future = cli.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self, future)
+        resp = future.result()
+        return bool(resp and resp.success)
+
+
+def quat_to_rotvec(quat):
+    """(x,y,z,w) 四元数 -> 旋转向量。"""
+    return Rot.from_quat(quat).as_rotvec()
+
+
 def main():
     """主函数"""
 
@@ -253,13 +322,9 @@ def main():
     print("\n提示：本脚本不执行上电/松闸（避免停止机器人侧脚本）。")
     print("      请确认示教器上机械臂处于 RUNNING 状态。")
 
-    # MoveIt 规划服务客户端（需已启动 move_group + grasp_move_server）
-    moveit_node = rclpy.create_node("grasp_moveit_client")
-    moveit_cli = moveit_node.create_client(MoveToPose, MOVEIT_SERVICE)
-    if not moveit_cli.wait_for_service(timeout_sec=3.0):
-        print(f"警告：MoveIt 服务 {MOVEIT_SERVICE} 暂不可用，按 G 将无法运动。")
-        print("      请先启动: ros2 launch my_elite_robot_cell_moveit_config move_group.launch.py")
-        print("             ros2 run hello_moveit grasp_move_server")
+    # 控制器 movej 脚本发送节点（只需驱动在跑，不需要 move_group）
+    mover = ControllerMover()
+    executor.add_node(mover)
 
     # ==========================================================
     # 4. 初始化相机检测节点（订阅 ROS 相机话题，需先启动相机驱动）
@@ -372,18 +437,18 @@ def main():
                 #     continue
 
                 # ----------------------------------------------------
-                # 【步骤三】：通过 MoveIt 服务节点规划并执行运动
-                #   OMPL 关节空间采样规划，自动绕开奇异位姿；
-                #   失败只打印信息，不执行运动。
+                # 【步骤三】：向控制器直接发送 movej 脚本
+                #   IK 和关节空间规划都在控制器内部完成；
+                #   无碰撞检查，目标不可达时控制器报错不执行。
                 # ----------------------------------------------------
-                print("3. 正在通过 MoveIt 规划并执行运动...")
+                print("3. 正在向控制器发送 movej 指令...")
 
                 # 终点姿态：fixed = 固定的常用抓取姿态（已按斜装底座校正）；keep = 保持当前姿态
                 if GRASP_ORIENTATION_MODE == "fixed":
-                    target_quat = Rot.from_rotvec(FIXED_GRASP_ROTVEC).as_quat()
+                    target_rotvec = FIXED_GRASP_ROTVEC
                     print("   终点姿态: 固定抓取姿态（法兰朝下, 已按底座倾斜校正）")
                 else:
-                    target_quat = current_ori
+                    target_rotvec = quat_to_rotvec(current_ori)
 
                 target_x = target_in_base[0]
                 target_y = target_in_base[1]
@@ -394,29 +459,11 @@ def main():
                 )
                 print(f"   运动距离: {move_dist:.3f}m")
 
-                req = MoveToPose.Request()
-                req.target_pose.header.frame_id = MOVEIT_BASE_FRAME
-                req.target_pose.pose.position.x = float(target_x)
-                req.target_pose.pose.position.y = float(target_y)
-                req.target_pose.pose.position.z = float(target_z)
-                req.target_pose.pose.orientation.x = float(target_quat[0])
-                req.target_pose.pose.orientation.y = float(target_quat[1])
-                req.target_pose.pose.orientation.z = float(target_quat[2])
-                req.target_pose.pose.orientation.w = float(target_quat[3])
-                req.velocity_scaling = MOVEIT_VEL_SCALING
-                req.acceleration_scaling = MOVEIT_ACC_SCALING
-
-                if not moveit_cli.service_is_ready():
-                    print("4. MoveIt 服务不可用（grasp_move_server 未启动），本次不运动")
+                mover.send_movej_pose((target_x, target_y, target_z), target_rotvec)
+                if mover.wait_motion_done(robot_node):
+                    print("4. 机械臂已到达目标上方！")
                 else:
-                    future = moveit_cli.call_async(req)
-                    rclpy.spin_until_future_complete(moveit_node, future)
-                    resp = future.result()
-                    if resp is not None and resp.success:
-                        print("4. 机械臂已到达目标上方！")
-                    else:
-                        detail = resp.message if resp is not None else "服务无响应"
-                        print(f"4. MoveIt 规划/执行失败: {detail}，本次不运动")
+                    print("4. 等待运动结束超时（可能目标不可达被控制器拒绝，看示教器报错）")
 
                 print("================================\n")
 
@@ -430,33 +477,25 @@ def main():
                 print("打开夹爪...")
                 robot_node.open_gripper(pin=0)
 
-            # 按 H 回到零位（走 MoveIt 服务，不直接占用控制器）
+            # 按 H 回到零位（控制器 movej，关节角目标）
             if key == ord('h') or key == ord('H'):
                 print("回到零位...")
-                req = MoveToPose.Request()
-                req.joint_target = [float(j) for j in HOME_JOINTS]
-                req.velocity_scaling = MOVEIT_VEL_SCALING
-                req.acceleration_scaling = MOVEIT_ACC_SCALING
-                if not moveit_cli.service_is_ready():
-                    print("MoveIt 服务不可用（grasp_move_server 未启动），无法回零")
+                mover.send_movej_joints(HOME_JOINTS)
+                if mover.wait_motion_done(robot_node):
+                    print("已回到零位")
                 else:
-                    future = moveit_cli.call_async(req)
-                    rclpy.spin_until_future_complete(moveit_node, future)
-                    resp = future.result()
-                    if resp is not None and resp.success:
-                        print("已回到零位")
-                    else:
-                        detail = resp.message if resp is not None else "服务无响应"
-                        print(f"回零失败: {detail}")
+                    print("回零等待超时（看示教器是否有报错）")
 
     except KeyboardInterrupt:
         print("\n用户中断")
     finally:
-        # 清理资源
+        # 清理资源；恢复驱动的外部控制程序（def 脚本把它打断了）
         cv2.destroyAllWindows()
+        if mover.resend_external_script():
+            print("已恢复驱动外部控制程序")
         cam_node.destroy_node()
         robot_node.destroy_node()
-        moveit_node.destroy_node()
+        mover.destroy_node()
         rclpy.shutdown()
         print("资源已清理，程序退出。")
 
