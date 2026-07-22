@@ -26,6 +26,7 @@
 """
 
 import cv2
+import math
 import numpy as np
 import json
 from scipy.spatial.transform import Rotation as Rot
@@ -46,7 +47,11 @@ import signal
 # 添加 elite_robot_example 包路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'elite_robot_example'))
 
-from elite_robot_example.robot_cartesian_control import RobotCartesianControl
+from elite_robot_example.robot_cartesian_control import (
+    RobotCartesianControl,
+    cs66_inverse_kinematics,
+    cs66_forward_kinematics,
+)
 
 # 手动补偿量（米）：改正 TCP/标定的固定偏移
 # 正值为正方向偏移，试出来之后填这里，不用重新标定
@@ -54,11 +59,20 @@ MANUAL_OFFSET_X = 0.00  # 机器人基座 X 方向
 MANUAL_OFFSET_Y = 0.00  # 机器人基座 Y 方向
 MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 
-# 接近高度（米）：移动到目标点"正上方"这么高；设为 0 = 直接移动到目标点（用于验证到位精度）
-APPROACH_HEIGHT = 0.00
+# ---- 倾斜安装补偿 ----
+# 基座向前倾斜 TILT_ANGLE_DEG 度（绕基座 Y 轴）：
+# 世界系"竖直向上"在基座系下 = (-sin, 0, cos)。
+# 预抓取点 = 目标点 + APPROACH_HEIGHT × V_UP_IN_BASE（世界系正上方，不是基座 Z 上方）
+TILT_ANGLE_DEG = 45.0
+V_UP_IN_BASE = np.array([-np.sin(np.radians(TILT_ANGLE_DEG)), 0.0,
+                         np.cos(np.radians(TILT_ANGLE_DEG))])  # ≈ (-0.7071, 0, 0.7071)
 
-# 运动方式：控制器原生 movej，通过驱动的 script_sender 节点发送脚本。
-# IK 和轨迹规划都在控制器内部完成；无碰撞检查，目标不可达时控制器报错不执行。
+# 接近高度（米）：停在目标点在【世界坐标系】正上方这么高；设为 0 = 直接到目标点
+APPROACH_HEIGHT = 0.20
+
+# 运动方式：本地 IK（scipy 数值法，当前关节角做初值取就近解）
+# + 控制器原生 movej（/script_sender/script_command 发脚本）。
+# 无碰撞检查；IK 失败或 FK 验证误差过大时不运动。
 SCRIPT_TOPIC = "/script_sender/script_command"
 MOVEJ_A = 1.0    # 关节加速度 (rad/s^2)
 MOVEJ_V = 0.2    # 关节速度 (rad/s)，想更快加大
@@ -66,13 +80,38 @@ MOVEJ_V = 0.2    # 关节速度 (rad/s)，想更快加大
 # 零位关节角（rad，H 键回零用）
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 
-# 终点姿态策略（笛卡尔运动时生效）：
-#   "fixed" - 固定为常用抓取姿态（底座斜装，"竖直向下"≠ base -Z，此值来自实测常用位姿，推荐）
-#   "keep"  - 保持当前姿态（姿态别扭时容易奇异失败）
-GRASP_ORIENTATION_MODE = "keep"
+# 终点姿态策略：
+#   "fixed"         - 固定抓取姿态（法兰竖直朝下，FIXED_GRASP_ROTVEC）
+#   "fixed_nearest" - 法兰同样竖直朝下，但绕竖直轴的自转角取"离当前姿态最近"，
+#                     避免从某些初始位姿出发手腕绕大圈（推荐）
+#   "keep"          - 保持当前姿态（姿态别扭时容易奇异失败）
+GRASP_ORIENTATION_MODE = "fixed_nearest"
 
-# 常用抓取姿态（法兰朝下，来自实测位姿的 FK，rotvec 格式）
-FIXED_GRASP_ROTVEC = np.array([-0.286496, 2.242937, 0.043244])
+# 固定抓取姿态（法兰竖直朝下的实测位姿，旋转向量 rad——控制器上报/示教器
+# 显示的姿态都是旋转向量，读出来什么就填什么，不要换算）
+FIXED_GRASP_ROTVEC = np.array([-2.9895, 0.749, -0.2910])
+
+
+def nearest_down_orientation(current_quat):
+    """在"法兰竖直朝下"的所有姿态中，选离当前姿态旋转量最小的那个。
+
+    做法：把当前工具 Z 轴沿最短弧转到世界"下"方向（转轴=两向量叉乘），
+    其余自由度保持不动。返回 scipy Rotation。"""
+    down = -V_UP_IN_BASE  # 世界系"下"在基座系下的方向
+    r_cur = Rot.from_quat(current_quat)
+    z_cur = r_cur.apply([0.0, 0.0, 1.0])  # 当前工具 Z 轴在基座系下的方向
+
+    cos_a = float(np.clip(z_cur @ down, -1.0, 1.0))
+    if cos_a > 0.99999:
+        return r_cur  # 已经朝下，直接用当前姿态
+    if cos_a < -0.99999:
+        return Rot.from_rotvec(FIXED_GRASP_ROTVEC)  # 几乎不可能，退回固定姿态
+
+    axis = np.cross(z_cur, down)
+    axis /= np.linalg.norm(axis)
+    angle = math.acos(cos_a)
+    r_align = Rot.from_rotvec(axis * angle)
+    return r_align * r_cur
 
 # CS66 几何参数（用于可达性预检，见 default_kinematics.yaml）
 SHOULDER_Z = 0.1625   # 肩关节距基座高度
@@ -231,11 +270,6 @@ class ControllerMover(Node):
         j = ", ".join(f"{x:.6f}" for x in joints_rad)
         self._send_script(f"def prog():\n    movej([{j}], a={a:.3f}, v={v:.3f}, r=0)\nend")
 
-    def send_movej_pose(self, pos, rotvec, a=MOVEJ_A, v=MOVEJ_V):
-        """位姿目标 movej：pos=(x,y,z) 米，rotvec=(rx,ry,rz) 旋转向量。"""
-        p = ", ".join(f"{x:.6f}" for x in (*pos, *rotvec))
-        self._send_script(f"def prog():\n    movej([{p}], a={a:.3f}, v={v:.3f}, r=0)\nend")
-
     def wait_motion_done(self, robot_node, timeout=30.0, settle_eps=0.0008):
         """轮询 TCP 位姿，连续多次基本不动视为运动结束。
         前 1 秒为宽限期（等脚本到达控制器、机器人启动），期间不算完成。"""
@@ -269,11 +303,6 @@ class ControllerMover(Node):
         rclpy.spin_until_future_complete(self, future)
         resp = future.result()
         return bool(resp and resp.success)
-
-
-def quat_to_rotvec(quat):
-    """(x,y,z,w) 四元数 -> 旋转向量。"""
-    return Rot.from_quat(quat).as_rotvec()
 
 
 def main():
@@ -423,11 +452,13 @@ def main():
                 target_in_base[1] += MANUAL_OFFSET_Y
                 target_in_base[2] += MANUAL_OFFSET_Z
 
-                # 接近高度：0 = 直接到目标点；>0 = 抬高到目标上方
+                # 接近高度：沿【世界系竖直方向】抬高（倾斜安装补偿），
+                # 0 = 直接到目标点；>0 = 停在目标点世界系正上方
                 if APPROACH_HEIGHT > 0:
-                    target_in_base[2] += APPROACH_HEIGHT
+                    target_in_base = target_in_base + APPROACH_HEIGHT * V_UP_IN_BASE
 
-                print(f"2. 计算目标在基座坐标系: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={target_in_base[2]:.4f}")
+                print(f"2. 计算目标在基座坐标系: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={target_in_base[2]:.4f}"
+                      f"（已沿世界系竖直方向抬高 {APPROACH_HEIGHT:.2f}m）")
 
                 # 可达性预检：目标到肩关节的斜距超过臂展就必然无解，直接给出人话提示  去掉
                 # slant = np.linalg.norm(target_in_base - np.array([0.0, 0.0, SHOULDER_Z]))
@@ -437,18 +468,24 @@ def main():
                 #     continue
 
                 # ----------------------------------------------------
-                # 【步骤三】：向控制器直接发送 movej 脚本
-                #   IK 和关节空间规划都在控制器内部完成；
-                #   无碰撞检查，目标不可达时控制器报错不执行。
+                # 【步骤三】：本地 IK 解算关节角 + 控制器 movej
+                #   EliRobot 脚本的 movej([6个数]) 只认关节角（位姿目标会被
+                #   误当关节角执行），所以先本地 IK（当前关节角做初值，
+                #   就近解），再以关节角目标发 movej。
                 # ----------------------------------------------------
-                print("3. 正在向控制器发送 movej 指令...")
+                print("3. 正在本地 IK 解算并发送 movej 指令...")
 
-                # 终点姿态：fixed = 固定的常用抓取姿态（已按斜装底座校正）；keep = 保持当前姿态
+                # 终点姿态：fixed = 固定抓取姿态；fixed_nearest = 同样法兰朝下，
+                # 但自转角取离当前最近的；keep = 保持当前姿态
                 if GRASP_ORIENTATION_MODE == "fixed":
-                    target_rotvec = FIXED_GRASP_ROTVEC
-                    print("   终点姿态: 固定抓取姿态（法兰朝下, 已按底座倾斜校正）")
+                    target_rotation = Rot.from_rotvec(FIXED_GRASP_ROTVEC)
+                    print("   终点姿态: 固定抓取姿态（法兰朝下）")
+                elif GRASP_ORIENTATION_MODE == "fixed_nearest":
+                    target_rotation = nearest_down_orientation(current_ori)
+                    print(f"   终点姿态: 法兰朝下（自转角就近）rotvec={np.round(target_rotation.as_rotvec(), 3)}")
                 else:
-                    target_rotvec = quat_to_rotvec(current_ori)
+                    target_rotation = Rot.from_quat(current_ori)
+                target_rot = target_rotation.as_matrix()
 
                 target_x = target_in_base[0]
                 target_y = target_in_base[1]
@@ -459,11 +496,30 @@ def main():
                 )
                 print(f"   运动距离: {move_dist:.3f}m")
 
-                mover.send_movej_pose((target_x, target_y, target_z), target_rotvec)
+                q_guess = robot_node.get_joint_positions()
+                if q_guess is None:
+                    print("4. 无法获取当前关节角，本次不运动")
+                    continue
+                joint_target = cs66_inverse_kinematics(
+                    np.array([target_x, target_y, target_z]), target_rot, q_guess)
+                if joint_target is None:
+                    print("4. IK 解算失败，目标不可达，本次不运动")
+                    continue
+
+                # FK 验证 IK 结果
+                fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
+                pos_err = float(np.linalg.norm(fk_pos - np.array([target_x, target_y, target_z])))
+                rot_err = float(Rot.from_matrix(fk_rot.T @ target_rot).magnitude())
+                print(f"   IK 成功，位置误差: {pos_err:.4f}m, 姿态误差: {math.degrees(rot_err):.2f}°")
+                if pos_err > 0.02 or rot_err > math.radians(5):
+                    print("4. IK 误差过大（目标可能不可达），本次不运动")
+                    continue
+
+                mover.send_movej_joints(joint_target)
                 if mover.wait_motion_done(robot_node):
                     print("4. 机械臂已到达目标上方！")
                 else:
-                    print("4. 等待运动结束超时（可能目标不可达被控制器拒绝，看示教器报错）")
+                    print("4. 等待运动结束超时（看示教器是否有报错）")
 
                 print("================================\n")
 

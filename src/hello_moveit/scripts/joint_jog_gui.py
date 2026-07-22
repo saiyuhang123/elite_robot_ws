@@ -70,7 +70,9 @@ WORLD_AXES_IN_BASE = (V_X_IN_BASE, V_Y_IN_BASE, V_UP_IN_BASE)
 
 
 def quat_to_rotvec(x, y, z, w):
-    """四元数 -> 旋转向量 (rx, ry, rz)，模长归一化到 <= pi。"""
+    """四元数 -> 旋转向量 (rx, ry, rz)，模长归一化到 <= pi。
+    艾利特控制器上报和脚本指令的位姿姿态部分都是旋转向量
+    （驱动 hardware_interface 按轴角解析上报的 TCP 姿态）。"""
     n = math.sqrt(x * x + y * y + z * z + w * w)
     x, y, z, w = x / n, y / n, z / n, w / n
     angle = 2.0 * math.acos(max(-1.0, min(1.0, w)))
@@ -105,7 +107,7 @@ class JogNode(Node):
         self.ui_queue.put(("current", [math.degrees(p) for p in positions]))
 
     def current_tcp(self):
-        """返回当前 TCP (x,y,z,rx,ry,rz)，查询失败返回 None。"""
+        """返回当前 TCP (x,y,z,rx,ry,rz)，rx/ry/rz 为旋转向量，查询失败返回 None。"""
         if not self.tf_buffer:
             return None
         try:
@@ -147,7 +149,7 @@ class JogNode(Node):
                            ", ".join(f"{d:.1f}" for d in joints_deg) + "]"))
 
     def send_movel(self, pose, a, v):
-        # EliRobot 脚本里位姿就是 6 元素列表 [x,y,z,rx,ry,rz]，
+        # EliRobot 脚本里位姿是 6 元素列表 [x,y,z,rx,ry,rz]，姿态部分为旋转向量(rad)。
         # 不要用 URScript 的 p[...] 写法（p 是内置函数，会报“不支持下标操作”）
         p = ", ".join(f"{x:.6f}" for x in pose)
         self.send_script(f"def prog():\n    movel([{p}], a={a:.3f}, v={v:.3f})\nend")
@@ -459,7 +461,7 @@ class JogGUI:
 
     def calibrate_up(self):
         """用当前姿态标定世界竖直方向（前提：法兰已用水平尺调水平）。
-        四元数直接转矩阵，无 rotvec/RPY 解释歧义。"""
+        四元数直接转矩阵，与姿态的显示/发送格式无关。"""
         quat = self.node.current_tcp_quat()
         if not quat:
             self.status_var.set("查询当前 TCP 失败，无法标定")
