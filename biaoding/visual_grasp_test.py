@@ -407,11 +407,20 @@ def main():
                 # 【步骤二】：执行空间坐标系转换
                 #   - 标定板在相机坐标系: P_cam
                 #   - 手眼标定: 相机→末端: P_tool = R_cam2tool * P_cam + t_cam2tool
+                #     （标定时用的是 URDF tool0 = 物理法兰系）
                 #   - 末端→基座:  P_base = R_tool2base * P_tool + t_tool2base
+                #     （因此这里也必须用物理法兰系的姿态 = FK；
+                #      不能用控制器上报的 tool0_controller，它带 ~118° TCP 旋转偏移）
                 # ----------------------------------------------------
                 # A. 构造当前末端到基座的变换矩阵
+                #    位置：控制器上报即可（TCP偏移平移为零，与FK一致）
+                #    姿态：用当前关节角的 FK（物理法兰系，与手眼标定一致）
+                q_now = robot_node.get_joint_positions()
+                if q_now is None:
+                    print("错误：无法获取当前关节角！")
+                    continue
+                _, R_tool2base = cs66_forward_kinematics(q_now)
                 t_tool2base = np.array(current_pos).reshape(3, 1)
-                R_tool2base = Rot.from_quat(current_ori).as_matrix()
 
                 # B. 将标定板坐标从相机系转换到末端系
                 P_c = detected_p_cam.reshape(3, 1)
