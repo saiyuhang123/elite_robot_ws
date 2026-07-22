@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'elite_r
 
 from elite_robot_example.robot_cartesian_control import (
     RobotCartesianControl,
-    cs66_inverse_kinematics,
+    cs66_inverse_kinematics_5dof,
     cs66_forward_kinematics,
 )
 
@@ -60,12 +60,13 @@ MANUAL_OFFSET_Y = 0.00  # 机器人基座 Y 方向
 MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 
 # ---- 倾斜安装补偿 ----
-# 基座向前倾斜 TILT_ANGLE_DEG 度（绕基座 Y 轴）：
-# 世界系"竖直向上"在基座系下 = (-sin, 0, cos)。
-# 预抓取点 = 目标点 + APPROACH_HEIGHT × V_UP_IN_BASE（世界系正上方，不是基座 Z 上方）
-TILT_ANGLE_DEG = 45.0
-V_UP_IN_BASE = np.array([-np.sin(np.radians(TILT_ANGLE_DEG)), 0.0,
-                         np.cos(np.radians(TILT_ANGLE_DEG))])  # ≈ (-0.7071, 0, 0.7071)
+# 基座倾斜安装，世界系"竖直向上"在基座系下的方向（实测值，倾斜角约48°）。
+# 测量方法：物理法兰调水平后 tf2_echo cs66_base_link cs66_tool0，
+# 取旋转矩阵第三列（法兰Z轴=世界的"下"）取反。
+# 注意：不要用 cs66_tool0_controller（控制器上报的虚拟TCP）——它和物理
+# 法兰差一个约118°的固定旋转（TCP偏移），姿态数据全是错的；位置不受影响。
+# 预抓取点 = 目标点 + APPROACH_HEIGHT × V_UP_IN_BASE（世界系正上方）
+V_UP_IN_BASE = np.array([-0.7431, 0.0120, 0.6691])
 
 # 接近高度（米）：停在目标点在【世界坐标系】正上方这么高；设为 0 = 直接到目标点
 APPROACH_HEIGHT = 0.20
@@ -80,38 +81,11 @@ MOVEJ_V = 0.2    # 关节速度 (rad/s)，想更快加大
 # 零位关节角（rad，H 键回零用）
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 
-# 终点姿态策略：
-#   "fixed"         - 固定抓取姿态（法兰竖直朝下，FIXED_GRASP_ROTVEC）
-#   "fixed_nearest" - 法兰同样竖直朝下，但绕竖直轴的自转角取"离当前姿态最近"，
-#                     避免从某些初始位姿出发手腕绕大圈（推荐）
-#   "keep"          - 保持当前姿态（姿态别扭时容易奇异失败）
-GRASP_ORIENTATION_MODE = "fixed_nearest"
-
-# 固定抓取姿态（法兰竖直朝下的实测位姿，旋转向量 rad——控制器上报/示教器
-# 显示的姿态都是旋转向量，读出来什么就填什么，不要换算）
-FIXED_GRASP_ROTVEC = np.array([-2.9895, 0.749, -0.2910])
-
-
-def nearest_down_orientation(current_quat):
-    """在"法兰竖直朝下"的所有姿态中，选离当前姿态旋转量最小的那个。
-
-    做法：把当前工具 Z 轴沿最短弧转到世界"下"方向（转轴=两向量叉乘），
-    其余自由度保持不动。返回 scipy Rotation。"""
-    down = -V_UP_IN_BASE  # 世界系"下"在基座系下的方向
-    r_cur = Rot.from_quat(current_quat)
-    z_cur = r_cur.apply([0.0, 0.0, 1.0])  # 当前工具 Z 轴在基座系下的方向
-
-    cos_a = float(np.clip(z_cur @ down, -1.0, 1.0))
-    if cos_a > 0.99999:
-        return r_cur  # 已经朝下，直接用当前姿态
-    if cos_a < -0.99999:
-        return Rot.from_rotvec(FIXED_GRASP_ROTVEC)  # 几乎不可能，退回固定姿态
-
-    axis = np.cross(z_cur, down)
-    axis /= np.linalg.norm(axis)
-    angle = math.acos(cos_a)
-    r_align = Rot.from_rotvec(axis * angle)
-    return r_align * r_cur
+# 终点姿态策略（5 维 IK：只约束工具 Z 轴方向，绕法兰的自转放开）：
+#   "down" - 工具 Z 轴朝世界系的"下"（法兰竖直朝下，抓取用，推荐）
+#   "keep" - 保持当前工具 Z 轴方向
+# （"fixed"/"fixed_nearest" 旧值等同 "down"）
+GRASP_ORIENTATION_MODE = "down"
 
 # CS66 几何参数（用于可达性预检，见 default_kinematics.yaml）
 SHOULDER_Z = 0.1625   # 肩关节距基座高度
@@ -468,24 +442,20 @@ def main():
                 #     continue
 
                 # ----------------------------------------------------
-                # 【步骤三】：本地 IK 解算关节角 + 控制器 movej
-                #   EliRobot 脚本的 movej([6个数]) 只认关节角（位姿目标会被
-                #   误当关节角执行），所以先本地 IK（当前关节角做初值，
-                #   就近解），再以关节角目标发 movej。
+                # 【步骤三】：本地 5 维 IK 解算关节角 + 控制器 movej
+                #   只约束位置 + 工具轴方向（绕法兰自转放开，求解器自取最优），
+                #   EliRobot 脚本的 movej([6个数]) 只认关节角，故先 IK 再发。
                 # ----------------------------------------------------
                 print("3. 正在本地 IK 解算并发送 movej 指令...")
 
-                # 终点姿态：fixed = 固定抓取姿态；fixed_nearest = 同样法兰朝下，
-                # 但自转角取离当前最近的；keep = 保持当前姿态
-                if GRASP_ORIENTATION_MODE == "fixed":
-                    target_rotation = Rot.from_rotvec(FIXED_GRASP_ROTVEC)
-                    print("   终点姿态: 固定抓取姿态（法兰朝下）")
-                elif GRASP_ORIENTATION_MODE == "fixed_nearest":
-                    target_rotation = nearest_down_orientation(current_ori)
-                    print(f"   终点姿态: 法兰朝下（自转角就近）rotvec={np.round(target_rotation.as_rotvec(), 3)}")
+                # 目标工具轴方向（基座系）：down = 世界系的"下"；keep = 保持当前方向
+                if GRASP_ORIENTATION_MODE in ("down", "fixed", "fixed_nearest"):
+                    target_dir = -V_UP_IN_BASE
+                    print(f"   终点方向: 工具轴朝世界系下方 {np.round(target_dir, 3)}（自转放开）")
                 else:
-                    target_rotation = Rot.from_quat(current_ori)
-                target_rot = target_rotation.as_matrix()
+                    _, cur_rot = cs66_forward_kinematics(robot_node.get_joint_positions())
+                    target_dir = cur_rot[:, 2]  # FK=物理法兰，当前工具Z轴方向
+                    print("   终点方向: 保持当前工具轴方向")
 
                 target_x = target_in_base[0]
                 target_y = target_in_base[1]
@@ -500,18 +470,29 @@ def main():
                 if q_guess is None:
                     print("4. 无法获取当前关节角，本次不运动")
                     continue
-                joint_target = cs66_inverse_kinematics(
-                    np.array([target_x, target_y, target_z]), target_rot, q_guess)
+
+                # FK 模型 = URDF = 物理法兰坐标系，姿态天然一致，无需校正。
+                # （控制器上报的 tool0_controller 带 TCP 旋转偏移，仅用于位置，
+                #  位置偏移为零，不影(响)FK 对比）
+                fk_pos_now, _ = cs66_forward_kinematics(q_guess)
+                pos_drift = float(np.linalg.norm(fk_pos_now - np.array(current_pos)))
+                if pos_drift > 0.01:
+                    print(f"   !! 警告: FK 位置与控制器上报偏差 {pos_drift*1000:.1f}mm，模型可能不一致")
+
+                joint_target = cs66_inverse_kinematics_5dof(
+                    np.array([target_x, target_y, target_z]), target_dir, q_guess)
                 if joint_target is None:
                     print("4. IK 解算失败，目标不可达，本次不运动")
                     continue
 
-                # FK 验证 IK 结果
+                # FK 验证 IK 结果：位置误差 + 工具轴方向误差（自转不检查）
                 fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
                 pos_err = float(np.linalg.norm(fk_pos - np.array([target_x, target_y, target_z])))
-                rot_err = float(Rot.from_matrix(fk_rot.T @ target_rot).magnitude())
-                print(f"   IK 成功，位置误差: {pos_err:.4f}m, 姿态误差: {math.degrees(rot_err):.2f}°")
-                if pos_err > 0.02 or rot_err > math.radians(5):
+                achieved_dir = fk_rot[:, 2]
+                dir_err = math.degrees(math.acos(
+                    float(np.clip(achieved_dir @ target_dir, -1.0, 1.0))))
+                print(f"   IK 成功，位置误差: {pos_err:.4f}m, 方向误差: {dir_err:.2f}°")
+                if pos_err > 0.02 or dir_err > 5.0:
                     print("4. IK 误差过大（目标可能不可达），本次不运动")
                     continue
 

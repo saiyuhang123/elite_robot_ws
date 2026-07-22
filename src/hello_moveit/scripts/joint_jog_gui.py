@@ -54,18 +54,26 @@ JOINT_ORDER = [
 ]
 
 # ---- 倾斜安装补偿 ----
-# 基座向前倾斜 TILT_ANGLE_DEG 度（绕基座 Y 轴）。
-# 世界系三个轴在基座系下的方向：
-#   世界 X = ( cos, 0, sin)   （有 z 分量！世界系水平移动时基座 z 会变）
-#   世界 Y = ( 0,   1, 0  )   （倾斜绕 Y 轴，Y 不变）
-#   世界 Z = (-sin, 0, cos)   （竖直向上；下降 = x 增加 h*sin、z 减小 h*cos）
-# MoveL 的 X/Y/Z 步进均沿世界系方向（可用 GUI 上的开关关闭）。
-TILT_ANGLE_DEG = 45.0
-_S = math.sin(math.radians(TILT_ANGLE_DEG))
-_C = math.cos(math.radians(TILT_ANGLE_DEG))
-V_UP_IN_BASE = (-_S, 0.0, _C)   # 世界 Z（上）≈ (-0.7071, 0, 0.7071)
-V_X_IN_BASE = (_C, 0.0, _S)     # 世界 X      ≈ ( 0.7071, 0, 0.7071)
-V_Y_IN_BASE = (0.0, 1.0, 0.0)   # 世界 Y      =  ( 0,      1, 0     )
+# 基座倾斜安装（实测倾斜角约48°）。世界系"上"在基座系下的方向（实测值）：
+# 物理法兰调水平后 tf2_echo cs66_base_link cs66_tool0，取矩阵第三列取反。
+# 注意：不要用 cs66_tool0_controller（虚拟TCP，与物理法兰差约118°旋转）。
+# 世界系 X/Y/Z 由该向量构建正交基；MoveL 步进沿世界系方向。
+V_UP_IN_BASE = (-0.7431, 0.0120, 0.6691)
+
+
+def _build_world_axes(v_up):
+    """由世界的'上'构建正交的世界系 X/Y 轴（以基座 Y 为参考）。"""
+    import numpy as _np
+    up = _np.array(v_up, dtype=float)
+    up /= _np.linalg.norm(up)
+    y = _np.array([0.0, 1.0, 0.0])
+    y = y - (y @ up) * up
+    y /= _np.linalg.norm(y)
+    x = _np.cross(y, up)
+    return tuple(x), tuple(y), tuple(up)
+
+
+V_X_IN_BASE, V_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 WORLD_AXES_IN_BASE = (V_X_IN_BASE, V_Y_IN_BASE, V_UP_IN_BASE)
 
 
@@ -460,22 +468,29 @@ class JogGUI:
         return f"竖直方向=[{v_up[0]:.3f}, {v_up[1]:.3f}, {v_up[2]:.3f}]  倾斜角={tilt:.1f}°"
 
     def calibrate_up(self):
-        """用当前姿态标定世界竖直方向（前提：法兰已用水平尺调水平）。
-        四元数直接转矩阵，与姿态的显示/发送格式无关。"""
-        quat = self.node.current_tcp_quat()
-        if not quat:
-            self.status_var.set("查询当前 TCP 失败，无法标定")
+        """用当前姿态标定世界竖直方向（前提：物理法兰已用水平尺调水平）。
+        查 URDF 物理法兰（cs66_tool0）的 TF——不要用 tool0_controller
+        （控制器上报的虚拟TCP，带约118°的 TCP 旋转偏移）。"""
+        if not self.node.tf_buffer:
             return
-        x, y, z, w = quat
+        try:
+            t = self.node.tf_buffer.lookup_transform(
+                BASE_FRAME, "cs66_tool0", rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+        except Exception as e:
+            self.status_var.set(f"查询 cs66_tool0 失败: {e}")
+            return
+        q = t.transform.rotation
+        x, y, z, w = q.x, q.y, q.z, q.w
         n = math.sqrt(x * x + y * y + z * z + w * w)
         x, y, z, w = x / n, y / n, z / n, w / n
-        # 旋转矩阵第三列 = 工具Z轴在基座系下的方向 = 世界的"下"（法兰水平时）
+        # 旋转矩阵第三列 = 物理法兰Z轴在基座系下的方向 = 世界的"下"（法兰水平时）
         tool_z = (2 * (x * z + w * y),
                   2 * (y * z - w * x),
                   1 - 2 * (x * x + y * y))
         self.v_up = (-tool_z[0], -tool_z[1], -tool_z[2])
         self.tilt_var.set(self._tilt_text(self.v_up))
-        self.status_var.set("竖直方向已用当前姿态重新标定")
+        self.status_var.set("竖直方向已用物理法兰姿态重新标定")
 
     # ---- 从 ROS 线程更新 UI ----
     def poll_queue(self):

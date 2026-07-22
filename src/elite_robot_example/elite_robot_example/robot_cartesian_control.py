@@ -186,6 +186,72 @@ def cs66_inverse_kinematics(
     return None
 
 
+def cs66_inverse_kinematics_5dof(
+    target_pos: np.ndarray,
+    target_tool_z: np.ndarray,
+    q_guess: List[float],
+    max_iter: int = 200,
+    tolerance: float = 1e-4,
+    joint_margin: float = math.pi,  # ±180° 范围
+    tool_axis: Optional[np.ndarray] = None,
+) -> Optional[List[float]]:
+    """
+    CS66 五维逆运动学（数值法，Levenberg-Marquardt + 正则化）
+
+    只约束【位置(3维) + 工具Z轴方向(2维)】，绕工具轴的自转完全放开，
+    由求解器自行取最优（通常是离初值最近的自转角）。
+    适合"法兰朝下抓取"这类不关心夹爪自转角的场景，可达域比 6 维 IK 更大。
+
+    Args:
+        target_pos: 目标位置 [x, y, z]
+        target_tool_z: 目标工具轴方向（基座系单位向量，如朝下 = 世界的"下"）
+        q_guess: 初始关节角度猜测（弧度）
+        max_iter: 最大迭代次数
+        tolerance: 收敛精度
+        joint_margin: 关节偏离初始值的最大范围（弧度），默认 ±π
+        tool_axis: 工具轴在模型末端坐标系下的方向，默认 [0,0,1]；
+                   模型与控制器末端约定不一致时传入校正轴（fk_rot^T @ R_reported 的第三列）
+
+    Returns:
+        6 个关节角度（弧度），失败返回 None
+    """
+    from scipy.optimize import least_squares
+
+    q0 = np.array(q_guess)
+    tz = np.asarray(target_tool_z, dtype=float)
+    tz = tz / np.linalg.norm(tz)
+    axis = np.array([0.0, 0.0, 1.0]) if tool_axis is None \
+        else np.asarray(tool_axis, dtype=float) / np.linalg.norm(tool_axis)
+
+    def pose_error(q):
+        pos, rot = cs66_forward_kinematics(q)
+        pos_err = pos - target_pos
+        z_err = rot @ axis - tz  # 工具轴方向误差（自转不约束）
+        # 弱正则化：轻微惩罚偏离初始值
+        reg = 0.001 * (q - q0)
+        return np.concatenate([10.0 * pos_err, 3.0 * z_err, reg])
+
+    # 边界：以当前位置为中心，±joint_margin 范围
+    bounds = (
+        [q0[i] - joint_margin for i in range(6)],
+        [q0[i] + joint_margin for i in range(6)],
+    )
+
+    result = least_squares(
+        pose_error,
+        q0,
+        bounds=bounds,
+        method='trf',
+        max_nfev=max_iter,
+        ftol=tolerance,
+        xtol=1e-8,
+    )
+
+    if result.success or np.linalg.norm(pose_error(result.x)[:3]) < 0.02:
+        return list(result.x)
+    return None
+
+
 def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
     """
     四元数转旋转矩阵
