@@ -3,13 +3,13 @@
 
 流程（按 G 触发）：
   1. 取 YOLO 感知节点发布的目标点（/target_object_pose，基座系）
-  2. 抓取点 = 目标点 + 世界系偏移（默认 Y- 方向 5cm）
-  3. movej 到预抓取点：抓取点沿工具轴反方向退 APPROACH_DIST，
-     工具轴朝世界系 +X（法兰面正对目标），掌心到达（含 11cm 工具偏移）
-  4. movel 沿工具轴前伸 APPROACH_DIST 到抓取点
-  5. 闭合机械手
-  6. movel 退回预抓取点
-  7. movej 回零位
+  2. 抓取点 = 目标点 + 世界系偏移（默认上方 1cm，防碰）
+  3. movej 到预抓取点 = 目标点正上方 10cm（世界系），
+     工具轴朝世界系 +X（法兰面朝向），掌心到达（含 11cm 工具偏移）
+  4. movel 竖直下降到抓取点
+  5. 闭合机械手（LinkerHand O6）
+  6. movel 上升退回预抓取点
+  7. movej 回零位（h 键）
 
 前提：
   - 机械臂驱动已启动（start_robot.launch.py）
@@ -63,10 +63,12 @@ def _build_world_axes(v_up):
 WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 
 # 抓取点偏移（世界系，米）：目标点 + 偏移 = 抓取点（掌心到达处）
-GRASP_OFFSET_WORLD = np.array([0.0, -0.04, 0.0])   # Y- 方向 3cm
+# (0, 0, 0.01) = 目标上方 1cm，防止碰上目标
+GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.01])
 
-# 预抓取距离（米）：从抓取点沿工具轴反方向退这么远（movej 粗定位点）
-APPROACH_DIST = 0.10
+# 预抓取点偏移（世界系，米）：目标点 + 偏移 = 预抓取点
+# (0, 0, 0.10) = 目标正上方 10cm，movej 到此后再 movel 竖直下降
+PRE_GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.10])
 
 # 工具轴方向：法兰面朝世界系 +X（正对目标，侧向抓取）
 TOOL_AXIS_DIR = WORLD_X_IN_BASE
@@ -215,8 +217,11 @@ class YoloGrasp:
         print(f"2. 抓取点(掌心到达): [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, {grasp_tip[2]:.4f}]"
               f"（世界系偏移 {GRASP_OFFSET_WORLD}）")
 
-        # 2. 预抓取点 = 抓取点沿工具轴反方向退 APPROACH_DIST（指尖参考系）
-        pre_tip = grasp_tip - APPROACH_DIST * TOOL_AXIS_DIR
+        # 2. 预抓取点 = 目标点 + 世界系偏移（默认正上方 10cm，指尖参考系）
+        pre_offset = (PRE_GRASP_OFFSET_WORLD[0] * WORLD_X_IN_BASE +
+                      PRE_GRASP_OFFSET_WORLD[1] * WORLD_Y_IN_BASE +
+                      PRE_GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
+        pre_tip = obj + pre_offset
         # IK 求法兰位置：指尖目标 - L × 工具轴方向
         pre_flange = pre_tip - TOOL_TIP_LENGTH * TOOL_AXIS_DIR
         print(f"3. 预抓取点(法兰): [{pre_flange[0]:.4f}, {pre_flange[1]:.4f}, {pre_flange[2]:.4f}]")
@@ -256,9 +261,9 @@ class YoloGrasp:
             print("   !! 等待运动结束超时，放弃")
             return
 
-        # 4. movel 前伸到抓取点（指尖参考：预抓取点 + APPROACH_DIST × 工具轴）
-        reach_flange = pre_flange + APPROACH_DIST * TOOL_AXIS_DIR
-        print("5. movel 前伸到抓取点...")
+        # 4. movel 竖直下降到抓取点（指尖目标 - L × 工具轴方向）
+        reach_flange = grasp_tip - TOOL_TIP_LENGTH * TOOL_AXIS_DIR
+        print("5. movel 下降到抓取点...")
         if not self.send_movel_keep_orientation(reach_flange):
             print("   !! 无法读取当前位姿，放弃")
             return
