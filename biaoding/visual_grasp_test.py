@@ -65,11 +65,29 @@ MANUAL_OFFSET_Z = 0.00  # 机器人基座 Z 方向（上下准就保持 0）
 # 取旋转矩阵第三列（法兰Z轴=世界的"下"）取反。
 # 注意：不要用 cs66_tool0_controller（控制器上报的虚拟TCP）——它和物理
 # 法兰差一个约118°的固定旋转（TCP偏移），姿态数据全是错的；位置不受影响。
-# 预抓取点 = 目标点 + APPROACH_HEIGHT × V_UP_IN_BASE（世界系正上方）
+# 预抓取点 = 目标点 + APPROACH_OFFSET_WORLD（世界系偏移）
 V_UP_IN_BASE = np.array([-0.7431, 0.0120, 0.6691])
 
-# 接近高度（米）：停在目标点在【世界坐标系】正上方这么高；设为 0 = 直接到目标点
-APPROACH_HEIGHT = 0.20
+
+def _build_world_axes(v_up):
+    """由世界的"上"构建正交的世界系 X/Y 轴（以基座 Y 为参考）。"""
+    up = np.asarray(v_up, dtype=float)
+    up /= np.linalg.norm(up)
+    y = np.array([0.0, 1.0, 0.0])
+    y = y - (y @ up) * up
+    y /= np.linalg.norm(y)
+    x = np.cross(y, up)
+    return x, y, up
+
+
+# 世界系 X/Y/Z 在基座系下的方向（X/Y 为世界系水平方向）
+WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
+
+# 接近偏移（世界系，米）：预抓取点 = 目标点 + 偏移
+#   (0, 0, 0.20)  = 世界系正上方 20cm（默认）
+#   (-0.20, 0, 0) = 世界系 -X 侧 20cm（侧向接近）
+#   (0, 0, 0)     = 直接到目标点（验证到位精度用）
+APPROACH_OFFSET_WORLD = np.array([-0.20, 0, 0])
 
 # 运动方式：本地 IK（scipy 数值法，当前关节角做初值取就近解）
 # + 控制器原生 movej（/script_sender/script_command 发脚本）。
@@ -82,10 +100,11 @@ MOVEJ_V = 0.2    # 关节速度 (rad/s)，想更快加大
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 
 # 终点姿态策略（5 维 IK：只约束工具 Z 轴方向，绕法兰的自转放开）：
-#   "down" - 工具 Z 轴朝世界系的"下"（法兰竖直朝下，抓取用，推荐）
+#   "down" - 工具 Z 轴朝世界系的"下"（法兰竖直朝下，从上方抓取，默认）
+#   "side" - 工具 Z 轴朝世界系 +X 水平方向（从世界系 -X 侧水平伸过去抓）
 #   "keep" - 保持当前工具 Z 轴方向
 # （"fixed"/"fixed_nearest" 旧值等同 "down"）
-GRASP_ORIENTATION_MODE = "down"
+GRASP_ORIENTATION_MODE = "side"
 
 # CS66 几何参数（用于可达性预检，见 default_kinematics.yaml）
 SHOULDER_Z = 0.1625   # 肩关节距基座高度
@@ -435,13 +454,16 @@ def main():
                 target_in_base[1] += MANUAL_OFFSET_Y
                 target_in_base[2] += MANUAL_OFFSET_Z
 
-                # 接近高度：沿【世界系竖直方向】抬高（倾斜安装补偿），
-                # 0 = 直接到目标点；>0 = 停在目标点世界系正上方
-                if APPROACH_HEIGHT > 0:
-                    target_in_base = target_in_base + APPROACH_HEIGHT * V_UP_IN_BASE
+                # 接近偏移：沿【世界系】偏移（倾斜安装补偿），
+                # (0,0,0) = 直接到目标点；非零 = 停在目标点世界系偏移处
+                offset_base = (APPROACH_OFFSET_WORLD[0] * WORLD_X_IN_BASE +
+                               APPROACH_OFFSET_WORLD[1] * WORLD_Y_IN_BASE +
+                               APPROACH_OFFSET_WORLD[2] * V_UP_IN_BASE)
+                if np.linalg.norm(offset_base) > 0:
+                    target_in_base = target_in_base + offset_base
 
                 print(f"2. 计算目标在基座坐标系: X={target_in_base[0]:.4f}, Y={target_in_base[1]:.4f}, Z={target_in_base[2]:.4f}"
-                      f"（已沿世界系竖直方向抬高 {APPROACH_HEIGHT:.2f}m）")
+                      f"（世界系偏移 {APPROACH_OFFSET_WORLD}）")
 
                 # 可达性预检：目标到肩关节的斜距超过臂展就必然无解，直接给出人话提示  去掉
                 # slant = np.linalg.norm(target_in_base - np.array([0.0, 0.0, SHOULDER_Z]))
@@ -457,10 +479,14 @@ def main():
                 # ----------------------------------------------------
                 print("3. 正在本地 IK 解算并发送 movej 指令...")
 
-                # 目标工具轴方向（基座系）：down = 世界系的"下"；keep = 保持当前方向
+                # 目标工具轴方向（基座系）：down = 世界系的"下"；
+                # side = 世界系 +X（侧向水平抓取）；keep = 保持当前方向
                 if GRASP_ORIENTATION_MODE in ("down", "fixed", "fixed_nearest"):
                     target_dir = -V_UP_IN_BASE
                     print(f"   终点方向: 工具轴朝世界系下方 {np.round(target_dir, 3)}（自转放开）")
+                elif GRASP_ORIENTATION_MODE == "side":
+                    target_dir = WORLD_X_IN_BASE
+                    print(f"   终点方向: 工具轴朝世界系+X {np.round(target_dir, 3)}（水平侧抓）")
                 else:
                     _, cur_rot = cs66_forward_kinematics(robot_node.get_joint_positions())
                     target_dir = cur_rot[:, 2]  # FK=物理法兰，当前工具Z轴方向
