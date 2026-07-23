@@ -42,6 +42,10 @@ SCRIPT_TOPIC = "/script_sender/script_command"
 MOVEJ_A = 1.0
 MOVEJ_V = 0.2
 
+# 工具偏移（米）：法兰面到夹爪掌心/指尖的距离，沿法兰 Z 轴（机械手约 11cm）。
+# IK 目标 = 输入点 - L × 工具轴方向，使【掌心/指尖】到达输入点。
+TOOL_TIP_LENGTH = 0.11
+
 
 def spin_some(node, n=10, dt=0.05):
     for _ in range(n):
@@ -130,19 +134,24 @@ def main():
             print(f"  FK与上报位置漂移: {drift*1000:.1f}mm" +
                   ("  !! 偏大，模型可能不一致" if drift > 10 else "  (正常)"))
 
+            # 工具偏移：让掌心/指尖到达输入点，法兰停在后方 L 处
+            flange_target = target_pos - TOOL_TIP_LENGTH * target_dir
+            if TOOL_TIP_LENGTH > 0:
+                print(f"  法兰目标(输入点-L): {np.round(flange_target, 4)}")
+
             # 可达性粗检
-            dist = float(np.linalg.norm(target_pos - np.array([0.0, 0.0, 0.1625])))
+            dist = float(np.linalg.norm(flange_target - np.array([0.0, 0.0, 0.1625])))
             print(f"  目标距肩关节: {dist:.3f}m" +
                   ("  !! 超过臂展 0.92m，必然无解" if dist > 0.92 else ""))
 
             joint_target = cs66_inverse_kinematics_5dof(
-                target_pos, target_dir, q_guess)
+                flange_target, target_dir, q_guess)
             if joint_target is None:
                 print("  IK 解算失败（目标不可达）")
                 continue
 
             fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
-            pos_err = float(np.linalg.norm(fk_pos - target_pos))
+            pos_err = float(np.linalg.norm(fk_pos - flange_target))
             achieved_dir = fk_rot[:, 2]
             dir_err = math.degrees(math.acos(
                 float(np.clip(achieved_dir @ target_dir, -1.0, 1.0))))

@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""YOLO 视觉抓取主程序（机械手版）。
+
+流程（按 G 触发）：
+  1. 取 YOLO 感知节点发布的目标点（/target_object_pose，基座系）
+  2. 抓取点 = 目标点 + 世界系偏移（默认 Y- 方向 5cm）
+  3. movej 到预抓取点：抓取点沿工具轴反方向退 APPROACH_DIST，
+     工具轴朝世界系 +X（法兰面正对目标），掌心到达（含 11cm 工具偏移）
+  4. movel 沿工具轴前伸 APPROACH_DIST 到抓取点
+  5. 闭合机械手
+  6. movel 退回预抓取点
+  7. movej 回零位
+
+前提：
+  - 机械臂驱动已启动（start_robot.launch.py）
+  - YOLO 感知节点已启动（YOLO/yolo_grasp_perception.py）
+
+用法：
+  cd ~/Documents/elite_robot_ws/biaoding
+  python3 yolo_grasp.py
+  按键: g=抓取  p=打印当前目标  h=回零  q=退出
+"""
+
+import math
+import os
+import sys
+import threading
+import time
+
+import numpy as np
+from scipy.spatial.transform import Rotation as Rot
+
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'elite_robot_example'))
+from elite_robot_example.robot_cartesian_control import (
+    RobotCartesianControl,
+    cs66_inverse_kinematics_5dof,
+    cs66_forward_kinematics,
+)
+
+# ---------------- 配置 ----------------
+SCRIPT_TOPIC = "/script_sender/script_command"
+TARGET_TOPIC = "/target_object_pose"
+
+# 倾斜安装实测：世界系"上"在基座系下的方向（calibrate_vertical.py 可重测）
+V_UP_IN_BASE = np.array([-0.7431, 0.0120, 0.6691])
+
+
+def _build_world_axes(v_up):
+    up = np.asarray(v_up, dtype=float)
+    up /= np.linalg.norm(up)
+    y = np.array([0.0, 1.0, 0.0])
+    y = y - (y @ up) * up
+    y /= np.linalg.norm(y)
+    return np.cross(y, up), y, up
+
+
+WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
+
+# 抓取点偏移（世界系，米）：目标点 + 偏移 = 抓取点（掌心到达处）
+GRASP_OFFSET_WORLD = np.array([0.0, -0.04, 0.0])   # Y- 方向 3cm
+
+# 预抓取距离（米）：从抓取点沿工具轴反方向退这么远（movej 粗定位点）
+APPROACH_DIST = 0.10
+
+# 工具轴方向：法兰面朝世界系 +X（正对目标，侧向抓取）
+TOOL_AXIS_DIR = WORLD_X_IN_BASE
+
+# 工具偏移（米）：法兰面到掌心，沿法兰 Z 轴
+TOOL_TIP_LENGTH = 0.11
+
+MOVEJ_A, MOVEJ_V = 1.0, 0.2    # movej 关节加速度/速度 (rad/s^2, rad/s)
+MOVEL_A, MOVEL_V = 0.3, 0.05   # movel 加速度/速度 (m/s^2, m/s)
+
+HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+SHOULDER_Z = 0.1625
+ARM_REACH = 0.92
+
+# ---------------- LinkerHand O6 机械手 ----------------
+# 控制 topic：position 0~255，0=弯曲(闭合)，255=伸直(张开)
+# 关节顺序: [大拇指弯曲, 大拇指横摆, 食指, 中指, 无名指, 小拇指]
+HAND_CMD_TOPIC = "/cb_right_hand_control_cmd"
+HAND_SETTING_TOPIC = "/cb_right_hand_setting_cmd"
+HAND_OPEN_POSE = [255.0] * 6                    # 五指张开
+HAND_CLOSE_POSE = [0.0, 25.0, 0.0, 0.0, 0.0, 0.0]  # 握拳（大拇指横摆 70，便于包握）
+HAND_SPEED = 30        # 速度 0~255
+HAND_TORQUE = 80       # 扭矩上限 0~255（太小夹不住，太大伤物体）
+
+GRIPPER_CLOSE_DELAY = 1.5   # 闭合机械手后的等待时间（秒）
+
+
+def quat_to_rotvec(x, y, z, w):
+    """四元数 -> 旋转向量（movel 指令的姿态格式）。"""
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    angle = 2.0 * math.acos(max(-1.0, min(1.0, w)))
+    s = math.sqrt(max(0.0, 1.0 - w * w))
+    if s < 1e-9:
+        return 0.0, 0.0, 0.0
+    if angle > math.pi:
+        angle -= 2.0 * math.pi
+    return x / s * angle, y / s * angle, z / s * angle
+
+
+class YoloGrasp:
+    def __init__(self):
+        self.robot = RobotCartesianControl()
+        self.script_pub = self.robot.create_publisher(String, SCRIPT_TOPIC, 10)
+        # LinkerHand 控制
+        self.hand_pub = self.robot.create_publisher(JointState, HAND_CMD_TOPIC, 10)
+        self.hand_setting_pub = self.robot.create_publisher(String, HAND_SETTING_TOPIC, 10)
+        self.latest_target = None       # 最新的目标点（基座系，米）
+        self.latest_target_time = 0.0
+        self.robot.create_subscription(
+            PoseStamped, TARGET_TOPIC, self._target_cb, 10)
+
+    # ---------------- LinkerHand 控制 ----------------
+    def hand_open(self):
+        self._hand_cmd(HAND_OPEN_POSE)
+
+    def hand_close(self):
+        self._hand_cmd(HAND_CLOSE_POSE)
+
+    def hand_setup(self):
+        """设置速度和扭矩上限（SDK 运行期间有效）。"""
+        import json as _json
+        for cmd, params in (("set_speed", {"speed": [HAND_SPEED] * 6}),
+                            ("set_torque", {"torque": [HAND_TORQUE] * 6})):
+            msg = String()
+            msg.data = _json.dumps({"setting_cmd": cmd, "params": params})
+            self.hand_setting_pub.publish(msg)
+
+    def _hand_cmd(self, positions):
+        msg = JointState()
+        msg.position = [float(p) for p in positions]
+        self.hand_pub.publish(msg)
+
+    def _target_cb(self, msg):
+        self.latest_target = np.array([
+            msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        self.latest_target_time = time.time()
+
+    def spin(self, n=10, dt=0.05):
+        for _ in range(n):
+            rclpy.spin_once(self.robot, timeout_sec=dt)
+
+    # ---------------- 运动原语 ----------------
+    def send_movej(self, joints_rad, a=MOVEJ_A, v=MOVEJ_V):
+        j = ", ".join(f"{x:.6f}" for x in joints_rad)
+        self._send(f"def prog():\n    movej([{j}], a={a:.3f}, v={v:.3f}, r=0)\nend")
+
+    def send_movel_keep_orientation(self, pos, a=MOVEL_A, v=MOVEL_V):
+        """movel 到指定位置，姿态保持当前（读当前 TCP 姿态原样回发）。"""
+        self.spin(5)
+        tcp = self.robot.get_tcp_pose()
+        if tcp is None:
+            return False
+        q = tcp[1]
+        rx, ry, rz = quat_to_rotvec(*q)
+        p = ", ".join(f"{x:.6f}" for x in (*pos, rx, ry, rz))
+        self._send(f"def prog():\n    movel([{p}], a={a:.3f}, v={v:.3f})\nend")
+        return True
+
+    def _send(self, script):
+        msg = String()
+        msg.data = script
+        self.script_pub.publish(msg)
+        print(f"  >> 已发送:\n{script}")
+
+    def wait_motion_done(self, timeout=30.0, settle_eps=0.0008):
+        """轮询 TCP 位置，连续稳定视为运动结束（前 1 秒宽限期）。"""
+        start = time.time()
+        last = None
+        stable = 0
+        while time.time() - start < timeout:
+            self.spin(5, 0.02)
+            tcp = self.robot.get_tcp_pose()
+            if tcp is None:
+                continue
+            pos = np.array(tcp[0])
+            if (last is not None and time.time() - start > 1.0
+                    and np.linalg.norm(pos - last) < settle_eps):
+                stable += 1
+                if stable >= 5:
+                    return True
+            else:
+                stable = 0
+            last = pos
+            time.sleep(0.05)
+        return False
+
+    # ---------------- 抓取流程 ----------------
+    def grasp(self):
+        print("\n======= 开始抓取流程 =======")
+        # 0. 目标检查
+        if self.latest_target is None:
+            print("没有目标点！请先确认 YOLO 感知节点检测到物体")
+            return
+        age = time.time() - self.latest_target_time
+        if age > 3.0:
+            print(f"警告：目标点已 {age:.0f}s 未更新（感知节点可能在跑但没检测到）")
+        obj = self.latest_target
+        print(f"1. 目标点(基座系): [{obj[0]:.4f}, {obj[1]:.4f}, {obj[2]:.4f}]")
+
+        # 1. 抓取点 = 目标点 + 世界系偏移
+        offset_base = (GRASP_OFFSET_WORLD[0] * WORLD_X_IN_BASE +
+                       GRASP_OFFSET_WORLD[1] * WORLD_Y_IN_BASE +
+                       GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
+        grasp_tip = obj + offset_base
+        print(f"2. 抓取点(掌心到达): [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, {grasp_tip[2]:.4f}]"
+              f"（世界系偏移 {GRASP_OFFSET_WORLD}）")
+
+        # 2. 预抓取点 = 抓取点沿工具轴反方向退 APPROACH_DIST（指尖参考系）
+        pre_tip = grasp_tip - APPROACH_DIST * TOOL_AXIS_DIR
+        # IK 求法兰位置：指尖目标 - L × 工具轴方向
+        pre_flange = pre_tip - TOOL_TIP_LENGTH * TOOL_AXIS_DIR
+        print(f"3. 预抓取点(法兰): [{pre_flange[0]:.4f}, {pre_flange[1]:.4f}, {pre_flange[2]:.4f}]")
+
+        dist = float(np.linalg.norm(pre_flange - np.array([0, 0, SHOULDER_Z])))
+        if dist > ARM_REACH:
+            print(f"   !! 预抓取点距肩关节 {dist:.2f}m 超臂展，不可达，放弃")
+            return
+
+        self.spin(10)
+        q_guess = self.robot.get_joint_positions()
+        if q_guess is None:
+            print("   !! 无法获取当前关节角，放弃")
+            return
+
+        joint_target = cs66_inverse_kinematics_5dof(
+            pre_flange, TOOL_AXIS_DIR, q_guess)
+        if joint_target is None:
+            print("   !! IK 解算失败，放弃")
+            return
+        fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
+        pos_err = float(np.linalg.norm(fk_pos - pre_flange))
+        achieved = fk_rot[:, 2]
+        dir_err = math.degrees(math.acos(
+            float(np.clip(achieved @ TOOL_AXIS_DIR, -1.0, 1.0))))
+        print(f"   IK: 位置误差 {pos_err*1000:.1f}mm, 方向误差 {dir_err:.2f}°")
+        if pos_err > 0.02 or dir_err > 5.0:
+            print("   !! IK 误差过大，放弃")
+            return
+
+        # 3. 张开机械手，movej 到预抓取点
+        print("4. 张开机械手，movej 到预抓取点...")
+        self.hand_open()
+        time.sleep(0.5)
+        self.send_movej(joint_target)
+        if not self.wait_motion_done():
+            print("   !! 等待运动结束超时，放弃")
+            return
+
+        # 4. movel 前伸到抓取点（指尖参考：预抓取点 + APPROACH_DIST × 工具轴）
+        reach_flange = pre_flange + APPROACH_DIST * TOOL_AXIS_DIR
+        print("5. movel 前伸到抓取点...")
+        if not self.send_movel_keep_orientation(reach_flange):
+            print("   !! 无法读取当前位姿，放弃")
+            return
+        if not self.wait_motion_done():
+            print("   !! movel 超时，放弃")
+            return
+
+        # 5. 闭合机械手
+        print("6. 闭合机械手...")
+        self.hand_close()
+        time.sleep(GRIPPER_CLOSE_DELAY)
+
+        # 6. movel 退回预抓取点
+        print("7. movel 退回...")
+        if not self.send_movel_keep_orientation(pre_flange):
+            print("   !! 无法读取当前位姿")
+            return
+        if not self.wait_motion_done():
+            print("   !! 退回超时（注意检查机械手是否夹住物体）")
+            return
+
+        print("======= 抓取完成 =======\n")
+
+    def home(self):
+        print("回零位...")
+        self.send_movej(HOME_JOINTS)
+        if self.wait_motion_done():
+            print("已回零")
+
+    def resend_external_script(self):
+        cli = self.robot.create_client(
+            Trigger, "/io_and_status_controller/resend_external_script")
+        if cli.wait_for_service(timeout_sec=2.0):
+            future = cli.call_async(Trigger.Request())
+            rclpy.spin_until_future_complete(self.robot, future)
+
+
+def main():
+    rclpy.init()
+    g = YoloGrasp()
+    if not g.robot.wait_for_state(timeout=10.0):
+        print("错误：收不到机械臂状态，请确认驱动已启动")
+        g.robot.destroy_node()
+        rclpy.shutdown()
+        return
+
+    print("=" * 56)
+    print("YOLO 抓取主程序（LinkerHand O6 机械手版）")
+    print("  g = 抓取   o = 张开手   c = 闭合手   p = 打印目标   h = 回零   q = 退出")
+    print(f"  工具轴: 世界系+X   抓取偏移: {GRASP_OFFSET_WORLD}")
+    print("=" * 56)
+    g.hand_setup()  # 设置机械手速度和扭矩
+
+    try:
+        while True:
+            g.spin(2)
+            try:
+                cmd = input("cmd> ").strip().lower()
+            except EOFError:
+                break
+            if cmd == 'q':
+                break
+            elif cmd == 'g':
+                g.grasp()
+            elif cmd == 'o':
+                g.hand_open()
+                print("  已张开")
+            elif cmd == 'c':
+                g.hand_close()
+                print("  已闭合")
+            elif cmd == 'p':
+                if g.latest_target is None:
+                    print("  无目标")
+                else:
+                    print(f"  目标: {np.round(g.latest_target, 4)}"
+                          f"（{time.time()-g.latest_target_time:.1f}s 前）")
+            elif cmd == 'h':
+                g.home()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        g.resend_external_script()
+        g.robot.destroy_node()
+        rclpy.shutdown()
+        print("已退出（外部控制程序已恢复）")
+
+
+if __name__ == '__main__':
+    main()

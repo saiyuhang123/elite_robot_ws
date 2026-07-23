@@ -51,7 +51,7 @@ class YoloGraspPerceptionNode(Node):
         
         # 加载 YOLO 模型 (首次运行会自动下载 yolov8n.pt，可换成你自己的 pt 模型)
         self.get_logger().info('正在加载 YOLO 模型...')
-        self.yolo_model = YOLO('yolov8s.engine') 
+        self.yolo_model = YOLO('yolov8s.pt') 
 
         # 手眼标定矩阵 (Camera -> Tool/Flange)，从 hand_eye_result.json 读取
         try:
@@ -65,19 +65,20 @@ class YoloGraspPerceptionNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # ---------------- 3. 话题订阅 (时间同步) ----------------
-        # 已匹配你的 Intel RealSense D435 实际话题名称
-        self.sub_color = message_filters.Subscriber(self, Image, '/camera/camera/color/image_raw')
-        self.sub_depth = message_filters.Subscriber(self, Image, '/camera/camera/aligned_depth_to_color/image_raw')
-        self.sub_info = message_filters.Subscriber(self, CameraInfo, '/camera/camera/color/camera_info')
-
-        # 使用 ApproximateTimeSynchronizer 容忍微小的帧微秒级不同步
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [self.sub_color, self.sub_depth, self.sub_info], 
-            queue_size=10, 
-            slop=0.05
-        )
-        self.ts.registerCallback(self.perception_callback)
+        # ---------------- 3. 话题订阅 ----------------
+        # 不用时间同步器（本机相机各话题时间戳有固定偏差，同步器凑不齐）。
+        # 各自缓存最新一帧，彩色图到达时用最新的深度+内参处理（静态场景够用）。
+        self._received = {'color': False, 'depth': False, 'info': False, 'tf': False}
+        self.latest_color = None
+        self.latest_depth = None
+        self.latest_info = None
+        self.create_subscription(
+            Image, '/camera/camera/color/image_raw', self._color_cb, 10)
+        self.create_subscription(
+            Image, '/camera/camera/aligned_depth_to_color/image_raw', self._depth_cb, 10)
+        self.create_subscription(
+            CameraInfo, '/camera/camera/color/camera_info', self._info_cb, 10)
+        self.create_timer(5.0, self._report_status)
 
         # ---------------- 4. 话题发布与 TF 广播 ----------------
         # 发布算出的目标 3D 位姿 (基座坐标系下)
@@ -89,7 +90,50 @@ class YoloGraspPerceptionNode(Node):
 
         self.get_logger().info('>>> 感知节点初始化完成，正在等待图像与 TF 数据...')
 
+    # ---- 话题回调（缓存最新帧） ----
+    def _color_cb(self, msg):
+        self._mark('color')
+        self.latest_color = msg
+        # 彩色图到达时驱动一次感知（深度和内参需已就绪）
+        if self.latest_depth is not None and self.latest_info is not None:
+            try:
+                self.perception_callback(msg, self.latest_depth, self.latest_info)
+            except Exception as e:
+                import traceback
+                self.get_logger().error(f'[诊断] 感知回调异常: {e}\n{traceback.format_exc()}')
+
+    def _depth_cb(self, msg):
+        self._mark('depth')
+        self.latest_depth = msg
+
+    def _info_cb(self, msg):
+        self._mark('info')
+        self.latest_info = msg
+
+    # ---- 诊断辅助 ----
+    def _mark(self, key):
+        if not self._received[key]:
+            self._received[key] = True
+            self.get_logger().info(f'[诊断] 首次收到话题: {key}')
+
+    def _report_status(self):
+        # TF 状态
+        try:
+            self.tf_buffer.lookup_transform(
+                BASE_FRAME, TOOL_FRAME, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1))
+            self._received['tf'] = True
+        except Exception:
+            self._received['tf'] = False
+        missing = [k for k, v in self._received.items() if not v]
+        if missing:
+            self.get_logger().warn(f'[诊断] 仍缺: {missing}（同步器凑不齐就不会触发）')
+        else:
+            self.get_logger().info('[诊断] color/depth/info/TF 全部就绪')
+
     def perception_callback(self, color_msg, depth_msg, info_msg):
+        import time as _time
+        _t0 = _time.time()
         # 1. ROS 图像消息转换为 OpenCV 格式
         try:
             color_img = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
@@ -105,7 +149,19 @@ class YoloGraspPerceptionNode(Node):
         cy = info_msg.k[5]
 
         # 3. YOLO 模型推理
-        results = self.yolo_model(color_img, verbose=False)[0]
+        if not hasattr(self, '_infer_logged'):
+            self.get_logger().info('[诊断] 首次推理开始（Jetson 首次 CUDA 推理可能要 30~60s）...')
+        try:
+            results = self.yolo_model(color_img, verbose=False)[0]
+        except Exception as e:
+            self.get_logger().error(f'[诊断] 推理异常: {e}')
+            return
+        if not hasattr(self, '_infer_logged'):
+            self._infer_logged = True
+            self.get_logger().info(f'[诊断] 首次推理完成，耗时 {_time.time()-_t0:.1f}s，'
+                                   f'检出 {len(results.boxes)} 个框')
+        elif int(_t0) % 10 < 1:
+            self.get_logger().info(f'[诊断] 推理中... 本帧检出 {len(results.boxes)} 个框')
 
         # 如果没有检测到任何物体，发布原图并返回
         if len(results.boxes) == 0:

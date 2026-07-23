@@ -89,6 +89,11 @@ WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 #   (0, 0, 0)     = 直接到目标点（验证到位精度用）
 APPROACH_OFFSET_WORLD = np.array([-0.20, 0, 0])
 
+# 工具偏移（米）：法兰面到夹爪掌心/指尖的距离，沿法兰 Z 轴（机械手约 11cm）。
+# IK 求解的是法兰位置：法兰目标 = 指尖目标 - TOOL_TIP_LENGTH × 工具轴方向，
+# 使【掌心/指尖】到达目标点而非法兰面。设为 0 = 规划到法兰面。
+TOOL_TIP_LENGTH = 0.11
+
 # 运动方式：本地 IK（scipy 数值法，当前关节角做初值取就近解）
 # + 控制器原生 movej（/script_sender/script_command 发脚本）。
 # 无碰撞检查；IK 失败或 FK 验证误差过大时不运动。
@@ -492,9 +497,14 @@ def main():
                     target_dir = cur_rot[:, 2]  # FK=物理法兰，当前工具Z轴方向
                     print("   终点方向: 保持当前工具轴方向")
 
-                target_x = target_in_base[0]
-                target_y = target_in_base[1]
-                target_z = target_in_base[2]
+                # 工具偏移：IK 求解的是法兰位置，让【掌心/指尖】到达目标点。
+                # 法兰目标 = 指尖目标 - L × 工具轴方向
+                # （down: 法兰在指尖上方 L；side: 法兰在指尖后方 L）
+                flange_target = (target_in_base - TOOL_TIP_LENGTH * target_dir
+                                 if TOOL_TIP_LENGTH > 0 else target_in_base)
+                target_x, target_y, target_z = flange_target
+                if TOOL_TIP_LENGTH > 0:
+                    print(f"   法兰目标(指尖目标-L): [{target_x:.4f}, {target_y:.4f}, {target_z:.4f}]")
 
                 move_dist = np.linalg.norm(
                     np.array([target_x, target_y, target_z]) - np.array(current_pos)
