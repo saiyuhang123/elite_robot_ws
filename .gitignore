@@ -140,3 +140,5 @@ core
 core.*
 
 *.pt
+*.engine
+*.onnx

@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from cv_bridge import CvBridge
+import message_filters
+from tf2_ros import Buffer, TransformListener, TransformBroadcaster
+from scipy.spatial.transform import Rotation as R
+
+import json
+import os
+import numpy as np
+import cv2
+from ultralytics import YOLO
+
+# 基座/法兰坐标系（驱动以 tf_prefix=cs66_ 启动，必须用带前缀的名字）
+BASE_FRAME = 'cs66_base_link'
+TOOL_FRAME = 'cs66_tool0'   # URDF 物理法兰，与手眼标定坐标系一致
+
+# 手眼标定结果文件（与 visual_grasp_test.py 用同一份）
+HAND_EYE_JSON = os.path.expanduser(
+    '~/Documents/elite_robot_ws/biaoding/hand_eye_result.json')
+
+
+# 目标类别过滤：只处理这些类别的检测框（COCO 类别名），空集合 = 全部处理
+TARGET_CLASSES = {'apple'}
+# 置信度阈值：低于此值的检测框直接忽略
+CONF_THRESHOLD = 0.4
+
+
+def load_hand_eye_matrix(path):
+    """从 hand_eye_result.json 读取 相机->法兰 的 4x4 变换矩阵。"""
+    with open(path, 'r') as f:
+        calib = json.load(f)
+    T = np.eye(4)
+    T[:3, :3] = np.array(calib['R_cam2tool'])
+    T[:3, 3] = np.array(calib['t_cam2tool']).flatten()
+    return T
+
+
+class YoloGraspPerceptionNode(Node):
+    def __init__(self):
+        super().__init__('yolo_grasp_perception_node')
+        self.get_logger().info('>>> YOLO 抓取感知节点正在启动...')
+
+        # ---------------- 1. 初始化参数与配置 ----------------
+        self.bridge = CvBridge()
+        
+        # 加载 YOLO 模型 (首次运行会自动下载 yolov8n.pt，可换成你自己的 pt 模型)
+        self.get_logger().info('正在加载 YOLO 模型...')
+        self.yolo_model = YOLO('yolov8s.engine') 
+
+        # 手眼标定矩阵 (Camera -> Tool/Flange)，从 hand_eye_result.json 读取
+        try:
+            self.T_cam_to_tool = load_hand_eye_matrix(HAND_EYE_JSON)
+            self.get_logger().info(f'已加载手眼标定: {HAND_EYE_JSON}')
+        except Exception as e:
+            self.get_logger().error(f'无法加载手眼标定文件 {HAND_EYE_JSON}: {e}')
+            raise
+
+        # ---------------- 2. TF 监听器 (用来获取末端法兰盘的实时位姿) ----------------
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ---------------- 3. 话题订阅 (时间同步) ----------------
+        # 已匹配你的 Intel RealSense D435 实际话题名称
+        self.sub_color = message_filters.Subscriber(self, Image, '/camera/camera/color/image_raw')
+        self.sub_depth = message_filters.Subscriber(self, Image, '/camera/camera/aligned_depth_to_color/image_raw')
+        self.sub_info = message_filters.Subscriber(self, CameraInfo, '/camera/camera/color/camera_info')
+
+        # 使用 ApproximateTimeSynchronizer 容忍微小的帧微秒级不同步
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.sub_color, self.sub_depth, self.sub_info], 
+            queue_size=10, 
+            slop=0.05
+        )
+        self.ts.registerCallback(self.perception_callback)
+
+        # ---------------- 4. 话题发布与 TF 广播 ----------------
+        # 发布算出的目标 3D 位姿 (基座坐标系下)
+        self.pose_pub = self.create_publisher(PoseStamped, '/target_object_pose', 10)
+        # 发布可视化画框后的图像 (方便 debug 查看)
+        self.annotated_img_pub = self.create_publisher(Image, '/yolo/annotated_image', 10)
+        # TF 广播器 (用来在 RViz2 里画出目标坐标轴)
+        self.tf_broadcaster = TransformBroadcaster(self)
+
+        self.get_logger().info('>>> 感知节点初始化完成，正在等待图像与 TF 数据...')
+
+    def perception_callback(self, color_msg, depth_msg, info_msg):
+        # 1. ROS 图像消息转换为 OpenCV 格式
+        try:
+            color_img = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
+            depth_img = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().error(f'图像转换失败: {e}')
+            return
+
+        # 2. 从 CameraInfo 提取相机内参
+        fx = info_msg.k[0]
+        fy = info_msg.k[4]
+        cx = info_msg.k[2]
+        cy = info_msg.k[5]
+
+        # 3. YOLO 模型推理
+        results = self.yolo_model(color_img, verbose=False)[0]
+
+        # 如果没有检测到任何物体，发布原图并返回
+        if len(results.boxes) == 0:
+            self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+            return
+
+        # 4. 类别/置信度过滤，多个目标取深度最近的一个
+        candidates = []
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            cls_name = self.yolo_model.names[cls_id]
+            conf = float(box.conf[0])
+            if TARGET_CLASSES and cls_name not in TARGET_CLASSES:
+                continue
+            if conf < CONF_THRESHOLD:
+                continue
+            xyxy = box.xyxy[0].cpu().numpy().astype(int)
+            candidates.append((xyxy, cls_name, conf))
+
+        if not candidates:
+            # 没有目标类别的检测框：画出所有检测框（灰色）提示用户
+            for box in results.boxes:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                name = self.yolo_model.names[int(box.cls[0])]
+                cv2.rectangle(color_img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (128, 128, 128), 1)
+                cv2.putText(color_img, name, (xyxy[0], xyxy[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+            self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+            return
+
+        # 5. 遍历候选目标，取深度最近的一个
+        best = None  # (Z_c, xyxy, cls_name, conf, X_c, Y_c)
+        for xyxy, cls_name, conf in candidates:
+            u_center = int((xyxy[0] + xyxy[2]) / 2)
+            v_center = int((xyxy[1] + xyxy[3]) / 2)
+
+            # ---------------- 7x7 窗口中值滤波提取深度 ----------------
+            patch_size = 7
+            half = patch_size // 2
+
+            # 边界保护
+            v_start = max(0, v_center - half)
+            v_end = min(depth_img.shape[0], v_center + half + 1)
+            u_start = max(0, u_center - half)
+            u_end = min(depth_img.shape[1], u_center + half + 1)
+
+            depth_patch = depth_img[v_start:v_end, u_start:u_end]
+            valid_depths = depth_patch[depth_patch > 0]  # 过滤掉 0 深度无效值
+
+            if len(valid_depths) == 0:
+                self.get_logger().warn(f'目标 [{cls_name}] 中心点深度无效，跳过...')
+                continue
+
+            # 取深度中位数 (单位: mm -> 转换为 m)
+            depth_mm = np.median(valid_depths)
+            Z_c = float(depth_mm) / 1000.0
+
+            # 过滤不合理的深度值 (比如小于10cm 或 大于 3m)
+            if Z_c < 0.1 or Z_c > 3.0:
+                continue
+
+            # ---------------- 反推相机坐标系 3D 坐标 (X_c, Y_c, Z_c) ----------------
+            X_c = (u_center - cx) * Z_c / fx
+            Y_c = (v_center - cy) * Z_c / fy
+
+            if best is None or Z_c < best[0]:
+                best = (Z_c, xyxy, cls_name, conf, X_c, Y_c, u_center, v_center)
+
+        if best is None:
+            self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+            return
+
+        Z_c, xyxy, cls_name, conf, X_c, Y_c, u_center, v_center = best
+        P_cam = np.array([X_c, Y_c, Z_c, 1.0])
+
+        # ---------------- 利用手眼标定转换到 法兰盘坐标系 (P_tool) ----------------
+        P_tool = self.T_cam_to_tool @ P_cam
+
+        # ---------------- 结合机械臂实时 TF 转到 基座坐标系 (P_base) ----------------
+        try:
+            # 优先用图像拍摄时刻的 TF（机械臂运动时更准）；
+            # 驱动 TF 时间戳落后于相机时钟（本机存在固定偏差）时退回最新 TF
+            try:
+                trans = self.tf_buffer.lookup_transform(
+                    BASE_FRAME,
+                    TOOL_FRAME,
+                    rclpy.time.Time.from_msg(color_msg.header.stamp),
+                    timeout=rclpy.duration.Duration(seconds=0.05)
+                )
+            except Exception:
+                trans = self.tf_buffer.lookup_transform(
+                    BASE_FRAME,
+                    TOOL_FRAME,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5)
+                )
+
+            # 提取平移向量和四元数
+            t_vec = [trans.transform.translation.x, trans.transform.translation.y, trans.transform.translation.z]
+            q_vec = [trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z, trans.transform.rotation.w]
+
+            # 四元数转换为 3x3 旋转矩阵
+            r_mat = R.from_quat(q_vec).as_matrix()
+
+            # 拼合 4x4 T_tool_to_base 变换矩阵
+            T_tool_to_base = np.eye(4)
+            T_tool_to_base[:3, :3] = r_mat
+            T_tool_to_base[:3, 3] = t_vec
+
+            # 最终算出基座坐标系下的目标 3D 位置 P_base
+            P_base = T_tool_to_base @ P_tool
+            X_b, Y_b, Z_b = float(P_base[0]), float(P_base[1]), float(P_base[2])
+
+        except Exception as e:
+            self.get_logger().warn(f'未获取到 TF ({BASE_FRAME} -> {TOOL_FRAME})，请确认机械臂驱动是否启动: {e}')
+            self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+            return
+
+        self.get_logger().info(
+            f'识别到 [{cls_name}] (可信度:{conf:.2f}) -> '
+            f'相机系: [{X_c:.3f}, {Y_c:.3f}, {Z_c:.3f}]m | '
+            f'基座系: [{X_b:.3f}, {Y_b:.3f}, {Z_b:.3f}]m'
+        )
+
+        # ---------------- 发布 PoseStamped 消息与 TF 广播 ----------------
+        now = self.get_clock().now().to_msg()
+
+        # 发布 Pose 消息
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = now
+        pose_msg.header.frame_id = BASE_FRAME
+        pose_msg.pose.position.x = X_b
+        pose_msg.pose.position.y = Y_b
+        pose_msg.pose.position.z = Z_b
+        pose_msg.pose.orientation.w = 1.0  # 默认姿态
+        self.pose_pub.publish(pose_msg)
+
+        # 广播 TF Transform (方便在 RViz2 里可视化)
+        t_tf = TransformStamped()
+        t_tf.header.stamp = now
+        t_tf.header.frame_id = BASE_FRAME
+        t_tf.child_frame_id = f'target_{cls_name}'
+        t_tf.transform.translation.x = X_b
+        t_tf.transform.translation.y = Y_b
+        t_tf.transform.translation.z = Z_b
+        t_tf.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform(t_tf)
+
+        # ---------------- 图像上绘制调试信息 ----------------
+        cv2.rectangle(color_img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
+        cv2.circle(color_img, (u_center, v_center), 5, (0, 0, 255), -1)
+        label = f'{cls_name}: Base[{X_b:.2f}, {Y_b:.2f}, {Z_b:.2f}]m'
+        cv2.putText(color_img, label, (xyxy[0], xyxy[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # 发布画框调试后的图像
+        self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = YoloGraspPerceptionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
