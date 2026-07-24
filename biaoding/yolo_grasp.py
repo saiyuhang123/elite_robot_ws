@@ -41,6 +41,7 @@ from std_srvs.srv import Trigger
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'elite_robot_example'))
 from elite_robot_example.robot_cartesian_control import (
     RobotCartesianControl,
+    cs66_inverse_kinematics,
     cs66_inverse_kinematics_5dof,
     cs66_forward_kinematics,
 )
@@ -65,23 +66,33 @@ def _build_world_axes(v_up):
 WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 
 # 抓取点偏移（世界系，米）：目标点 + 偏移 = 抓取点（掌心到达处）
-# (0, 0, 0.01) = 目标上方 1cm，防止碰上目标
-GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.01])
+# 负 Z = 掌心低于物体表面（包住物体），值根据物体大小调整
+# 苹果 ~8cm → -0.04；小物件 → -0.02；大物件 → -0.06
+GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.04])
 
 # 预抓取点偏移（世界系，米）：目标点 + 偏移 = 预抓取点
 # (0, 0, 0.10) = 目标正上方 10cm，movej 到此后再 movel 竖直下降
 PRE_GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.10])
 
-# 工具轴方向：法兰面朝世界系 +X（正对目标，侧向抓取）
-TOOL_AXIS_DIR = WORLD_X_IN_BASE
+# 工具轴方向（世界系）：手心朝下抓取 = 世界的"下"
+TOOL_AXIS_DIR = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
 
-# 工具偏移（米）：法兰面到掌心，沿法兰 Z 轴
-TOOL_TIP_LENGTH = 0.11
+# 抓取姿态（完整旋转矩阵，法兰朝世界系+X 且手心朝下）。
+# 启动后按 k 键示教：把机械臂摆到目标姿态（法兰朝+X、手心朝下），
+# 自动记录当前 FK 旋转矩阵并存入 grasp_orientation.json；
+# 也可以把测得的 3x3 矩阵直接写在这里（跳过示教）。
+GRASP_TARGET_ROT = None
+GRASP_ROT_FILE = os.path.join(os.path.dirname(__file__), 'grasp_orientation.json')
+
+# 工具偏移（米）：法兰面到掌心，沿手心法线方向
+TOOL_TIP_LENGTH = 0.13
 
 MOVEJ_A, MOVEJ_V = 1.0, 0.2    # movej 关节加速度/速度 (rad/s^2, rad/s)
 MOVEL_A, MOVEL_V = 0.3, 0.05   # movel 加速度/速度 (m/s^2, m/s)
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+# 抓取预备位姿（角度: -2.2, -38.3, -124.8, -16.3, 102.1, 94.2）
+READY_JOINTS = [-0.0384, -0.6685, -2.1782, -0.2845, 1.7820, 1.6441]
 SHOULDER_Z = 0.1625
 ARM_REACH = 0.92
 
@@ -135,8 +146,38 @@ class YoloGrasp:
                                   callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/home', self._srv_home,
                                   callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/ready', self._srv_ready,
+                                  callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/status', self._srv_status,
                                   callback_group=self.cb_group)
+
+        # ---- 抓取姿态（完整旋转矩阵）----
+        self.grasp_rot = GRASP_TARGET_ROT
+        if self.grasp_rot is None and os.path.exists(GRASP_ROT_FILE):
+            try:
+                import json as _json
+                with open(GRASP_ROT_FILE) as f:
+                    self.grasp_rot = np.array(_json.load(f), dtype=float)
+                print(f"已从 {GRASP_ROT_FILE} 加载抓取姿态")
+            except Exception as e:
+                print(f"读取 {GRASP_ROT_FILE} 失败: {e}（按 k 重新示教）")
+
+    # ---------------- 抓取姿态示教 ----------------
+    def calibrate_grasp_orientation(self):
+        """把机械臂摆到目标抓取姿态（法兰朝+X、手心朝下）后调用：
+        记录当前 FK 旋转矩阵作为 IK 的完整姿态目标。"""
+        self.spin(10)
+        q = self.robot.get_joint_positions()
+        if q is None:
+            print("  无法获取关节角，示教失败")
+            return
+        _, r_flange = cs66_forward_kinematics(q)
+        self.grasp_rot = r_flange
+        import json as _json
+        with open(GRASP_ROT_FILE, 'w') as f:
+            _json.dump([[float(v) for v in row] for row in r_flange], f)
+        print(f"  抓取姿态已记录（FK 旋转矩阵），保存到 {GRASP_ROT_FILE}")
+        print(f"  法兰Z方向(基座系) = {np.round(r_flange[:, 2], 3)}（应≈世界+X方向）")
 
     # ---------------- LinkerHand 控制 ----------------
     def hand_open(self):
@@ -191,6 +232,14 @@ class YoloGrasp:
         self.home()
         response.success = True
         response.message = '已回零位'
+        return response
+
+    def _srv_ready(self, request, response):
+        """服务 /yolo_grasp/ready：到抓取预备位姿"""
+        self.robot.get_logger().info('[服务] 收到预备位姿指令')
+        self.go_ready()
+        response.success = True
+        response.message = '已到抓取预备位姿'
         return response
 
     def _srv_status(self, request, response):
@@ -293,8 +342,13 @@ class YoloGrasp:
                       PRE_GRASP_OFFSET_WORLD[1] * WORLD_Y_IN_BASE +
                       PRE_GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
         pre_tip = obj + pre_offset
-        # IK 求法兰位置：指尖目标 - L × 工具轴方向
-        pre_flange = pre_tip - TOOL_TIP_LENGTH * TOOL_AXIS_DIR
+
+        # 工具方向 = 法兰 Z 轴（从示教抓取姿态读取），手沿法兰 Z 轴安装
+        tool_dir = self.grasp_rot[:, 2]  # 法兰 Z 轴在基座系下的方向
+        print(f"   [诊断] 工具方向(法兰Z轴): {np.round(tool_dir, 3)}")
+
+        # IK 求法兰位置：掌心目标 - L × 工具方向
+        pre_flange = pre_tip - TOOL_TIP_LENGTH * tool_dir
         print(f"3. 预抓取点(法兰): [{pre_flange[0]:.4f}, {pre_flange[1]:.4f}, {pre_flange[2]:.4f}]")
 
         dist = float(np.linalg.norm(pre_flange - np.array([0, 0, SHOULDER_Z])))
@@ -308,18 +362,21 @@ class YoloGrasp:
             print("   !! 无法获取当前关节角，放弃")
             return
 
-        joint_target = cs66_inverse_kinematics_5dof(
-            pre_flange, TOOL_AXIS_DIR, q_guess)
+        if self.grasp_rot is None:
+            print("   !! 抓取姿态未示教：先把机械臂摆到目标姿态（法兰朝+X、手心朝下），再按 k 示教")
+            return
+
+        # 完整 6 维 IK：位置 + 完整姿态（法兰朝+X 且手心朝下，姿态不再放开）
+        joint_target = cs66_inverse_kinematics(
+            pre_flange, self.grasp_rot, q_guess)
         if joint_target is None:
             print("   !! IK 解算失败，放弃")
             return
         fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
         pos_err = float(np.linalg.norm(fk_pos - pre_flange))
-        achieved = fk_rot[:, 2]
-        dir_err = math.degrees(math.acos(
-            float(np.clip(achieved @ TOOL_AXIS_DIR, -1.0, 1.0))))
-        print(f"   IK: 位置误差 {pos_err*1000:.1f}mm, 方向误差 {dir_err:.2f}°")
-        if pos_err > 0.02 or dir_err > 5.0:
+        rot_err = math.degrees(float(Rot.from_matrix(fk_rot.T @ self.grasp_rot).magnitude()))
+        print(f"   IK: 位置误差 {pos_err*1000:.1f}mm, 姿态误差 {rot_err:.2f}°")
+        if pos_err > 0.02 or rot_err > 5.0:
             print("   !! IK 误差过大，放弃")
             return
 
@@ -332,8 +389,20 @@ class YoloGrasp:
             print("   !! 等待运动结束超时，放弃")
             return
 
-        # 4. movel 竖直下降到抓取点（指尖目标 - L × 工具轴方向）
-        reach_flange = grasp_tip - TOOL_TIP_LENGTH * TOOL_AXIS_DIR
+        # 诊断：读取控制器反馈的实际 TCP 位置
+        self.spin(5)
+        actual_tcp = self.robot.get_tcp_pose()
+        if actual_tcp is not None:
+            print(f"   [诊断] movej 后实际 TCP: [{actual_tcp[0][0]:.4f}, {actual_tcp[0][1]:.4f}, {actual_tcp[0][2]:.4f}]")
+            print(f"   [诊断] 期望法兰位置:   [{pre_flange[0]:.4f}, {pre_flange[1]:.4f}, {pre_flange[2]:.4f}]")
+            tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - pre_flange)
+            print(f"   [诊断] 偏差: {tcp_err*1000:.1f}mm")
+
+        # 4. movel 竖直下降到抓取点（法兰 = 掌心目标 - L × 工具方向）
+        reach_flange = grasp_tip - TOOL_TIP_LENGTH * tool_dir
+        print(f"   掌心目标: [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, {grasp_tip[2]:.4f}]")
+        print(f"   法兰目标(movel): [{reach_flange[0]:.4f}, {reach_flange[1]:.4f}, {reach_flange[2]:.4f}]")
+        print(f"   工具偏移: {TOOL_TIP_LENGTH:.3f}m  方向: {np.round(TOOL_AXIS_DIR, 3)}")
         print("5. movel 下降到抓取点...")
         if not self.send_movel_keep_orientation(reach_flange):
             print("   !! 无法读取当前位姿，放弃")
@@ -341,6 +410,14 @@ class YoloGrasp:
         if not self.wait_motion_done():
             print("   !! movel 超时，放弃")
             return
+
+        # 诊断：movel 后实际位置
+        self.spin(5)
+        actual_tcp = self.robot.get_tcp_pose()
+        if actual_tcp is not None:
+            print(f"   [诊断] movel 后实际 TCP: [{actual_tcp[0][0]:.4f}, {actual_tcp[0][1]:.4f}, {actual_tcp[0][2]:.4f}]")
+            tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - reach_flange)
+            print(f"   [诊断] 与法兰目标偏差: {tcp_err*1000:.1f}mm")
 
         # 5. 闭合机械手
         print("6. 闭合机械手...")
@@ -363,6 +440,12 @@ class YoloGrasp:
         self.send_movej(HOME_JOINTS)
         if self.wait_motion_done():
             print("已回零")
+
+    def go_ready(self):
+        print("移动到抓取预备位姿...")
+        self.send_movej(READY_JOINTS)
+        if self.wait_motion_done():
+            print("已到预备位姿")
 
     def resend_external_script(self):
         cli = self.robot.create_client(
@@ -390,11 +473,12 @@ def main():
 
     print("=" * 60)
     print("YOLO 抓取主程序（LinkerHand O6 机械手版）")
-    print("  键盘: g=抓取  o=张开手  c=闭合手  p=打印目标  h=回零  q=退出")
+    print("  键盘: g=抓取  o=张开手  c=闭合手  p=打印目标  h=回零  r=预备位姿  q=退出")
+    print("        k=示教抓取姿态（摆到 法兰朝+X+手心朝下 后按）")
     print("        t=切换目标类别（如 t apple / t cup / t all）")
-    print("  ROS服务: /yolo_grasp/grasp  /open  /close  /home  /status")
+    print("  ROS服务: /yolo_grasp/grasp  /open  /close  /home  /ready  /status")
     print("  ROS话题: /yolo/target_class (发布类别名切换检测目标)")
-    print(f"  工具轴: 世界系+X   抓取偏移: {GRASP_OFFSET_WORLD}")
+    print(f"  工具轴: 世界系下(手心朝下)   抓取偏移: {GRASP_OFFSET_WORLD}")
     print("=" * 60)
     g.hand_setup()  # 设置机械手速度和扭矩
 
@@ -423,6 +507,10 @@ def main():
                           f"（{time.time()-g.latest_target_time:.1f}s 前）")
             elif cmd == 'h':
                 g.home()
+            elif cmd == 'r':
+                g.go_ready()
+            elif cmd == 'k':
+                g.calibrate_grasp_orientation()
             elif cmd.startswith('t'):
                 # t apple  /  t cup  /  t all  /  t apple,cup
                 parts = cmd.split(maxsplit=1)
@@ -431,7 +519,7 @@ def main():
             elif cmd == '':
                 pass
             else:
-                print("  未知命令。可用: g=抓取 o=张开 c=闭合 p=打印 h=回零 t=切换目标 q=退出")
+                print("  未知命令。可用: g=抓取 o=张开 c=闭合 p=打印 h=回零 r=预备位姿 t=切换目标 q=退出")
     except KeyboardInterrupt:
         pass
     finally:

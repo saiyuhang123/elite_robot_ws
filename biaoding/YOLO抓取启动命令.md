@@ -7,7 +7,6 @@
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/Documents/elite_robot_ws/install/setup.bash
-source ~/Documents/linker_hand_ros2_sdk/install/setup.bash
 ```
 
 CAN 端口（机械手，每次插拔/重启后执行一次）：
@@ -110,6 +109,7 @@ python3 yolo_grasp.py
 | `c` | 闭合机械手 |
 | `p` | 打印当前目标点坐标 |
 | `h` | 回零位 |
+| `r` | 移动到抓取预备位姿 |
 | `t apple` | 切换目标类别为 apple |
 | `t cup` | 切换目标类别为 cup |
 | `t apple,cup` | 同时检测多个类别 |
@@ -128,8 +128,11 @@ python3 yolo_grasp.py
 # 单个类别
 ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'apple'"
 
-# 多个类别
+# 多个类别（同时检测，取深度最近的一个）
 ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'apple,cup'"
+
+# 单个类别
+ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'apple'"
 
 # 所有类别
 ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'all'"
@@ -149,6 +152,9 @@ ros2 service call /yolo_grasp/close std_srvs/srv/Trigger
 
 # 回零位
 ros2 service call /yolo_grasp/home std_srvs/srv/Trigger
+
+# 到抓取预备位姿
+ros2 service call /yolo_grasp/ready std_srvs/srv/Trigger
 
 # 查看当前目标状态
 ros2 service call /yolo_grasp/status std_srvs/srv/Trigger

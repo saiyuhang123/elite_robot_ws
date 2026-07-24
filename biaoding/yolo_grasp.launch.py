@@ -40,6 +40,9 @@ YOLO 视觉抓取一体化 Launch 文件（LinkerHand O6 机械手版）。
 	  # 回零位
 	  ros2 service call /yolo_grasp/home std_srvs/srv/Trigger
 
+	  # 到抓取预备位姿
+	  ros2 service call /yolo_grasp/ready std_srvs/srv/Trigger
+
 	  # 查看当前目标状态
 	  ros2 service call /yolo_grasp/status std_srvs/srv/Trigger
 
@@ -148,14 +151,16 @@ def generate_launch_description():
 
     # ============================================================
     # 3. LinkerHand O6 SDK（机械手控制）
-    #    —— 位于独立工作区，用绝对路径引用
+    #    —— 位于独立工作区，用 bash -c 先 source 再 ros2 launch
     # ============================================================
-    linker_hand_sdk_path = os.path.expanduser(
-        "~/Documents/linker_hand_ros2_sdk/src/linkerhand-ros2-sdk"
-        "/linker_hand_ros2_sdk/launch/linker_hand.launch.py"
-    )
-    linker_hand = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(linker_hand_sdk_path),
+    linker_hand_ws = os.path.expanduser("~/Documents/linker_hand_ros2_sdk")
+    linker_hand = ExecuteProcess(
+        cmd=[
+            "bash", "-c",
+            f"source {linker_hand_ws}/install/setup.bash && "
+            "ros2 launch linker_hand_ros2_sdk linker_hand.launch.py"
+        ],
+        output="screen",
         condition=IfCondition(run_linker_hand),
     )
 
