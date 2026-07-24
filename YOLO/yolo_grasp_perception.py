@@ -5,6 +5,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 import message_filters
 from tf2_ros import Buffer, TransformListener, TransformBroadcaster
@@ -25,8 +26,9 @@ HAND_EYE_JSON = os.path.expanduser(
     '~/Documents/elite_robot_ws/biaoding/hand_eye_result.json')
 
 
-# 目标类别过滤：只处理这些类别的检测框（COCO 类别名），空集合 = 全部处理
-TARGET_CLASSES = {'apple'}
+# 默认目标类别（可通过 /yolo/target_class 话题动态修改）
+# 空集合 = 处理所有类别
+DEFAULT_TARGET_CLASSES = {'apple'}
 # 置信度阈值：低于此值的检测框直接忽略
 CONF_THRESHOLD = 0.4
 
@@ -48,7 +50,10 @@ class YoloGraspPerceptionNode(Node):
 
         # ---------------- 1. 初始化参数与配置 ----------------
         self.bridge = CvBridge()
-        
+
+        # 目标类别集合（可通过 /yolo/target_class 话题动态修改）
+        self.target_classes = set(DEFAULT_TARGET_CLASSES)
+
         # 加载 YOLO 模型 (首次运行会自动下载 yolov8n.pt，可换成你自己的 pt 模型)
         self.get_logger().info('正在加载 YOLO 模型...')
         self.yolo_model = YOLO('yolov8s.pt') 
@@ -80,6 +85,10 @@ class YoloGraspPerceptionNode(Node):
             CameraInfo, '/camera/camera/color/camera_info', self._info_cb, 10)
         self.create_timer(5.0, self._report_status)
 
+        # 订阅目标类别切换话题（可动态切换检测目标，如 "apple" -> "cup"）
+        self.create_subscription(
+            String, '/yolo/target_class', self._target_class_cb, 10)
+
         # ---------------- 4. 话题发布与 TF 广播 ----------------
         # 发布算出的目标 3D 位姿 (基座坐标系下)
         self.pose_pub = self.create_publisher(PoseStamped, '/target_object_pose', 10)
@@ -109,6 +118,18 @@ class YoloGraspPerceptionNode(Node):
     def _info_cb(self, msg):
         self._mark('info')
         self.latest_info = msg
+
+    # ---- 目标类别切换回调 ----
+    def _target_class_cb(self, msg):
+        """动态切换检测目标类别。发送逗号分隔的类别名，如 "apple,cup" 或 "apple"。
+           发送空字符串或 "all" 表示检测所有类别。"""
+        text = msg.data.strip()
+        if not text or text.lower() == 'all':
+            self.target_classes = set()
+            self.get_logger().info('[目标类别] 已切换为: 全部类别')
+        else:
+            self.target_classes = {c.strip() for c in text.split(',') if c.strip()}
+            self.get_logger().info(f'[目标类别] 已切换为: {self.target_classes}')
 
     # ---- 诊断辅助 ----
     def _mark(self, key):
@@ -174,7 +195,7 @@ class YoloGraspPerceptionNode(Node):
             cls_id = int(box.cls[0])
             cls_name = self.yolo_model.names[cls_id]
             conf = float(box.conf[0])
-            if TARGET_CLASSES and cls_name not in TARGET_CLASSES:
+            if self.target_classes and cls_name not in self.target_classes:
                 continue
             if conf < CONF_THRESHOLD:
                 continue

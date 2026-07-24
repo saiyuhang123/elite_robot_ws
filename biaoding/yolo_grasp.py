@@ -31,6 +31,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
@@ -112,14 +114,29 @@ def quat_to_rotvec(x, y, z, w):
 class YoloGrasp:
     def __init__(self):
         self.robot = RobotCartesianControl()
+        self.cb_group = ReentrantCallbackGroup()
         self.script_pub = self.robot.create_publisher(String, SCRIPT_TOPIC, 10)
         # LinkerHand 控制
         self.hand_pub = self.robot.create_publisher(JointState, HAND_CMD_TOPIC, 10)
         self.hand_setting_pub = self.robot.create_publisher(String, HAND_SETTING_TOPIC, 10)
+        # 目标类别发布（发给 YOLO 感知节点）
+        self.target_class_pub = self.robot.create_publisher(String, '/yolo/target_class', 10)
         self.latest_target = None       # 最新的目标点（基座系，米）
         self.latest_target_time = 0.0
         self.robot.create_subscription(
             PoseStamped, TARGET_TOPIC, self._target_cb, 10)
+
+        # ---- ROS 服务（可通过命令行远程调用）----
+        self.robot.create_service(Trigger, '/yolo_grasp/grasp', self._srv_grasp,
+                                  callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/open', self._srv_open,
+                                  callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/close', self._srv_close,
+                                  callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/home', self._srv_home,
+                                  callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/status', self._srv_status,
+                                  callback_group=self.cb_group)
 
     # ---------------- LinkerHand 控制 ----------------
     def hand_open(self):
@@ -141,6 +158,60 @@ class YoloGrasp:
         msg = JointState()
         msg.position = [float(p) for p in positions]
         self.hand_pub.publish(msg)
+
+    # ---------------- ROS 服务回调 ----------------
+    def _srv_grasp(self, request, response):
+        """服务 /yolo_grasp/grasp：触发一次抓取流程"""
+        self.robot.get_logger().info('[服务] 收到抓取指令')
+        # 在回调里直接执行抓取（会阻塞直到完成）
+        self.grasp()
+        response.success = True
+        response.message = '抓取流程已完成'
+        return response
+
+    def _srv_open(self, request, response):
+        """服务 /yolo_grasp/open：张开机械手"""
+        self.robot.get_logger().info('[服务] 收到张开手指令')
+        self.hand_open()
+        response.success = True
+        response.message = '机械手已张开'
+        return response
+
+    def _srv_close(self, request, response):
+        """服务 /yolo_grasp/close：闭合机械手"""
+        self.robot.get_logger().info('[服务] 收到闭合手指令')
+        self.hand_close()
+        response.success = True
+        response.message = '机械手已闭合'
+        return response
+
+    def _srv_home(self, request, response):
+        """服务 /yolo_grasp/home：回零位"""
+        self.robot.get_logger().info('[服务] 收到回零指令')
+        self.home()
+        response.success = True
+        response.message = '已回零位'
+        return response
+
+    def _srv_status(self, request, response):
+        """服务 /yolo_grasp/status：获取当前状态"""
+        if self.latest_target is None:
+            response.success = False
+            response.message = '无目标（感知节点未检测到物体）'
+        else:
+            t = self.latest_target
+            age = time.time() - self.latest_target_time
+            response.success = True
+            response.message = (
+                f'目标: [{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}]（{age:.1f}s 前）')
+        return response
+
+    def set_target_class(self, class_name: str):
+        """发布目标类别切换指令给 YOLO 感知节点。"""
+        msg = String()
+        msg.data = class_name
+        self.target_class_pub.publish(msg)
+        print(f"  已发送目标类别切换: '{class_name}'")
 
     def _target_cb(self, msg):
         self.latest_target = np.array([
@@ -310,11 +381,21 @@ def main():
         rclpy.shutdown()
         return
 
-    print("=" * 56)
+    # 后台线程：处理 ROS 服务请求
+    executor = MultiThreadedExecutor()
+    executor.add_node(g.robot)
+    import threading
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    print("=" * 60)
     print("YOLO 抓取主程序（LinkerHand O6 机械手版）")
-    print("  g = 抓取   o = 张开手   c = 闭合手   p = 打印目标   h = 回零   q = 退出")
+    print("  键盘: g=抓取  o=张开手  c=闭合手  p=打印目标  h=回零  q=退出")
+    print("        t=切换目标类别（如 t apple / t cup / t all）")
+    print("  ROS服务: /yolo_grasp/grasp  /open  /close  /home  /status")
+    print("  ROS话题: /yolo/target_class (发布类别名切换检测目标)")
     print(f"  工具轴: 世界系+X   抓取偏移: {GRASP_OFFSET_WORLD}")
-    print("=" * 56)
+    print("=" * 60)
     g.hand_setup()  # 设置机械手速度和扭矩
 
     try:
@@ -342,9 +423,19 @@ def main():
                           f"（{time.time()-g.latest_target_time:.1f}s 前）")
             elif cmd == 'h':
                 g.home()
+            elif cmd.startswith('t'):
+                # t apple  /  t cup  /  t all  /  t apple,cup
+                parts = cmd.split(maxsplit=1)
+                cls = parts[1] if len(parts) > 1 else 'apple'
+                g.set_target_class(cls)
+            elif cmd == '':
+                pass
+            else:
+                print("  未知命令。可用: g=抓取 o=张开 c=闭合 p=打印 h=回零 t=切换目标 q=退出")
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         g.resend_external_script()
         g.robot.destroy_node()
         rclpy.shutdown()
