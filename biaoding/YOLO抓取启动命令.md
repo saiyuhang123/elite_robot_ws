@@ -26,12 +26,22 @@ ip link show can2   # 应显示 <UP,LOWER_UP>
 ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp.launch.py
 ```
 
-第二个终端启动抓取主程序：
+第二个终端启动抓取主程序（根据夹爪选择）：
 
 ```bash
 cd ~/Documents/elite_robot_ws/biaoding
-python3 yolo_grasp.py
+python3 yolo_grasp.py                          # 默认 LinkerHand O6 灵巧手
+python3 yolo_grasp.py --gripper two_finger     # 二指夹爪（Inspire 4B4C）
+python3 yolo_grasp.py --gripper soft_touch     # 柔触三指气动夹爪
 ```
+
+不同夹爪需要提前启动对应的控制节点：
+
+| 夹爪 | 前置节点 |
+|---|---|
+| linkerhand | `ros2 launch linker_hand_ros2_sdk linker_hand.launch.py` |
+| two_finger | `ros2 run inspire_gripper Gripper_control_node` |
+| soft_touch | `ros2 run gripper_control gripper_server` |
 
 可选参数：
 
@@ -214,9 +224,21 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 | 文件 | 作用 |
 |---|---|
 | `biaoding/hand_eye_result.json` | 手眼标定结果（相机→法兰变换矩阵） |
-| `biaoding/yolo_grasp.py` | 抓取主程序（含抓取偏移、速度等参数） |
+| `biaoding/yolo_grasp.py` | 抓取主程序（支持多夹爪，`--gripper` 选择） |
+| `biaoding/grippers/` | 夹爪抽象层（base / linkerhand / two_finger / soft_touch） |
+| `biaoding/grasp_orientation_*.json` | 各夹爪的示教姿态文件 |
 | `YOLO/yolo_grasp_perception.py` | YOLO 感知节点（模型路径、目标类别、置信度阈值） |
 | `YOLO/yolov8s.pt` | YOLOv8 模型权重 |
+
+### 夹爪参数速查
+
+| 参数 | linkerhand | two_finger | soft_touch |
+|---|---|---|---|
+| 控制方式 | topic (JointState) | 服务 (serial→ROS) | 服务 (Modbus TCP) |
+| IK 模式 | 6dof | 6dof | 5dof（旋转对称） |
+| tool_length | 0.13 | 0.12 | 0.15 |
+| grasp_offset Z | -0.04（包握） | 0.0（对准中心） | 0.02（略高） |
+| close_delay | 1.5s | 1.0s | 2.0s |
 
 ---
 
