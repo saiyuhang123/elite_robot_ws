@@ -1,0 +1,115 @@
+1.ros2_gripper包支持因时机器人公司的4B4C夹爪在ROS2.0平台上的使用。
+2.为了使程序能够正常运行，需要进行ros2.0环境配置，安装对应依赖。
+    1) 新建文件夹ros2_ws,在此文件夹下创建src文件夹
+    2) 将夹爪压缩包解压后的三个文件夹放入src文件夹下
+    3）在ros2_ws下打开新终端，运行指令colcon build，编译成功后继续
+3.夹爪使用
+    1）将夹爪与电脑连接，查看连接端口名称。
+       终端指令：ls /dev/tty*（端口名称应该会显示/dev/ttyUSB0或者是/dev/ttyUSB1、/dev/ttyUSB2等）,功能包默认使用的串口为/dev/ttyUSB0，若串口名称不一致可修改程序。
+    2) 下面就是正式启动命令。使用launch命令来启动程序：
+        (1) 如果串口名称是默认的ttyUSB0。终端指令：cd ~/ros2_ws
+                                                 colcon build
+
+    3) 如果上一步编译成功，那么就可以使用后续的命令了：
+       注意： 需要重新打开一个新的终端，并执行终端指令：cd ~/ros2_ws
+                                                 source install/setup.bash
+						 ros2 run inspire_gripper Gripper_control_node
+    4）在ros2_ws下重新打开终端先运行指令：source install/setup.bash
+                             
+                之后运行以下指令控制夹爪
+    
+      (1)ros2 service call SetID service_interfaces/srv/SetpID "{gripper_setid: num,gripper_id: 1, status: 'set_id'}"
+      设置夹爪ID------参数num范围1-254,默认夹爪ID为1
+
+      (2)ros2 service call /Setopenlimit service_interfaces/srv/Setopenlimit "{openmax: num1,openmin: num2,gripper_id: 1, status: 'set_openlimit'}"
+      设置夹爪开口上下限------参数num1，num2范围 0-1000
+
+      (3)ros2 service call /Setclearerror service_interfaces/srv/Setclearerror "{gripper_id: 1, status: 'set_clearerror'}"
+      清除故障
+
+      (4)ros2 service call /Setmovetgt service_interfaces/srv/Setmovetgt "{movetgt: num,gripper_id: 1, status: 'set_move_tgt'}"
+      设置夹爪开口度------参数num 范围 0-1000
+
+      (5)ros2 service call /Setmovemax service_interfaces/srv/Setmovemax "{speed: num,gripper_id: 1, status: 'set_movemax'}"
+      指定速度松开夹爪------参数num 范围 1-1000
+
+      (6)ros2 service call /Setmovemin service_interfaces/srv/Setmovemin "{speed: num,power: num1,gripper_id: 1, status: 'set_movemin'}"
+      指定速度力值夹爪抓取------参数num 范围 1-1000  num1 范围50-1000
+
+
+      (7)ros2 service call /Setmoveminhold service_interfaces/srv/Setmoveminhold "{speed: num,power: num1,gripper_id: 1, status: 'set_moveminhold'}"
+      指定速度力值夹爪持续抓取------参数num 范围 1-1000  num1 范围50-1000
+
+      (8)ros2 service call /Setestop service_interfaces/srv/Setestop "{gripper_id: 1, status: 'set_estop'}"
+      急停
+
+      (9)ros2 service call /Setparam service_interfaces/srv/Setparam "{gripper_id: 1, status: 'set_param'}"
+      参数固化
+
+      (10)ros2 service call /Getopenlimit service_interfaces/srv/Getopenlimit "{gripper_id: 1, status: 'get_openlimit'}"
+      读取夹爪开口上下限位
+      
+      (11)ros2 service call /Getcopen service_interfaces/srv/Getcopen "{gripper_id: 1, status: 'get_copen'}"
+      读取夹爪开口度
+      
+      (12)ros2 service call /Getstatus service_interfaces/srv/Getstatus "{gripper_id: 1, status: 'get_status'}"
+      读取夹爪状态，故障码，温度
+  
+
+
+(2) 设置夹爪开口上下限
+
+  - 示例设置：最大开口限位 900，最小开口限位 100（范围：0 ~ 1000）
+
+ros2 service call /Setopenlimit service_interfaces/srv/Setopenlimit "{openmax: 900, openmin: 100, gripper_id: 1, status: 'set_openlimit'}"
+
+(3) 清除故障
+
+ros2 service call /Setclearerror service_interfaces/srv/Setclearerror "{gripper_id: 1, status: 'set_clearerror'}"
+
+(4) 设置夹爪开口度
+
+  - 示例设置：开口度目标位置 500（范围：0 ~ 1000）
+
+ros2 service call /Setmovetgt service_interfaces/srv/Setmovetgt "{movetgt: 500, gripper_id: 1, status: 'set_move_tgt'}"
+
+(5) 指定速度松开夹爪
+
+  - 示例设置：松开速度 400（范围：1 ~ 1000）
+
+ros2 service call /Setmovemax service_interfaces/srv/Setmovemax "{speed: 400, gripper_id: 1, status: 'set_movemax'}"
+
+(6) 指定速度力值夹爪抓取
+
+  - 示例设置：速度 500（范围：11000），力值 200（范围：501000）
+
+ros2 service call /Setmovemin service_interfaces/srv/Setmovemin "{speed: 500, power: 200, gripper_id: 1, status: 'set_movemin'}"
+
+(7) 指定速度力值夹爪持续抓取
+
+  - 示例设置：速度 600（范围：11000），力值 300（范围：501000）
+
+ros2 service call /Setmoveminhold service_interfaces/srv/Setmoveminhold "{speed: 600, power: 300, gripper_id: 1, status: 'set_moveminhold'}"
+
+(8) 急停
+
+ros2 service call /Setestop service_interfaces/srv/Setestop "{gripper_id: 1, status: 'set_estop'}"
+
+(9) 参数固化
+
+ros2 service call /Setparam service_interfaces/srv/Setparam "{gripper_id: 1, status: 'set_param'}"
+
+(10) 读取夹爪开口上下限位
+
+ros2 service call /Getopenlimit service_interfaces/srv/Getopenlimit "{gripper_id: 1, status: 'get_openlimit'}"
+
+(11) 读取夹爪开口度
+
+ros2 service call /Getcopen service_interfaces/srv/Getcopen "{gripper_id: 1, status: 'get_copen'}"
+
+(12) 读取夹爪状态，故障码，温度
+
+ros2 service call /Getstatus service_interfaces/srv/Getstatus "{gripper_id: 1, status: 'get_status'}"
+
+
+

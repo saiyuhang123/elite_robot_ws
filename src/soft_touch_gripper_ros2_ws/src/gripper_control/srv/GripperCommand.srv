@@ -1,0 +1,31 @@
+# GripperCommand.srv
+# 用于软体抓手的气压控制服务
+# =======================================
+# 命令常量:
+#
+# 正压控制:
+#   0 = START_POSITIVE_PRESSURE     启动正压 (线圈 0x0100 = ON)
+#   1 = RELEASE_POSITIVE_PRESSURE   正压松气 (线圈 0x0100 = OFF)
+# 负压控制:
+#   2 = START_NEGATIVE_PRESSURE     启动负压 (线圈 0x0101 = ON)
+#   3 = RELEASE_NEGATIVE_PRESSURE   负压松气 (线圈 0x0101 = OFF)
+# 参数设置:
+#   4 = SET_PRESSURE_UPPER_LIMIT    设置气压上限 (寄存器 0x0306)
+#   5 = SET_NEGATIVE_PRESSURE       设置负压值   (寄存器 0x0307, 有符号)
+# 状态查询:
+#   6 = READ_POSITIVE_FEEDBACK      读正压反馈 (离散输入 0x0200, 0/1)
+#   7 = READ_NEGATIVE_FEEDBACK      读负压反馈 (离散输入 0x0201, 0/1)
+# =======================================
+
+uint8 command       # 命令类型，取值 0~7
+
+# 参数值（仅 command 4/5 时需要，其它命令忽略）
+int32 value
+
+# 从站ID，默认 1
+uint8 slave_id 1
+
+---
+bool   success       # 是否执行成功
+string message       # 执行结果描述
+int32  result_value  # 查询返回值 (command 6/7 时存放 0/1)

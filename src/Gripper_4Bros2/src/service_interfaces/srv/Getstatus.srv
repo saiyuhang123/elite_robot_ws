@@ -1,0 +1,9 @@
+#接收的命令类型
+string status
+#夹爪ID
+int32 gripper_id
+---
+#接收数据
+int32 status
+int32 error
+int32 temp

@@ -1,0 +1,1 @@
+cmd_/home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/ch341.ko := ld -r -EL  -maarch64elf -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/ch341.ko /home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/ch341.o /home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/ch341.mod.o;  true

@@ -1,0 +1,8 @@
+#接收的命令类型
+string status
+#夹爪ID
+int32 gripper_id
+---
+#接收数据
+float32 openmax
+float32 openmin

@@ -1,0 +1,1 @@
+cmd_/home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/ch341.mod := printf '%s\n'   ch341.o | awk '!x[$$0]++ { print("/home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/"$$0) }' > /home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/ch341.mod

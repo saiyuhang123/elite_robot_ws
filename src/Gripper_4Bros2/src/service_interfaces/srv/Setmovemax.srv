@@ -1,0 +1,9 @@
+#接收的命令类型
+string status
+#夹爪ID
+int32 gripper_id
+
+int32 speed
+---
+#接收数据
+bool movemax_accepted

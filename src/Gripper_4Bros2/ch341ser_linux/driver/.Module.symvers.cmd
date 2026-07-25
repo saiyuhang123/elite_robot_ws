@@ -1,0 +1,1 @@
+cmd_/home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/Module.symvers := sed 's/\.ko$$/\.o/' /home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/modules.order | scripts/mod/modpost -m   -o /home/nvidia/Documents/Gripper_4Bros2/ch341ser_linux/driver/Module.symvers -e -i Module.symvers   -T -
