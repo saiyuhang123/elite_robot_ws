@@ -14,6 +14,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(orocos_kdl REQUIRED)
 find_package(trac_ik_lib REQUIRED)
@@ -43,10 +44,55 @@ install(TARGETS
 
 # =============================================
 # TODO: More executables to be added:
-#   - eliteURForceAppControl  (main state machine)
 #   - eliteCamera3DSolver     (vision solver)
-#   - eliteAppCommandNode     (command publisher)
 # =============================================
+
+# =============================================
+# Main state machine: ysURForceAppControl
+# =============================================
+add_executable(ysURForceAppControl
+  src/ysURForceAppNode.cpp
+  src/ysURForceAppControl.cpp
+)
+
+ament_target_dependencies(ysURForceAppControl
+  rclcpp sensor_msgs geometry_msgs Eigen3 orocos_kdl
+  trac_ik_lib std_srvs PCL
+  trajectory_msgs std_msgs eli_common_interface)
+
+install(TARGETS
+  ysURForceAppControl
+  DESTINATION lib/${PROJECT_NAME})
+
+# =============================================
+# Vision solver: 3D camera point cloud processing
+# =============================================
+add_executable(ysCamera3DSolver
+  src/ysCamera3DSolverNode.cpp
+  src/ysCamera3DSolver.cpp
+)
+
+ament_target_dependencies(ysCamera3DSolver
+  rclcpp sensor_msgs geometry_msgs Eigen3 orocos_kdl
+  trac_ik_lib std_srvs PCL pcl_conversions tf2_eigen_kdl)
+
+install(TARGETS
+  ysCamera3DSolver
+  DESTINATION lib/${PROJECT_NAME})
+
+# =============================================
+# App command publisher
+# =============================================
+add_executable(ysAppCommand
+  src/ysAppCommandNode.cpp
+)
+
+ament_target_dependencies(ysAppCommand
+  rclcpp Eigen3 std_msgs)
+
+install(TARGETS
+  ysAppCommand
+  DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -56,3 +102,13 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
+
+# Install launch files
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME})
+
+# Install template PCD files
+install(DIRECTORY
+  share
+  DESTINATION share/${PROJECT_NAME})
