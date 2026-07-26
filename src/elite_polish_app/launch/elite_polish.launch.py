@@ -35,6 +35,17 @@ def generate_launch_description():
             output='screen',
         ),
 
+        # Vision solver (required for command 3 / vision job; missing it blocks sub_step 302/303)
+        # template_file 当前仅作调试点云（cameracapture.pcd/base.pcd）的保存路径前缀，
+        # 实际不加载模板文件（加载代码在 ysCamera3DSolver.cpp 中被注释），故指向 /tmp/。
+        Node(
+            package='elite_polish_app',
+            executable='ysCamera3DSolver',
+            name='ysCamera3DSolver',
+            output='screen',
+            parameters=[{'template_file': '/tmp/'}],
+        ),
+
         # Interactive command line interface
         Node(
             package='elite_polish_app',

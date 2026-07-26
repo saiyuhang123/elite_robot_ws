@@ -41,12 +41,22 @@ private:
       msg->points.size());
 
     auto send_goal_options = rclcpp_action::Client<FollowJT>::SendGoalOptions();
+    // goal 被拒绝（如 time_from_start 非递增、关节名不匹配）时必须可见，否则表现为"不动且无报错"
+    send_goal_options.goal_response_callback =
+      [this](const GoalHandleFollowJT::SharedPtr & goal_handle) {
+        if (!goal_handle) {
+          RCLCPP_ERROR(this->get_logger(), "Trajectory goal was REJECTED by controller");
+        } else {
+          RCLCPP_DEBUG(this->get_logger(), "Trajectory goal accepted");
+        }
+      };
     send_goal_options.result_callback =
       [this](const GoalHandleFollowJT::WrappedResult & result) {
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           RCLCPP_INFO(this->get_logger(), "Trajectory succeeded");
         } else {
-          RCLCPP_ERROR(this->get_logger(), "Trajectory failed: %d", (int)result.code);
+          // 流式打磨时新 goal 抢占旧 goal，旧 goal 会以 ABORTED 结束，降级为 WARN
+          RCLCPP_WARN(this->get_logger(), "Trajectory finished with code: %d", (int)result.code);
         }
       };
 

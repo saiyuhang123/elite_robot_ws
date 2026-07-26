@@ -144,8 +144,11 @@ namespace elite_robot {
             KDL::Tree kdl_tree;
             if (kdl_parser::treeFromUrdfModel(robot_model, kdl_tree)) {
               //ys_eye
+              // 眼在手上相机: 链只到 tool0（URDF 中无 tr_camera link），
+              // tool0->相机光学系的固定变换（手眼标定）在使用处单独乘，见 ysCamera3DSolver.cpp。
+              // 此处 FK 仅用于 timer_callback 的守卫判断，链到 tool0 即可。
                 std::string ys_base = ys_prefix_ + "base_link";
-                std::string ys_tip_link = "tr_camera";
+                std::string ys_tip_link = ys_prefix_ + "tool0";
                 if (kdl_tree.getChain(ys_base, ys_tip_link, ys_eye_chain_)) {
                   ys_eye_fk_solver_ = new KDL::ChainFkSolverPos_recursive(ys_eye_chain_);
                 } else {
@@ -474,9 +477,9 @@ namespace elite_robot {
           value.force = data.force - gravity_sensor;
           value.torque.data[0] = data.torque.data[0] 
               - (gravity_sensor.data[2]*ys_tool_gcenter_.data[1] - gravity_sensor.data[1]*ys_tool_gcenter_.data[2]);
-          value.torque.data[1] = data.torque.data[0] 
+          value.torque.data[1] = data.torque.data[1] 
               - (gravity_sensor.data[0]*ys_tool_gcenter_.data[2] - gravity_sensor.data[2]*ys_tool_gcenter_.data[0]);
-          value.torque.data[2] = data.torque.data[0] 
+          value.torque.data[2] = data.torque.data[2] 
               - (gravity_sensor.data[1]*ys_tool_gcenter_.data[0] - gravity_sensor.data[0]*ys_tool_gcenter_.data[1]);
         }
         return value;
@@ -785,7 +788,7 @@ namespace elite_robot {
               ys_up_point.positions.push_back(ys_resultJnt(i));
               ys_up_point.velocities.push_back(0);
           }
-          ys_up_point.time_from_start = deltaT;
+          ys_up_point.time_from_start = moveT + deltaT;// 第二点时间必须晚于第一点，否则被控制器拒绝
           traj_goal.points.push_back(ys_up_point);
 
           //pub
@@ -894,7 +897,7 @@ namespace elite_robot {
                 tmpPt.positions.push_back(ys_resultJnt(x));
                 tmpPt.velocities.push_back(0);
             }
-            tmpPt.time_from_start = deltaT;
+            tmpPt.time_from_start = rclcpp::Duration::from_nanoseconds(deltaT.nanoseconds() * (i + 1));// 时间必须逐点递增，否则被控制器拒绝
             ys_goal.points.push_back(tmpPt);
           }
 
@@ -987,7 +990,7 @@ namespace elite_robot {
                 tmpPt.positions.push_back(ys_resultJnt(x));
                 tmpPt.velocities.push_back(0);
             }
-            tmpPt.time_from_start = deltaT;
+            tmpPt.time_from_start = rclcpp::Duration::from_nanoseconds(deltaT.nanoseconds() * (i + 1));// 时间必须逐点递增，否则被控制器拒绝
             ys_goal.points.push_back(tmpPt);
           }
 
@@ -999,7 +1002,8 @@ namespace elite_robot {
               ys_home_point.velocities.push_back(0);
           }
           rclcpp::Duration homeT(2*speed_level_, 0);
-          ys_home_point.time_from_start = homeT;
+          // home 点时间必须在抬刀轨迹段之后（循环段总时长 deltaT*trajCount 约 2.4s*speed_level_ 已大于 homeT）
+          ys_home_point.time_from_start = rclcpp::Duration::from_nanoseconds(deltaT.nanoseconds() * trajCount) + homeT;
           ys_goal.points.push_back(ys_home_point);
 
           //pub

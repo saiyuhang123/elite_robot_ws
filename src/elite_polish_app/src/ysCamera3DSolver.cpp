@@ -89,8 +89,10 @@ namespace elite_robot {
             KDL::Tree kdl_tree;
             if (kdl_parser::treeFromUrdfModel(robot_model, kdl_tree)) {
               //ys eye
+              // 眼在手上相机: 链只到 tool0（URDF 中无 tr_camera link），
+              // tool0->相机光学系的固定变换在点云回调中乘上（见下方 ys_T_tool0_camera_）。
                 std::string ys_base = ys_prefix_ + "base";
-                std::string ys_tip_link = "tr_camera";
+                std::string ys_tip_link = ys_prefix_ + "tool0";
                 if (kdl_tree.getChain(ys_base, ys_tip_link, ys_eye_chain_)) {
                   ys_eye_fk_solver_ = new KDL::ChainFkSolverPos_recursive(ys_eye_chain_);
                 } else {
@@ -189,6 +191,13 @@ namespace elite_robot {
           if (ys_first_q_==false&&ys_eye_fk_solver_!=nullptr)
           {
             ys_eye_fk_solver_->JntToCart(ys_cur_q_, ys_curP_eye_);
+            // 眼在手上: tool0 -> 相机光学系的固定变换（手眼标定 biaoding/hand_eye_result.json，
+            // cv2.calibrateHandEye 输出的 R_cam2tool / t_cam2tool；RPY 由 R_cam2tool 换算）。
+            // KDL 链只到 tool0，相机位姿 = tool0位姿 * 该固定变换。
+            static const KDL::Frame ys_T_tool0_camera_(
+                KDL::Rotation::RPY(-0.063913, 0.009927, -1.552858),
+                KDL::Vector(-0.135488, 0.025233, 0.033736));
+            ys_curP_eye_ = ys_curP_eye_ * ys_T_tool0_camera_;
             Eigen::Affine3d transform;
             tf2::transformKDLToEigen(ys_curP_eye_, transform);
             base_cloud_ = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
