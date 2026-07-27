@@ -28,11 +28,18 @@ def generate_launch_description():
         ),
 
         # Main state machine for force-controlled polishing
+        # debug_skip_force_contact: true=空跑模式(402免接触、404力控旁路)，验证动作用；
+        #                           真打磨必须改回 false！
+        # contact_fz_threshold: 402 接触判定阈值(N,负值)，软工件/纸箱可调小(如 -6.0)
         Node(
             package='elite_polish_app',
             executable='ysURForceAppControl',
             name='ysURForceAppControl',
             output='screen',
+            parameters=[{
+                'debug_skip_force_contact': True,
+                'contact_fz_threshold': -16.0,
+            }],
         ),
 
         # Vision solver (required for command 3 / vision job; missing it blocks sub_step 302/303)

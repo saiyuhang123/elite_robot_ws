@@ -101,6 +101,8 @@ namespace elite_robot {
             double adjust_dz_;
             int control_dt_count_;//n*4ms for timer
             int control_dt_index_;
+            bool debug_skip_force_contact_ = false;//调试空跑: 402免接触、404力控旁路
+            double contact_fz_threshold_ = -16.0;//402接触判定阈值(N)
             //polish data
             KDL::Frame frame_polishcloud_base_;
             KDL::Frame frame_polishcloud_transform_;

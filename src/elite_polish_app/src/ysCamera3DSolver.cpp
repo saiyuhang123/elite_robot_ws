@@ -221,7 +221,11 @@ namespace elite_robot {
         RCLCPP_INFO(this->get_logger(), "camera capture cloud size %d\n", base_cloud_->size());
         YsPCLCalcTransform calcFrame;
         Eigen::Matrix4f result;
-        calcFrame.calc(base_cloud_, result);
+        if (!calcFrame.calc(base_cloud_, result)) {
+          RCLCPP_ERROR(this->get_logger(),
+            "vision calc failed (some crop stage empty). Check workpiece position vs crop boxes.");
+          return false;
+        }
         // Print the rotation matrix and translation vector
         Eigen::Matrix3f rotationC = result.block<3,3>(0, 0);
         Eigen::Vector3f translationC = result.block<3,1>(0, 3);

@@ -29,6 +29,11 @@ namespace elite_robot {
           target_fz_ = -8;//N
           adjust_dz_ = 0.0003;//m
           control_dt_count_ = 10;//todo, n*4ms for timer
+          // 调试/工艺参数（ROS 参数，可在 launch 中覆盖）:
+          // debug_skip_force_contact=true 时空跑: 402 免接触直接过、404 力控旁路
+          // contact_fz_threshold: 402 接触判定阈值(N)，负值，压向工件时 force.z 小于它判定接触
+          debug_skip_force_contact_ = this->declare_parameter<bool>("debug_skip_force_contact", false);
+          contact_fz_threshold_ = this->declare_parameter<double>("contact_fz_threshold", target_fz_*2);
           control_dt_index_ = 0;
           //polish data
           frame_polishcloud_base_.p = KDL::Vector(-0.11, 0.125, 0.205);
@@ -84,12 +89,13 @@ namespace elite_robot {
           ys_average_wrench_.force = KDL::Vector(0,0,0);
           ys_average_wrench_.torque = KDL::Vector(0,0,0);
           ys_first_wrench_ = true;
-          // 重力补偿参数（2026-07-26 负载识别，含打磨机+相机整体）:
-          //   质量 1.478 kg，重力 = m*g*(世界系向下在 base 系的方向)（45°倾斜安装，
-          //   方向向量 = -V_UP_IN_BASE = (0.7431,-0.0120,-0.6691)，见 biaoding/world_offset_calc.py）
-          ys_tool_gravity_ = KDL::Vector(10.7654, -0.1738, -9.6917);
-          //   质心在 tool0（法兰）系下的坐标（米），示教器读数 X=-56.32 Y=19.36 Z=-19.86 mm
-          ys_tool_gcenter_ = KDL::Vector(-0.05632, 0.01936, -0.01986);
+          // 重力补偿参数（保持为零！）:
+          // 示教器负载识别(1.478kg)后 Elite 控制器已在驱动端补偿重力——实测装工具原始读数仅 ~1N，
+          // 而代码内补偿后去皮值达 -11.8N（双重补偿）。故驱动端补偿已足够，此处不再补偿。
+          // 若日后确认驱动端未补偿，再填: ys_tool_gravity_ = m*g*(世界系向下在 base 系方向)，
+          // 即 (10.7654, -0.1738, -9.6917)，ys_tool_gcenter_ = (-0.05632, 0.01936, -0.01986)。
+          ys_tool_gravity_ = KDL::Vector(0.0, 0.0, 0.0);
+          ys_tool_gcenter_ = KDL::Vector(0.0, 0.0, 0.0);
           // Bias will be auto-calibrated from first 200 samples
           ys_bias_wrench_.force = KDL::Vector(0.0, 0.0, 0.0);
           ys_bias_wrench_.torque = KDL::Vector(0.0, 0.0, 0.0);
@@ -215,11 +221,8 @@ namespace elite_robot {
             ys_home_q_(i) = ys_home_q_(i)*M_PI/180;
           }
           ys_cameraCapture_q_.resize(joint_size_);
-          // 已示教（角度制），与 home 同姿态
-          ys_cameraCapture_q_.data <<  8.2, -93.6, -110.2, 57.4, 91.7, 91.6;
-          for (int i=0;i<joint_size_;i++){
-            ys_cameraCapture_q_(i) = ys_cameraCapture_q_(i)*M_PI/180;
-          }
+          // 已示教（弧度制，直接赋值，不要再做角度→弧度转换！）2026-07-27 更新
+          ys_cameraCapture_q_.data << 0.1204, -0.9960, -2.4689, 0.4922, 1.6232, 1.6037;
           ys_polishBase_q_.resize(joint_size_);
           // 已示教（弧度制，直接赋值，不要再做角度→弧度转换！）
           ys_polishBase_q_.data << 0.2583, -1.7438, -1.5621, 0.7505, 1.5043, 1.5330;
@@ -771,12 +774,27 @@ namespace elite_robot {
           upFrame = startPos * moveFrame;
           KDL::JntArray ys_resultJnt(joint_size_);
           int rc = ys_tcp_tracik_solver_->CartToJnt(ys_polishBase_q_, upFrame, ys_resultJnt);
+          // IK 失败(rc!=1)时 ys_resultJnt 是未初始化垃圾；构型跳变时机械臂会猛甩。
+          // 两种情况都中止流程，绝不把目标发出去（2026-07-27 悬空狂晃事故的修复）
+          // 分关节检查: 关节1~5 限 90°（防翻肩/翻肘/翻腕），wrist_3 放宽到 170°——
+          // 打磨头是旋转体，工具绕自身 z 多转不影响功能（2026-07-27 误伤修复）
+          bool branch_jump = false;
           if (rc == 1) {
-            RCLCPP_INFO(this->get_logger()," polish start up target, %f, %f, %f, %f, %f, %f", 
-              ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
-          } else {
-            RCLCPP_INFO(this->get_logger()," polish start up target, trac ik failed");
+            for (int j = 0; j < joint_size_; j++) {
+              double lim = (j == joint_size_ - 1) ? M_PI * 0.95 : M_PI / 2;
+              if (std::fabs(ys_polishBase_q_(j) - ys_resultJnt(j)) > lim) { branch_jump = true; break; }
+            }
           }
+          if (rc != 1 || branch_jump) {
+            RCLCPP_ERROR(this->get_logger(),
+              "polish start up target unreachable or branch jump (rc=%d, branch_jump=%d), polish aborted. "
+              "Check vision frame / polishBase seed.", rc, (int)branch_jump);
+            app_cmd_ = AppCommand::NOTHING;
+            sub_step_ = 9999;
+            return;
+          }
+          RCLCPP_INFO(this->get_logger()," polish start up target, %f, %f, %f, %f, %f, %f", 
+            ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
           //polish start up point
           rclcpp::Duration deltaT(2*speed_level_, 1E9/125);
           trajectory_msgs::msg::JointTrajectoryPoint ys_up_point;
@@ -823,6 +841,12 @@ namespace elite_robot {
       void ysURForceAppControl::polish_doForceContact() {
         if (sub_step_ == 402 ) 
         {
+          // 调试空跑模式: 不做接触下压，直接进入打磨步（ROS 参数 debug_skip_force_contact）
+          if (debug_skip_force_contact_) {
+            RCLCPP_WARN(this->get_logger(),"DEBUG: skip force contact (air run), goto polishing");
+            sub_step_++;
+            return;
+          }
           bool touch = false;
 
           //start up point
@@ -838,7 +862,7 @@ namespace elite_robot {
           curFrame.M = startPos.M;
 
           double dcontact = 0.01;
-          if ( ys_average_wrench_.force.data[2] < target_fz_*2)
+          if ( ys_average_wrench_.force.data[2] < contact_fz_threshold_)
           // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
           //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
           //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
@@ -902,7 +926,7 @@ namespace elite_robot {
           // RCLCPP_INFO(this->get_logger(),"pub contact start polish trajectory");
           ys_traj_publisher_->publish(ys_goal);   
 
-          if ( ys_average_wrench_.force.data[2] < target_fz_*2)
+          if ( ys_average_wrench_.force.data[2] < contact_fz_threshold_)
           // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
           //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
           //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
@@ -1044,7 +1068,9 @@ namespace elite_robot {
           KDL::Frame  curFrame, tmpFrame, moveFrame;
           curFrame = ys_curP_tcp_;
           double k=0,dz;
-          if (fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)<3) {
+          if (debug_skip_force_contact_) {
+            k = 0;  // 调试空跑: 力控旁路，轨迹不叠加力调整
+          } else if (fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)<3) {
             k=0;
           } else {
             k=fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)/(ys_contact_wrench_sensor_.force.data[2] - target_fz_);
