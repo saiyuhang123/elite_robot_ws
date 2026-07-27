@@ -359,10 +359,11 @@ namespace elite_robot {
         RCLCPP_INFO(this->get_logger(), "subVisionResultCB: type: %s: x %f ; y %f ; z %f", id.c_str(), result.pose.position.x, result.pose.position.y, result.pose.position.z);
         RCLCPP_INFO(this->get_logger(), "subVisionResultCB: Quaternion: x %f ; y %f ; z %f; w %f", result.pose.orientation.x,result.pose.orientation.y,result.pose.orientation.z, result.pose.orientation.w);
         if ( (sub_step_ == 303 && ys_vision_job_done_ == false)
-          || app_cmd_ == AppCommand::NOTHING )  // 调试: 空闲时允许手动注入参考系(跳过视觉测试打磨)
+          || app_cmd_ == AppCommand::NOTHING || app_cmd_ < 0 )  // 调试: 空闲(-1或NOTHING)时允许手动注入参考系
         {
           frame_polishcloud_transform_.p = KDL::Vector(result.pose.position.x,result.pose.position.y,result.pose.position.z);
           frame_polishcloud_transform_.M = KDL::Rotation::Quaternion(result.pose.orientation.x,result.pose.orientation.y,result.pose.orientation.z, result.pose.orientation.w);          
+          RCLCPP_INFO(this->get_logger(),"subVisionResultCB: frame APPLIED (app_cmd_=%d, sub_step_=%d)", app_cmd_, sub_step_);
           ys_vision_job_done_ = true;
         }
       }
@@ -790,6 +791,10 @@ namespace elite_robot {
             RCLCPP_ERROR(this->get_logger(),
               "polish start up target unreachable or branch jump (rc=%d, branch_jump=%d), polish aborted. "
               "Check vision frame / polishBase seed.", rc, (int)branch_jump);
+            RCLCPP_ERROR(this->get_logger()," seed(polishBase), %f, %f, %f, %f, %f, %f",
+              ys_polishBase_q_(0)*180/M_PI, ys_polishBase_q_(1)*180/M_PI, ys_polishBase_q_(2)*180/M_PI, ys_polishBase_q_(3)*180/M_PI, ys_polishBase_q_(4)*180/M_PI, ys_polishBase_q_(5)*180/M_PI);
+            RCLCPP_ERROR(this->get_logger()," ik resultJnt,    %f, %f, %f, %f, %f, %f",
+              ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
             app_cmd_ = AppCommand::NOTHING;
             sub_step_ = 9999;
             return;
