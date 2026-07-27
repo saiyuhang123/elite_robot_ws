@@ -358,7 +358,8 @@ namespace elite_robot {
         
         RCLCPP_INFO(this->get_logger(), "subVisionResultCB: type: %s: x %f ; y %f ; z %f", id.c_str(), result.pose.position.x, result.pose.position.y, result.pose.position.z);
         RCLCPP_INFO(this->get_logger(), "subVisionResultCB: Quaternion: x %f ; y %f ; z %f; w %f", result.pose.orientation.x,result.pose.orientation.y,result.pose.orientation.z, result.pose.orientation.w);
-        if ( (sub_step_ == 303 && ys_vision_job_done_ == false) )
+        if ( (sub_step_ == 303 && ys_vision_job_done_ == false)
+          || app_cmd_ == AppCommand::NOTHING )  // 调试: 空闲时允许手动注入参考系(跳过视觉测试打磨)
         {
           frame_polishcloud_transform_.p = KDL::Vector(result.pose.position.x,result.pose.position.y,result.pose.position.z);
           frame_polishcloud_transform_.M = KDL::Rotation::Quaternion(result.pose.orientation.x,result.pose.orientation.y,result.pose.orientation.z, result.pose.orientation.w);          
