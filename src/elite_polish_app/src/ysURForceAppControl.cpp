@@ -84,12 +84,12 @@ namespace elite_robot {
           ys_average_wrench_.force = KDL::Vector(0,0,0);
           ys_average_wrench_.torque = KDL::Vector(0,0,0);
           ys_first_wrench_ = true;
-          // TODO: Calibrate for Elite + polishing tool:
-          //   ys_tool_gravity_ = tool_mass * 9.81 in base frame (N)
-          //   ys_tool_gcenter_ = tool center of mass in sensor frame (m)
-          //   Set to zero for now — gravity compensation is no-op without tool
-          ys_tool_gravity_ = KDL::Vector(0.0, 0.0, 0.0);
-          ys_tool_gcenter_ = KDL::Vector(0.0, 0.0, 0.0);
+          // 重力补偿参数（2026-07-26 负载识别，含打磨机+相机整体）:
+          //   质量 1.478 kg，重力 = m*g*(世界系向下在 base 系的方向)（45°倾斜安装，
+          //   方向向量 = -V_UP_IN_BASE = (0.7431,-0.0120,-0.6691)，见 biaoding/world_offset_calc.py）
+          ys_tool_gravity_ = KDL::Vector(10.7654, -0.1738, -9.6917);
+          //   质心在 tool0（法兰）系下的坐标（米），示教器读数 X=-56.32 Y=19.36 Z=-19.86 mm
+          ys_tool_gcenter_ = KDL::Vector(-0.05632, 0.01936, -0.01986);
           // Bias will be auto-calibrated from first 200 samples
           ys_bias_wrench_.force = KDL::Vector(0.0, 0.0, 0.0);
           ys_bias_wrench_.torque = KDL::Vector(0.0, 0.0, 0.0);
@@ -207,25 +207,22 @@ namespace elite_robot {
                 4ms, std::bind(&ysURForceAppControl::timer_callback, this));
       }
 
-      bool ysURForceAppControl::initDataQ(){  // TODO: RE-TEACH all joint angles for Elite CS66!
+      bool ysURForceAppControl::initDataQ(){
           ys_home_q_.resize(joint_size_);
-          // PLACEHOLDER: current robot position, re-teach for safe home
-          ys_home_q_.data << 8.2, -93.6, -109.4, 61.4, 86.4, -11.2;
+          // 已示教（角度制，示教器读数）
+          ys_home_q_.data << 8.2, -93.6, -110.2, 57.4, 91.7, 91.6;  
           for (int i=0;i<joint_size_;i++){
             ys_home_q_(i) = ys_home_q_(i)*M_PI/180;
           }
           ys_cameraCapture_q_.resize(joint_size_);
-          // PLACEHOLDER: same as home, re-teach for camera capture pose
-          ys_cameraCapture_q_.data << 8.2, -93.6, -109.4, 61.4, 86.4, -11.2;
+          // 已示教（角度制），与 home 同姿态
+          ys_cameraCapture_q_.data <<  8.2, -93.6, -110.2, 57.4, 91.7, 91.6;
           for (int i=0;i<joint_size_;i++){
             ys_cameraCapture_q_(i) = ys_cameraCapture_q_(i)*M_PI/180;
           }
           ys_polishBase_q_.resize(joint_size_);
-          // PLACEHOLDER: same as home, re-teach for polish approach pose
-          ys_polishBase_q_.data << 8.2, -93.6, -109.4, 61.4, 86.4, -11.2;
-          for (int i=0;i<joint_size_;i++){
-            ys_polishBase_q_(i) = ys_polishBase_q_(i)*M_PI/180;
-          }
+          // 已示教（弧度制，直接赋值，不要再做角度→弧度转换！）
+          ys_polishBase_q_.data << 0.2583, -1.7438, -1.5621, 0.7505, 1.5043, 1.5330;
           return true;
       }
 
@@ -964,11 +961,15 @@ namespace elite_robot {
           KDL::Frame moveFrame;
           int trajCount=120*speed_level_;
           rclcpp::Duration deltaT(0, 1E9/50);
+          // 45° 倾斜安装: 退刀按"世界系竖直向上"抬刀（实测向量，与 biaoding/world_offset_calc.py
+          // 的 V_UP_IN_BASE 一致），同时 base y 方向侧移 0.1m（base y 仍接近世界水平）。
+          const KDL::Vector world_up_in_base(-0.7431, 0.0120, 0.6691);
+          const double lift_height = 0.15;  // 世界系竖直抬刀高度(米)，按现场调整
           for (size_t i = 0; i < trajCount; i++)
           {
             //ys_ik
             lastQ = ys_resultJnt;
-            moveFrame.p = KDL::Vector(0,0.1*(i+1)/trajCount,(0.4-curFrame.p.data[2])*(i+1)/trajCount);//base y+ z+//todo
+            moveFrame.p = KDL::Vector(0,0.1*(i+1)/trajCount,0) + world_up_in_base*(lift_height*(i+1)/trajCount);//base y侧移 + 世界系竖直抬刀
             moveFrame.M = KDL::Rotation::RPY(0,0,0);
             upFrame = moveFrame * curFrame;
             int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, upFrame, ys_resultJnt);
