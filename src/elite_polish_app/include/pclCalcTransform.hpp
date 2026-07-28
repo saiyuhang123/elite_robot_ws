@@ -2,6 +2,8 @@
 #define ysPCLCalcTransform_HPP
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <vector>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <pcl/common/common.h>
@@ -236,11 +238,28 @@ class YsPCLCalcTransform
     }
 
     void getCurveFrame() {
+      // 用 2%~98% 分位数边界代替裸 min/max：盒面边缘的飞点会拉扯包围盒
+      // （实测挪 5cm 测出 4~7cm 抖动），分位数边界对少量离群点不敏感。
+      std::vector<float> xs, ys, zs;
+      xs.reserve(curveCloud_->points.size());
+      ys.reserve(curveCloud_->points.size());
+      zs.reserve(curveCloud_->points.size());
+      for (const auto& p : curveCloud_->points) {
+        xs.push_back(p.x); ys.push_back(p.y); zs.push_back(p.z);
+      }
+      auto pct = [](std::vector<float>& v, float q) {
+        size_t k = std::min(v.size() - 1, (size_t)(q * v.size()));
+        std::nth_element(v.begin(), v.begin() + k, v.end());
+        return v[k];
+      };
       pcl::PointXYZ min, max, mid;
-      pcl::getMinMax3D(*curveCloud_, min, max);
+      min.x = pct(xs, 0.02f);  max.x = pct(xs, 0.98f);
+      min.y = pct(ys, 0.02f);  max.y = pct(ys, 0.98f);
+      min.z = pct(zs, 0.02f);  max.z = pct(zs, 0.98f);
       mid.x = (min.x+max.x)/2;
       mid.y = (min.y+max.y)/2;
       mid.z = (min.z+max.z)/2;
+      std::cout<<"curve frame bbox x ["<<min.x<<","<<max.x<<"] y ["<<min.y<<","<<max.y<<"] z ["<<min.z<<","<<max.z<<"]"<<std::endl;
 
       Eigen::Vector3f trans;
       trans(0) = mid.x;
