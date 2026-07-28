@@ -70,5 +70,5 @@ ysCamera3DSolver:
     # ---- 圆弧坐标系常数 ----
     curve_radius: 0.9306       # 与状态机 polishcurve_radius 一致
     curve_center_dz: 1.89539   # 与状态机 polishcurve_center_dz 一致
-    curve_tool_offset: 0.18    # 打磨头沿 tool z 伸出法兰长度(m)，法兰目标=表面-此值×法向
+    curve_tool_offset: 0.205    # 打磨头(含沙盘)沿 tool z 伸出法兰长度(m)，2026-07-27 平贴实测 0.205；法兰目标=表面-此值×法向
     curve_y_offset: 0.1        # trans(1) = max.y - 此值

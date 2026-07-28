@@ -15,7 +15,7 @@ from tf2_ros import Buffer, TransformListener
 from scipy.spatial.transform import Rotation
 import numpy as np
 
-TOOL_Z = 0.18  # 打磨机沿 tool z 伸出长度（米），按实际修改
+TOOL_Z = 0.205  # 打磨机(含沙盘)沿 tool z 伸出长度（米），2026-07-27 平贴实测，按实际修改
 
 
 def main():
