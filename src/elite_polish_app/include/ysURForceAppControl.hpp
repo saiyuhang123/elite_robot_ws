@@ -103,6 +103,9 @@ namespace elite_robot {
             int control_dt_index_;
             bool debug_skip_force_contact_ = false;//调试空跑: 402免接触、404力控旁路
             double contact_fz_threshold_ = -16.0;//402接触判定阈值(N)
+            bool debug_approach_started_ = false;//空跑平滑接近状态
+            KDL::JntArray debug_approach_target_q_;//空跑接近目标关节角
+            double debug_approach_time_ = 4.0;//空跑接近轨迹时长(s)
             KDL::Vector world_up_in_base_;//退刀: 世界系"上"在 base 系的方向(参数)
             double retract_lift_height_ = 0.15;//退刀: 世界系竖直抬刀高度(m)
             //polish data

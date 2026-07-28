@@ -34,6 +34,7 @@ namespace elite_robot {
           // contact_fz_threshold: 402 接触判定阈值(N)，负值，压向工件时 force.z 小于它判定接触
           debug_skip_force_contact_ = this->declare_parameter<bool>("debug_skip_force_contact", false);
           contact_fz_threshold_ = this->declare_parameter<double>("contact_fz_threshold", target_fz_*2);
+          debug_approach_time_ = this->declare_parameter<double>("debug_approach_time", 4.0);//空跑接近轨迹时长(s)
           control_dt_index_ = 0;
           //polish data
           frame_polishcloud_base_.p = KDL::Vector(-0.11, 0.125, 0.205);
@@ -859,10 +860,40 @@ namespace elite_robot {
       void ysURForceAppControl::polish_doForceContact() {
         if (sub_step_ == 402 ) 
         {
-          // 调试空跑模式: 不做接触下压，直接进入打磨步（ROS 参数 debug_skip_force_contact）
+          // 调试空跑模式: 不做接触下压，但先发一条平滑轨迹慢速走到轨迹起点——
+          // 直接跳进 404 会被 20ms 流式目标全速追点（2026-07-27 用户反馈接近速度过快）
           if (debug_skip_force_contact_) {
-            RCLCPP_WARN(this->get_logger(),"DEBUG: skip force contact (air run), goto polishing");
-            sub_step_++;
+            if (!debug_approach_started_) {
+              KDL::Frame startPos = frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
+              KDL::JntArray targetJnt(joint_size_);
+              int rc = ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, startPos, targetJnt);
+              if (rc != 1) {
+                RCLCPP_ERROR(this->get_logger(),"DEBUG approach IK failed (rc=%d), abort", rc);
+                app_cmd_ = AppCommand::NOTHING;
+                sub_step_ = 9999;
+                return;
+              }
+              trajectory_msgs::msg::JointTrajectory traj;
+              traj.header.stamp = this->now();
+              for(int i=0;i<joint_size_;++i) {
+                traj.joint_names.push_back(ys_prefix_ + joint_names_[i]);
+              }
+              trajectory_msgs::msg::JointTrajectoryPoint pt;
+              for(int i=0;i<joint_size_;++i) {
+                pt.positions.push_back(targetJnt(i));
+                pt.velocities.push_back(0);
+              }
+              pt.time_from_start = rclcpp::Duration::from_seconds(debug_approach_time_);
+              traj.points.push_back(pt);
+              ys_traj_publisher_->publish(traj);
+              debug_approach_target_q_ = targetJnt;
+              debug_approach_started_ = true;
+              RCLCPP_INFO(this->get_logger(),"DEBUG: smooth approach to polish start (%.1fs)", debug_approach_time_);
+            } else if (KDL::Equal(ys_cur_q_, debug_approach_target_q_, joint_eps_)) {
+              debug_approach_started_ = false;
+              RCLCPP_INFO(this->get_logger(),"DEBUG: approach done, goto polishing");
+              sub_step_++;
+            }
             return;
           }
           bool touch = false;

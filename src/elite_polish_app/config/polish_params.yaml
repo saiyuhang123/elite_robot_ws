@@ -12,6 +12,8 @@ ysURForceAppControl:
     debug_skip_force_contact: true
     # 402 接触判定阈值(N, 负值)。压向工件时 force.z 小于它判定接触。软工件可调小(如 -6.0)
     contact_fz_threshold: -16.0
+    # 空跑模式接近轨迹起点的时长(s)，越大越慢
+    debug_approach_time: 4.0
 
     # ---- 力控 ----
     target_fz: -8.0          # 目标接触力(N, 负值=压向工件)
@@ -35,7 +37,7 @@ ysURForceAppControl:
     # ---- 示教姿态 ----
     home_q_deg: [8.2, -93.6, -110.2, 57.4, 91.7, 91.6]              # Home(角度制)
     camera_capture_q_rad: [0.1204, -0.9960, -2.4689, 0.4922, 1.6232, 1.6037]  # 拍照位(弧度制)
-    polish_base_q_rad: [0.2583, -1.7438, -1.5621, 0.7505, 1.5043, 1.5330]     # 打磨基准位(弧度制)
+    polish_base_q_rad: [0.4555, -1.3985, -1.6755, 0.5356, 1.3404, 1.4224]     # 打磨基准位(弧度制)
 
 # ---------------- 视觉节点 ----------------
 ysCamera3DSolver:
@@ -49,21 +51,21 @@ ysCamera3DSolver:
     handeye_translation: [-0.135488, 0.025233, 0.033736]   # m (t_cam2tool)
 
     # ---- 大盒 (cs66_base_link 系, 工件整体包围盒) ----
-    # 2026-07-27 差分法标定(竖直纸箱)。工件/治具变动后需重标。
-    target_box_min: [0.520, -0.209, 0.498]
-    target_box_max: [0.720,  0.178, 0.740]
+    # 2026-07-27 锚点法标定(竖直纸盒粘墙 32x20cm)。工件/治具变动后需重标。
+    target_box_min: [0.620, -0.250, 0.700]
+    target_box_max: [0.950,  0.120, 1.060]
 
     # ---- 三测点盒 (base_link 系, 拟合工件平面系) ----
     # 每盒 x/y 方向 ±5mm，z 方向贯通 [plane_box_z_range]。
     # 点序约定: X点必须在"离机器人更远"的位置, 使 法向=(X-O)×(Y-O) 指向工件内部！
-    plane_box_z_range: [0.45, 0.75]
-    plane_point_o: [0.590, -0.120]    # 原点测点 (x, y)
-    plane_point_x: [0.670, -0.010]    # X 轴测点(离机器人更远的那个!)
-    plane_point_y: [0.590,  0.100]    # Y 参考测点
+    plane_box_z_range: [0.78, 0.95]
+    plane_point_o: [0.705, -0.066]    # 原点测点 (x, y)
+    plane_point_x: [0.705,  0.054]    # X 轴测点(离机器人更远的那个!)
+    plane_point_y: [0.637, -0.072]    # Y 参考测点
 
     # ---- 圆弧盒 (工件平面系下, 圈打磨特征区域) ----
-    curve_box_min: [-0.08, -0.14, -0.02]
-    curve_box_max: [ 0.28,  0.24,  0.02]
+    curve_box_min: [-0.15, -0.10, -0.02]
+    curve_box_max: [ 0.15,  0.10,  0.02]
 
     # ---- 圆弧坐标系常数 ----
     curve_radius: 0.9306       # 与状态机 polishcurve_radius 一致
