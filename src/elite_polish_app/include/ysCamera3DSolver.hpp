@@ -66,6 +66,14 @@ namespace elite_robot {
             KDL::ChainFkSolverPos_recursive *ys_eye_fk_solver_;
             TRAC_IK::TRAC_IK *ys_eye_tracik_solver_;
 
+            //手眼标定 (tool0 -> 相机光学系)，从 ROS 参数 handeye_rpy/handeye_translation 加载
+            KDL::Frame ys_T_tool0_camera_;
+            //裁剪盒参数（从 ROS 参数加载，注入 YsPCLCalcTransform）
+            Eigen::Vector4f target_box_min_, target_box_max_, curve_box_min_, curve_box_max_;
+            double plane_box_zmin_, plane_box_zmax_;
+            double plane_ox_, plane_oy_, plane_xx_, plane_xy_, plane_yx_, plane_yy_;
+            double curve_radius_, curve_center_dz_, curve_tool_offset_, curve_y_offset_;
+
             //topic and service
             rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_; 
             rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr ys_jointstates_sub_;      

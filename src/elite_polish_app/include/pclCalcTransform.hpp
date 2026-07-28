@@ -57,50 +57,65 @@ class YsPCLCalcTransform
       return true;
     }
 
+    // ---- 可调参数（由 ysCamera3DSolver 从 ROS 参数注入；默认值 = 2026-07-27 标定值）----
+    // 大盒 (base_link 系)
+    Eigen::Vector4f target_box_min{0.520, -0.209, 0.498, 1.0};
+    Eigen::Vector4f target_box_max{0.720,  0.178, 0.740, 1.0};
+    // 三测点盒: x/y ±5mm, z 贯通
+    double plane_box_zmin = 0.45, plane_box_zmax = 0.75;
+    double plane_ox = 0.590, plane_oy = -0.120;  // 原点测点
+    double plane_xx = 0.670, plane_xy = -0.010;  // X 轴测点(离机器人更远!)
+    double plane_yx = 0.590, plane_yy =  0.100;  // Y 参考测点
+    // 圆弧盒 (平面系)
+    Eigen::Vector4f curve_box_min{-0.08, -0.14, -0.02, 1.0};
+    Eigen::Vector4f curve_box_max{ 0.28,  0.24,  0.02, 1.0};
+    // 圆弧坐标系常数
+    double curve_radius = 0.9306;
+    double curve_center_dz = 1.89539;
+    double curve_tool_offset = 0.18;   // 打磨头伸出法兰长度(m)
+    double curve_y_offset = 0.1;
+
     void getTargetCloud() {
       std::cout<<"base cloud size "<<baseCloud_->points.size()<<std::endl;
       targetCloud_->clear();
       ///---------------直通滤波
-      // 2026-07-27 标定 v2（差分法，模拟工件=竖直纸箱）: 工件范围 + 2cm 余量
       pcl::CropBox<pcl::PointXYZ> boxFilter;
-      boxFilter.setMin(Eigen::Vector4f(0.520, -0.209, 0.498, 1.0));
-      boxFilter.setMax(Eigen::Vector4f(0.720,  0.178, 0.740, 1.0));
+      boxFilter.setMin(target_box_min);
+      boxFilter.setMax(target_box_max);
       boxFilter.setInputCloud(baseCloud_);
       boxFilter.filter(*targetCloud_);
       std::cout<<"target cloud size "<<targetCloud_->points.size()<<std::endl;
     }
 
     void getPlaneFrame() {
-      // 2026-07-27 标定: 工件(竖直纸箱)工作面为竖直面，三测点在面上拉开大三角，
-      // 盒 x/y 方向 ±5mm、z 方向贯通(0.45~0.78)。
-      // 注意点序约定: X测点必须选在"离机器人更远"的位置(0.690,-0.010)，
-      // 使 法向=(X-O)×(Y-O) 指向盒内(远离机器人)——反了则下压方向指向机器人自身，IK 无解。
+      // 三测点在工件平面上拉开大三角，盒 x/y ±5mm、z 贯通。
+      // 点序约定: X测点必须在"离机器人更远"的位置，使 法向=(X-O)×(Y-O) 指向工件内部！
       //origin
       pcl::PointXYZ minO, maxO, midO;
-      minO.x = 0.590-0.005;
-      minO.y = -0.120-0.005;
-      minO.z = 0.45;
-      maxO.x = 0.590+0.005;
-      maxO.y = -0.120+0.005;
-      maxO.z = 0.75;
+      minO.x = plane_ox-0.005;
+      minO.y = plane_oy-0.005;
+      minO.z = plane_box_zmin;
+      maxO.x = plane_ox+0.005;
+      maxO.y = plane_oy+0.005;
+      maxO.z = plane_box_zmax;
       midO = getBoxCloudCenter(targetCloud_, minO, maxO);
       std::cout<<"plane origin x "<<midO.x<<" y "<<midO.y<<" z "<<midO.z<<std::endl;
       pcl::PointXYZ minX, maxX, midX;
-      minX.x = 0.670-0.005;
-      minX.y = -0.010-0.005;
-      minX.z = 0.45;
-      maxX.x = 0.670+0.005;
-      maxX.y = -0.010+0.005;
-      maxX.z = 0.75;
+      minX.x = plane_xx-0.005;
+      minX.y = plane_xy-0.005;
+      minX.z = plane_box_zmin;
+      maxX.x = plane_xx+0.005;
+      maxX.y = plane_xy+0.005;
+      maxX.z = plane_box_zmax;
       midX = getBoxCloudCenter(targetCloud_, minX, maxX);
       std::cout<<"plane x axis x "<<midX.x<<" y "<<midX.y<<" z "<<midX.z<<std::endl;
       pcl::PointXYZ minY, maxY, midY;
-      minY.x = 0.590-0.005;
-      minY.y = 0.100-0.005;
-      minY.z = 0.45;
-      maxY.x = 0.590+0.005;
-      maxY.y = 0.100+0.005;
-      maxY.z = 0.75;
+      minY.x = plane_yx-0.005;
+      minY.y = plane_yy-0.005;
+      minY.z = plane_box_zmin;
+      maxY.x = plane_yx+0.005;
+      maxY.y = plane_yy+0.005;
+      maxY.z = plane_box_zmax;
       midY = getBoxCloudCenter(targetCloud_, minY, maxY);
       std::cout<<"plane y axis x "<<midY.x<<" y "<<midY.y<<" z "<<midY.z<<std::endl;
 
@@ -195,10 +210,10 @@ class YsPCLCalcTransform
       pcl::PointCloud<pcl::PointXYZ>::Ptr tmpCloud = std::make_shared< pcl::PointCloud<pcl::PointXYZ> >();
       tmpCloud->clear();
       ///---------------直通滤波
-      // 2026-07-27 标定 v2(模拟工件=竖直纸箱): 平面系下圈工件竖直面（模拟占位，真工件需重标）
+      // 圆弧盒(平面系下圈打磨特征区域)
       pcl::CropBox<pcl::PointXYZ> boxFilter;
-      boxFilter.setMin(Eigen::Vector4f(-0.08, -0.14, -0.02, 1.0));
-      boxFilter.setMax(Eigen::Vector4f( 0.28,  0.24,  0.02, 1.0));
+      boxFilter.setMin(curve_box_min);
+      boxFilter.setMax(curve_box_max);
       boxFilter.setInputCloud(planeCloud_);
       boxFilter.filter(*tmpCloud);
       std::cout<<"curve box cloud size "<<tmpCloud->points.size()<<std::endl;
@@ -229,13 +244,11 @@ class YsPCLCalcTransform
 
       Eigen::Vector3f trans;
       trans(0) = mid.x;
-      trans(1) = max.y-0.1;
-      // 2026-07-27: -0.18 为 Elite 打磨头伸出补偿（方向推导）:
-      // 平面系 z 轴 = 法向 = 指向工件内部 = 打磨头伸出方向（法兰 z 指向工件）。
-      // ysrob 的 KDL 链末端在打磨头尖端，路径目标即"贴表面"；Elite 链末端是法兰 tool0，
-      // 要让尖端贴表面，法兰目标必须 = 表面 - 0.18×法向（悬在表面外侧 18cm），故为 -0.18。
-      // 符号写反(+0.18)会把法兰送进工件内部，切勿改错。
-      trans(2) = min.z + 0.9306 - 1.89539 - 0.18;
+      trans(1) = max.y - curve_y_offset;
+      // 打磨头伸出补偿: 平面系 z 轴 = 法向 = 指向工件内部 = 打磨头伸出方向（法兰 z 指向工件）。
+      // 要让尖端贴表面，法兰目标必须 = 表面 - curve_tool_offset×法向，故为减。
+      // 符号写反(+)会把法兰送进工件内部，切勿改错。
+      trans(2) = min.z + curve_radius - curve_center_dz - curve_tool_offset;
 
       curveFrame_.setIdentity();
       curveFrame_.block<3,1>(0, 3) = trans;

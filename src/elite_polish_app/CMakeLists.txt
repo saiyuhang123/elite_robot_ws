@@ -108,6 +108,11 @@ install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME})
 
+# Install config files (polish_params.yaml)
+install(DIRECTORY
+  config
+  DESTINATION share/${PROJECT_NAME})
+
 # Install template PCD files
 install(DIRECTORY
   share

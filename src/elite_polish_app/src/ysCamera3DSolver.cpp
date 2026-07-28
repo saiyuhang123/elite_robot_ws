@@ -27,6 +27,40 @@ namespace elite_robot {
         this->get_parameter<std::string>("template_file", template_pathname_);
         RCLCPP_INFO(rclcpp::get_logger("ysCamera3DSolver"), "template_file: '%s'.", template_pathname_.c_str());
 
+        // ---- 从参数文件加载手眼标定与裁剪盒（config/polish_params.yaml，默认值=2026-07-27标定）----
+        auto getv3 = [this](const std::string& name, std::vector<double> def) {
+          return this->declare_parameter<std::vector<double>>(name, def);
+        };
+        auto getd = [this](const std::string& name, double def) {
+          return this->declare_parameter<double>(name, def);
+        };
+        auto rpy = getv3("handeye_rpy", {-0.063913, 0.009927, -1.552858});
+        auto trans = getv3("handeye_translation", {-0.135488, 0.025233, 0.033736});
+        ys_T_tool0_camera_ = KDL::Frame(
+            KDL::Rotation::RPY(rpy[0], rpy[1], rpy[2]),
+            KDL::Vector(trans[0], trans[1], trans[2]));
+        RCLCPP_INFO(this->get_logger(), "handeye t: %f %f %f", trans[0], trans[1], trans[2]);
+
+        auto v4 = [](std::vector<double> v) {
+          return Eigen::Vector4f(v[0], v[1], v[2], 1.0);
+        };
+        target_box_min_ = v4(getv3("target_box_min", {0.520, -0.209, 0.498}));
+        target_box_max_ = v4(getv3("target_box_max", {0.720,  0.178, 0.740}));
+        auto zrange = getv3("plane_box_z_range", {0.45, 0.75});
+        plane_box_zmin_ = zrange[0];  plane_box_zmax_ = zrange[1];
+        auto po = getv3("plane_point_o", {0.590, -0.120});
+        plane_ox_ = po[0];  plane_oy_ = po[1];
+        auto px = getv3("plane_point_x", {0.670, -0.010});
+        plane_xx_ = px[0];  plane_xy_ = px[1];
+        auto py = getv3("plane_point_y", {0.590,  0.100});
+        plane_yx_ = py[0];  plane_yy_ = py[1];
+        curve_box_min_ = v4(getv3("curve_box_min", {-0.08, -0.14, -0.02}));
+        curve_box_max_ = v4(getv3("curve_box_max", { 0.28,  0.24,  0.02}));
+        curve_radius_ = getd("curve_radius", 0.9306);
+        curve_center_dz_ = getd("curve_center_dz", 1.89539);
+        curve_tool_offset_ = getd("curve_tool_offset", 0.18);
+        curve_y_offset_ = getd("curve_y_offset", 0.1);
+
         //init app
           app_cmd_ = -1;
           //init  robot
@@ -191,12 +225,7 @@ namespace elite_robot {
           if (ys_first_q_==false&&ys_eye_fk_solver_!=nullptr)
           {
             ys_eye_fk_solver_->JntToCart(ys_cur_q_, ys_curP_eye_);
-            // 眼在手上: tool0 -> 相机光学系的固定变换（手眼标定 biaoding/hand_eye_result.json，
-            // cv2.calibrateHandEye 输出的 R_cam2tool / t_cam2tool；RPY 由 R_cam2tool 换算）。
-            // KDL 链只到 tool0，相机位姿 = tool0位姿 * 该固定变换。
-            static const KDL::Frame ys_T_tool0_camera_(
-                KDL::Rotation::RPY(-0.063913, 0.009927, -1.552858),
-                KDL::Vector(-0.135488, 0.025233, 0.033736));
+            // 眼在手上: 相机位姿 = FK(tool0) × 手眼固定变换（参数 handeye_rpy/handeye_translation）
             ys_curP_eye_ = ys_curP_eye_ * ys_T_tool0_camera_;
             Eigen::Affine3d transform;
             tf2::transformKDLToEigen(ys_curP_eye_, transform);
@@ -220,6 +249,20 @@ namespace elite_robot {
   
         RCLCPP_INFO(this->get_logger(), "camera capture cloud size %d\n", base_cloud_->size());
         YsPCLCalcTransform calcFrame;
+        // 注入参数化的裁剪盒/常数（config/polish_params.yaml）
+        calcFrame.target_box_min = target_box_min_;
+        calcFrame.target_box_max = target_box_max_;
+        calcFrame.plane_box_zmin = plane_box_zmin_;
+        calcFrame.plane_box_zmax = plane_box_zmax_;
+        calcFrame.plane_ox = plane_ox_;  calcFrame.plane_oy = plane_oy_;
+        calcFrame.plane_xx = plane_xx_;  calcFrame.plane_xy = plane_xy_;
+        calcFrame.plane_yx = plane_yx_;  calcFrame.plane_yy = plane_yy_;
+        calcFrame.curve_box_min = curve_box_min_;
+        calcFrame.curve_box_max = curve_box_max_;
+        calcFrame.curve_radius = curve_radius_;
+        calcFrame.curve_center_dz = curve_center_dz_;
+        calcFrame.curve_tool_offset = curve_tool_offset_;
+        calcFrame.curve_y_offset = curve_y_offset_;
         Eigen::Matrix4f result;
         if (!calcFrame.calc(base_cloud_, result)) {
           RCLCPP_ERROR(this->get_logger(),

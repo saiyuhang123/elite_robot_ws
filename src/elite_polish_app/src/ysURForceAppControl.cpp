@@ -21,13 +21,13 @@ namespace elite_robot {
           app_cmd_ = -1;
           sub_step_ = -1;
           joint_size_ = 6;
-          speed_level_ = 2;
+          speed_level_ = this->declare_parameter<int>("speed_level", 2);
           initDataQ();
 
           RCLCPP_INFO(this->get_logger(),"init force data");
-          //init force control
-          target_fz_ = -8;//N
-          adjust_dz_ = 0.0003;//m
+          //init force control（参数见 config/polish_params.yaml）
+          target_fz_ = this->declare_parameter<double>("target_fz", -8.0);//N
+          adjust_dz_ = this->declare_parameter<double>("adjust_dz", 0.0003);//m
           control_dt_count_ = 10;//todo, n*4ms for timer
           // 调试/工艺参数（ROS 参数，可在 launch 中覆盖）:
           // debug_skip_force_contact=true 时空跑: 402 免接触直接过、404 力控旁路
@@ -42,18 +42,22 @@ namespace elite_robot {
           frame_polishcloud_transform_.M = KDL::Rotation::RPY(0, 0, 0);
           frame_forceadjust_base_.p = KDL::Vector(0,0,0);
           frame_forceadjust_base_.M = KDL::Rotation::RPY(0, 0, 0);
-          polishcurve_radius_ = 0.9306;
-          polishcurve_center_dz_ = 1.89539;
-          polishcurve_start_ry_ = -9.2*M_PI/180;
-          polishcurve_end_ry_ = 9.2*M_PI/180;
-          polishproduct_width_ = 0.2;
+          polishcurve_radius_ = this->declare_parameter<double>("polishcurve_radius", 0.9306);
+          polishcurve_center_dz_ = this->declare_parameter<double>("polishcurve_center_dz", 1.89539);
+          polishcurve_start_ry_ = this->declare_parameter<double>("polishcurve_start_ry_deg", -9.2)*M_PI/180;
+          polishcurve_end_ry_ = this->declare_parameter<double>("polishcurve_end_ry_deg", 9.2)*M_PI/180;
+          polishproduct_width_ = this->declare_parameter<double>("polishproduct_width", 0.2);
           polishcurve_step_count_ = 500*speed_level_;
           polishcurve_step_index_ = 0;
-          polishcurve_ycount_ = 1;
+          polishcurve_ycount_ = this->declare_parameter<int>("polishcurve_ycount", 1);
           polishcurve_yindex_ = 0;
           sidepolish_step_count_ = 100*speed_level_;
           sidepolish_step_index_ = 0;
-          dz_polish_startup_tool_ = -0.08;//offset tool z for polish startup
+          dz_polish_startup_tool_ = this->declare_parameter<double>("dz_polish_startup_tool", -0.08);//offset tool z for polish startup
+          //退刀参数: 世界系"上"方向(45°倾斜实测) + 抬刀高度
+          auto wup = this->declare_parameter<std::vector<double>>("world_up_in_base", {-0.7431, 0.0120, 0.6691});
+          world_up_in_base_ = KDL::Vector(wup[0], wup[1], wup[2]);
+          retract_lift_height_ = this->declare_parameter<double>("retract_lift_height", 0.15);
           calcCurvePolishPath();
 
           RCLCPP_INFO(this->get_logger(),"init robot data");
@@ -214,18 +218,26 @@ namespace elite_robot {
       }
 
       bool ysURForceAppControl::initDataQ(){
+          // 示教姿态从参数加载（config/polish_params.yaml）。
+          // 注意单位: home 为角度制，cameraCapture/polishBase 为弧度制（与示教来源一致）。
+          auto home_deg = this->declare_parameter<std::vector<double>>(
+              "home_q_deg", {8.2, -93.6, -110.2, 57.4, 91.7, 91.6});
           ys_home_q_.resize(joint_size_);
-          // 已示教（角度制，示教器读数）
-          ys_home_q_.data << 8.2, -93.6, -110.2, 57.4, 91.7, 91.6;  
           for (int i=0;i<joint_size_;i++){
-            ys_home_q_(i) = ys_home_q_(i)*M_PI/180;
+            ys_home_q_(i) = home_deg[i]*M_PI/180;
           }
+          auto cap_rad = this->declare_parameter<std::vector<double>>(
+              "camera_capture_q_rad", {0.1204, -0.9960, -2.4689, 0.4922, 1.6232, 1.6037});
           ys_cameraCapture_q_.resize(joint_size_);
-          // 已示教（弧度制，直接赋值，不要再做角度→弧度转换！）2026-07-27 更新
-          ys_cameraCapture_q_.data << 0.1204, -0.9960, -2.4689, 0.4922, 1.6232, 1.6037;
+          for (int i=0;i<joint_size_;i++){
+            ys_cameraCapture_q_(i) = cap_rad[i];
+          }
+          auto pb_rad = this->declare_parameter<std::vector<double>>(
+              "polish_base_q_rad", {0.2583, -1.7438, -1.5621, 0.7505, 1.5043, 1.5330});
           ys_polishBase_q_.resize(joint_size_);
-          // 已示教（弧度制，直接赋值，不要再做角度→弧度转换！）
-          ys_polishBase_q_.data << 0.2583, -1.7438, -1.5621, 0.7505, 1.5043, 1.5330;
+          for (int i=0;i<joint_size_;i++){
+            ys_polishBase_q_(i) = pb_rad[i];
+          }
           return true;
       }
 
@@ -991,15 +1003,12 @@ namespace elite_robot {
           KDL::Frame moveFrame;
           int trajCount=120*speed_level_;
           rclcpp::Duration deltaT(0, 1E9/50);
-          // 45° 倾斜安装: 退刀按"世界系竖直向上"抬刀（实测向量，与 biaoding/world_offset_calc.py
-          // 的 V_UP_IN_BASE 一致），同时 base y 方向侧移 0.1m（base y 仍接近世界水平）。
-          const KDL::Vector world_up_in_base(-0.7431, 0.0120, 0.6691);
-          const double lift_height = 0.15;  // 世界系竖直抬刀高度(米)，按现场调整
+          // 退刀: base y 侧移 + 世界系竖直抬刀（world_up_in_base_ / retract_lift_height_ 为 ROS 参数）
           for (size_t i = 0; i < trajCount; i++)
           {
             //ys_ik
             lastQ = ys_resultJnt;
-            moveFrame.p = KDL::Vector(0,0.1*(i+1)/trajCount,0) + world_up_in_base*(lift_height*(i+1)/trajCount);//base y侧移 + 世界系竖直抬刀
+            moveFrame.p = KDL::Vector(0,0.1*(i+1)/trajCount,0) + world_up_in_base_*(retract_lift_height_*(i+1)/trajCount);//base y侧移 + 世界系竖直抬刀
             moveFrame.M = KDL::Rotation::RPY(0,0,0);
             upFrame = moveFrame * curFrame;
             int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, upFrame, ys_resultJnt);
