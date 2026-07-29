@@ -65,7 +65,7 @@ class GripperBase(ABC):
     @property
     def tool_length(self) -> float:
         """法兰面到 TCP（掌心/指尖中点）沿工具轴的距离（米）。"""
-        return 0.13
+        return 0.11
 
     @property
     def tcp_transform(self) -> np.ndarray:
