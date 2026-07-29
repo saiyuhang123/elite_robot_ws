@@ -90,6 +90,8 @@ MOVEJ_A, MOVEJ_V = 1.0, 0.2
 MOVEL_A, MOVEL_V = 0.3, 0.05
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+# 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
+HOME2_JOINTS = [-0.0384, 0.3438, -2.7018, -1.5062, 1.6424, 1.4696]
 # 抓取预备位姿（角度: -2.2, -38.3, -124.8, -16.3, 102.1, 94.2）
 READY_JOINTS = [-0.0384, -0.6685, -2.1782, -0.2845, 1.7820, 1.6441]
 SHOULDER_Z = 0.1625
@@ -141,6 +143,8 @@ class YoloGrasp:
         self.robot.create_service(Trigger, '/yolo_grasp/close', self._srv_close,
                                   callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/home', self._srv_home,
+                                  callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/home2', self._srv_home2,
                                   callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/ready', self._srv_ready,
                                   callback_group=self.cb_group)
@@ -203,6 +207,13 @@ class YoloGrasp:
         self.home()
         response.success = True
         response.message = '已回零位'
+        return response
+
+    def _srv_home2(self, request, response):
+        self.robot.get_logger().info('[服务] 收到回 Home2 指令')
+        self.home2()
+        response.success = True
+        response.message = '已到 Home2 位姿'
         return response
 
     def _srv_ready(self, request, response):
@@ -468,6 +479,12 @@ class YoloGrasp:
         if self.wait_motion_done():
             print("已回零")
 
+    def home2(self):
+        print("回 Home2 位姿...")
+        self.send_movej(HOME2_JOINTS)
+        if self.wait_motion_done():
+            print("已到 Home2 位姿")
+
     def go_ready(self):
         print("移动到抓取预备位姿...")
         self.send_movej(READY_JOINTS)
@@ -542,9 +559,9 @@ def main():
     print(f"YOLO 抓取主程序（夹爪: {g.gripper.name}）")
     print(f"  IK: {g.gripper.ik_mode}  偏移: {g.gripper.grasp_offset_world}")
     print(f"  工具长度: {g.gripper.tool_length:.3f}m")
-    print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  h=回零  r=预备位姿")
+    print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  h=回零  2=Home2  r=预备位姿")
     print("        j=示教放置位姿  l=放置  t=切换目标类别  q=退出")
-    print("  ROS服务: /yolo_grasp/grasp /open /close /home /ready /place /status")
+    print("  ROS服务: /yolo_grasp/grasp /open /close /home /home2 /ready /place /status")
     print("=" * 60)
 
     try:
@@ -582,6 +599,8 @@ def main():
                                   f"（{time.time()-g.latest_target_time:.1f}s 前）")
                     elif cmd == 'h':
                         g.home()
+                    elif cmd == '2':
+                        g.home2()
                     elif cmd == 'r':
                         g.go_ready()
                     elif cmd == 'j':
@@ -597,7 +616,7 @@ def main():
                         pass
                     else:
                         print("  未知命令。g=抓取 o=张开 c=闭合 p=打印 "
-                              "h=回零 r=预备 j=示教放置 l=放置 "
+                              "h=回零 2=Home2 r=预备 j=示教放置 l=放置 "
                               "t=切换目标 q=退出")
             except KeyboardInterrupt:
                 pass
