@@ -4,11 +4,13 @@
 流程（按 G 触发）：
   1. 取 YOLO 感知节点发布的目标点（/target_object_pose，基座系）
   2. 抓取点 = 目标点 + 世界系偏移（由夹爪类型决定语义）
-  3. movej 到预抓取点 = 目标点正上方 10cm（世界系）
-  4. movel 竖直下降到抓取点
-  5. 闭合夹爪
-  6. movel 上升退回预抓取点
-  7. movej 回零位（h 键）
+  3. 抓取姿态固定：法兰面（法兰 Z 轴）朝世界 X+，灵巧手沿法兰 Z
+     水平伸出，手心朝世界正下方
+  4. movej 到预抓取点 = 目标点正上方 10cm（世界系）
+  5. movel 竖直下降到抓取点
+  6. 闭合夹爪
+  7. movel 上升退回预抓取点
+  8. movej 回零位（h 键）
 
 前提：
   - 机械臂驱动已启动（start_robot.launch.py）
@@ -26,6 +28,8 @@
   调 /yolo_grasp/grasp（Trigger）触发抓取，response.success/message
   为真实结果（失败原因如 无稳定目标/IK 解算失败/movel 下降超时）。
   抓取前会检查目标新鲜度（<1s）与稳定性（0.6s 内漂移 <5mm）。
+  调 /yolo_grasp/place（Trigger）执行放置：movej 到示教放置位姿
+  （按 j 示教，存 place_pose.json）→ 张手放下 → 退回预备位姿。
 """
 
 import argparse
@@ -78,9 +82,9 @@ WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 PRE_GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.10])
 
 # 目标新鲜度/稳定性门限（调度集成：防止抓旧目标或移动中的目标）
-TARGET_MAX_AGE = 1.0        # 目标点最大龄期（秒），超龄视为无目标
-TARGET_STABLE_WINDOW = 0.6  # 稳定采样窗口（秒）
-TARGET_STABLE_TOL = 0.005   # 窗口内允许的最大漂移（米）
+TARGET_MAX_AGE = 5.0        # 目标点最大龄期（秒），超龄视为无目标
+TARGET_STABLE_WINDOW = 1.2  # 稳定采样窗口（秒）
+TARGET_STABLE_TOL = 0.05   # 窗口内允许的最大漂移（米）
 
 MOVEJ_A, MOVEJ_V = 1.0, 0.2
 MOVEL_A, MOVEL_V = 0.3, 0.05
@@ -91,8 +95,8 @@ READY_JOINTS = [-0.0384, -0.6685, -2.1782, -0.2845, 1.7820, 1.6441]
 SHOULDER_Z = 0.1625
 ARM_REACH = 0.92
 
-# 示教文件基名（不同夹爪存不同文件）
-GRASP_ROT_FILE = os.path.join(os.path.dirname(__file__), 'grasp_orientation.json')
+# 放置位姿示教文件（关节角，按 j 示教，place 服务/ l 键使用）
+PLACE_POSE_FILE = os.path.join(os.path.dirname(__file__), 'place_pose.json')
 
 
 def quat_to_rotvec(x, y, z, w):
@@ -108,12 +112,6 @@ def quat_to_rotvec(x, y, z, w):
     return x / s * angle, y / s * angle, z / s * angle
 
 
-def _gripper_rot_file(name: str) -> str:
-    """按夹爪名称返回示教文件路径。"""
-    return os.path.join(os.path.dirname(__file__),
-                        f'grasp_orientation_{name}.json')
-
-
 class YoloGrasp:
     def __init__(self, gripper_name: str = "linkerhand"):
         self.robot = RobotCartesianControl()
@@ -121,7 +119,6 @@ class YoloGrasp:
 
         # ---- 夹爪（按名称创建）----
         self.gripper = create_gripper(gripper_name, self.robot)
-        rot_file = _gripper_rot_file(gripper_name)
 
         # ---- 控制器通信 ----
         self.script_pub = self.robot.create_publisher(String, SCRIPT_TOPIC, 10)
@@ -131,6 +128,8 @@ class YoloGrasp:
             String, '/yolo/target_class', 10)
         self.latest_target = None
         self.latest_target_time = 0.0
+        self._locked_target = None
+        self._target_locked = False
         self.robot.create_subscription(
             PoseStamped, TARGET_TOPIC, self._target_cb, 10)
 
@@ -145,47 +144,46 @@ class YoloGrasp:
                                   callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/ready', self._srv_ready,
                                   callback_group=self.cb_group)
+        self.robot.create_service(Trigger, '/yolo_grasp/place', self._srv_place,
+                                  callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/status', self._srv_status,
                                   callback_group=self.cb_group)
 
-        # ---- 抓取姿态：示教文件优先，直装爪缺文件时自动构造兜底 ----
-        self.grasp_rot = None
-
-        if os.path.exists(rot_file):
+        # ---- 放置位姿（关节角，按 j 示教）----
+        self.place_joints = None
+        if os.path.exists(PLACE_POSE_FILE):
             try:
                 import json as _json
-                with open(rot_file) as f:
-                    self.grasp_rot = np.array(_json.load(f), dtype=float)
-                print(f"已从 {rot_file} 加载抓取姿态")
+                with open(PLACE_POSE_FILE) as f:
+                    self.place_joints = list(_json.load(f))
+                print(f"已从 {PLACE_POSE_FILE} 加载放置位姿")
             except Exception as e:
-                print(f"读取 {rot_file} 失败: {e}（按 k 重新示教）")
+                print(f"读取 {PLACE_POSE_FILE} 失败: {e}（按 j 重新示教）")
 
-        if self.grasp_rot is None and not self.gripper.needs_orientation_calibration:
-            # 直装型夹爪：自动构造（Z=世界下方），不依赖文件/启动姿态
-            r = self.gripper.default_grasp_rotation(V_UP_IN_BASE)
-            if r is not None:
-                self.grasp_rot = r
-                import json as _json
-                with open(rot_file, 'w') as f:
-                    _json.dump([[float(v) for v in row] for row in r], f)
-                print(f"[自动] 抓取姿态已构造: Z={np.round(r[:, 2], 3)} → {rot_file}")
+    # ---------------- 抓取姿态（固定姿态，无需示教） ----------------
+    def _compute_grasp_rotation(self):
+        """构造固定抓取姿态旋转矩阵（基座系，列为法兰 X/Y/Z 轴）：
+        法兰 Z 轴（法兰面法线）= 世界 X+，灵巧手沿法兰 Z 水平伸出；
+        法兰 Y 轴 = 世界正下方，使该姿态下手心朝下。"""
+        z = WORLD_X_IN_BASE / np.linalg.norm(WORLD_X_IN_BASE)  # 法兰面朝世界 X+
+        y = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)       # 法兰 Y = 世界下方 → 手心朝下
+        x = np.cross(y, z)
+        return np.column_stack([x, y, z])
 
-    # ---------------- 抓取姿态示教 ----------------
-    def calibrate_grasp_orientation(self):
-        """把机械臂摆到目标抓取姿态后调用，记录当前 FK 旋转矩阵。"""
+    # ---------------- 放置位姿示教 ----------------
+    def teach_place_pose(self):
+        """把机械臂（手动/GUI）摆到放置位姿后调用，记录当前关节角。"""
         self.spin(10)
         q = self.robot.get_joint_positions()
         if q is None:
             print("  无法获取关节角，示教失败")
             return
-        _, r_flange = cs66_forward_kinematics(q)
-        self.grasp_rot = r_flange
-        rot_file = _gripper_rot_file(self.gripper.name)
+        self.place_joints = [float(v) for v in q]
         import json as _json
-        with open(rot_file, 'w') as f:
-            _json.dump([[float(v) for v in row] for row in r_flange], f)
-        print(f"  抓取姿态已记录到 {rot_file}")
-        print(f"  法兰Z方向(基座系) = {np.round(r_flange[:, 2], 3)}")
+        with open(PLACE_POSE_FILE, 'w') as f:
+            _json.dump(self.place_joints, f)
+        print(f"  放置位姿已记录到 {PLACE_POSE_FILE}")
+        print(f"  关节角 = {np.round(self.place_joints, 4)}")
 
 
     # ---------------- ROS 服务回调 ----------------
@@ -222,6 +220,13 @@ class YoloGrasp:
         self.go_ready()
         response.success = True
         response.message = '已到抓取预备位姿'
+        return response
+
+    def _srv_place(self, request, response):
+        self.robot.get_logger().info('[服务] 收到放置指令')
+        ok, msg = self.place()
+        response.success = ok
+        response.message = msg
         return response
 
     def _srv_status(self, request, response):
@@ -296,36 +301,60 @@ class YoloGrasp:
     # ---------------- 抓取流程 ----------------
     def get_stable_target(self, window=TARGET_STABLE_WINDOW,
                           tol=TARGET_STABLE_TOL):
-        """在 window 内持续采样目标点：要求感知持续更新且位置漂移 < tol。
-        返回稳定目标均值（基座系），任一条件不满足返回 None。"""
+        """眼在手上：拍照位姿下快速确认目标新鲜即可，不要求运动过程中持续跟踪。
+        短暂采样若干帧取均值（过滤单帧噪声），返回稳定目标均值（基座系）。"""
         samples = []
-        first_stamp = self.latest_target_time
         start = time.time()
         while time.time() - start < window:
             t = self.latest_target
-            if (t is None
-                    or time.time() - self.latest_target_time > TARGET_MAX_AGE):
-                return None
-            samples.append(t.copy())
+            age = time.time() - self.latest_target_time
+            if t is not None and age < TARGET_MAX_AGE:
+                samples.append(t.copy())
             time.sleep(0.05)
-        if not samples or self.latest_target_time == first_stamp:
-            return None  # 窗口内没有新帧（感知停发）
+        if len(samples) < 2:
+            print(f"   [诊断] 稳定采样: 窗口{window}s内仅{len(samples)}个有效样本")
+            return None
         arr = np.array(samples)
         spread = float(np.max(np.linalg.norm(arr - arr.mean(axis=0), axis=1)))
+        mean = arr.mean(axis=0)
+        print(f"   [诊断] 稳定采样: OK, 漂移 {spread*1000:.1f}mm, "
+              f"样本{len(samples)}个, 均值[{mean[0]:.3f},{mean[1]:.3f},{mean[2]:.3f}]")
         if spread > tol:
+            print(f"   [诊断] 注意: 漂移偏大 ({spread*1000:.1f}mm > {tol*1000:.0f}mm)，"
+                  f"但仍使用均值（眼在手上模式）")
+        # 锁存目标，后续运动不再依赖感知
+        self._locked_target = mean.copy()
+        self._target_locked = True
+        return mean
+
+    def _check_fresh_target(self):
+        """快速检查：是否有新鲜目标（不采样，不回 None 时直接返回最新值）。"""
+        if self.latest_target is None:
             return None
-        return arr.mean(axis=0)
+        if time.time() - self.latest_target_time > TARGET_MAX_AGE:
+            return None
+        return self.latest_target.copy()
 
     def grasp(self):
         """执行一次抓取流程。返回 (成功与否, 结果描述)。"""
         gripper = self.gripper
         print(f"\n======= 开始抓取流程 [{gripper.name}] =======")
 
-        # 0. 目标检查：新鲜 + 稳定（调度场景：防旧目标/移动目标）
+        # 0. 拍照位姿下锁存目标位置（眼在手上：后续运动不依赖感知持续跟踪）
+        self._target_locked = False
+        self._locked_target = None
+
+        # 先快速检查是否有新鲜目标
+        obj = self._check_fresh_target()
+        if obj is None:
+            print("没有目标（感知未检测到或目标超龄）")
+            return False, "无目标"
+
+        # 短暂采样取均值，过滤单帧噪声（不要求全程稳定）
         obj = self.get_stable_target()
         if obj is None:
-            print("没有稳定目标（感知未检测到、目标超龄或在移动）")
-            return False, "无稳定目标"
+            print("目标采样不足（感知帧率过低或窗口内目标丢失次数过多）")
+            return False, "目标采样不足"
         print(f"1. 目标点(基座系): [{obj[0]:.4f}, {obj[1]:.4f}, {obj[2]:.4f}]")
 
         # 1. 抓取点 = 目标点 + 夹爪定义的偏移
@@ -343,13 +372,12 @@ class YoloGrasp:
                       PRE_GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
         pre_tip = obj + pre_offset
 
-        # 工具方向 = 法兰 Z 轴，长度 = 夹爪的 tool_length
-        if self.grasp_rot is None:
-            print("   !! 抓取姿态未示教，请先按 k 示教")
-            return False, "抓取姿态未示教"
-        tool_dir = self.grasp_rot[:, 2]
+        # 固定抓取姿态：法兰面朝世界 X+，手沿法兰 Z 水平伸出，手心朝下
+        grasp_rot = self._compute_grasp_rotation()
+        tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 世界 X+（手伸出方向）
         L = gripper.tool_length
-        print(f"   [诊断] 工具方向(法兰Z轴): {np.round(tool_dir, 3)}  "
+        print(f"   [诊断] 法兰面朝向(法兰Z轴): {np.round(tool_dir, 3)}  "
+              f"手心朝向(法兰Y轴): {np.round(grasp_rot[:, 1], 3)}  "
               f"长度: {L:.3f}m")
 
         pre_flange = pre_tip - L * tool_dir
@@ -373,7 +401,7 @@ class YoloGrasp:
         if gripper.ik_mode == "5dof":
             joint_target = ik_func(pre_flange, tool_dir, q_guess)
         else:
-            joint_target = ik_func(pre_flange, self.grasp_rot, q_guess)
+            joint_target = ik_func(pre_flange, grasp_rot, q_guess)
 
         if joint_target is None:
             print("   !! IK 解算失败，放弃")
@@ -382,7 +410,7 @@ class YoloGrasp:
         pos_err = float(np.linalg.norm(fk_pos - pre_flange))
         if gripper.ik_mode == "6dof":
             rot_err = math.degrees(float(
-                Rot.from_matrix(fk_rot.T @ self.grasp_rot).magnitude()))
+                Rot.from_matrix(fk_rot.T @ grasp_rot).magnitude()))
         else:
             rot_err = math.degrees(math.acos(float(
                 np.clip(fk_rot[:, 2] @ tool_dir, -1.0, 1.0))))
@@ -455,6 +483,34 @@ class YoloGrasp:
         if self.wait_motion_done():
             print("已到预备位姿")
 
+    def place(self):
+        """移动到示教放置位姿 → 张手放下 → 退回预备位姿。返回 (成功与否, 描述)。"""
+        print(f"\n======= 开始放置流程 [{self.gripper.name}] =======")
+        if self.place_joints is None:
+            print("   !! 放置位姿未示教，请先按 j 示教")
+            return False, "放置位姿未示教"
+
+        # 1. movej 到放置位姿
+        print("1. movej 到放置位姿...")
+        self.send_movej(self.place_joints)
+        if not self.wait_motion_done():
+            print("   !! 运动超时，放弃")
+            return False, "movej 到放置位姿超时"
+
+        # 2. 张手放下
+        print(f"2. 张开 [{self.gripper.name}] 放下物体...")
+        self.gripper.open()
+        time.sleep(self.gripper.close_delay)
+
+        # 3. 退回预备位姿（让开工作区，方便底盘继续导航）
+        print("3. 退回预备位姿...")
+        self.send_movej(READY_JOINTS)
+        if not self.wait_motion_done():
+            return False, "退回预备位姿超时（物体已放下）"
+
+        print(f"======= 放置完成 [{self.gripper.name}] =======\n")
+        return True, "放置完成"
+
     def resend_external_script(self):
         cli = self.robot.create_client(
             Trigger, "/io_and_status_controller/resend_external_script")
@@ -496,8 +552,8 @@ def main():
     print(f"  IK: {g.gripper.ik_mode}  偏移: {g.gripper.grasp_offset_world}")
     print(f"  工具长度: {g.gripper.tool_length:.3f}m")
     print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  h=回零  r=预备位姿")
-    print("        k=示教姿态  t=切换目标类别  q=退出")
-    print("  ROS服务: /yolo_grasp/grasp /open /close /home /ready /status")
+    print("        j=示教放置位姿  l=放置  t=切换目标类别  q=退出")
+    print("  ROS服务: /yolo_grasp/grasp /open /close /home /ready /place /status")
     print("=" * 60)
 
     try:
@@ -537,8 +593,11 @@ def main():
                         g.home()
                     elif cmd == 'r':
                         g.go_ready()
-                    elif cmd == 'k':
-                        g.calibrate_grasp_orientation()
+                    elif cmd == 'j':
+                        g.teach_place_pose()
+                    elif cmd == 'l':
+                        ok, msg = g.place()
+                        print(f"  结果: {'成功' if ok else '失败'} - {msg}")
                     elif cmd.startswith('t'):
                         parts = cmd.split(maxsplit=1)
                         cls = parts[1] if len(parts) > 1 else 'apple'
@@ -547,7 +606,8 @@ def main():
                         pass
                     else:
                         print("  未知命令。g=抓取 o=张开 c=闭合 p=打印 "
-                              "h=回零 r=预备 k=示教 t=切换目标 q=退出")
+                              "h=回零 r=预备 j=示教放置 l=放置 "
+                              "t=切换目标 q=退出")
             except KeyboardInterrupt:
                 pass
     finally:

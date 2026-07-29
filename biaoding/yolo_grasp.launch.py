@@ -140,6 +140,7 @@ def generate_launch_description():
         ),
         launch_arguments={
             "camera_namespace": "camera",
+            "serial_no": '"944122073226"',
             "enable_color": "true",
             "enable_depth": "true",
             "rgb_camera.color_profile": "1280x720x30",

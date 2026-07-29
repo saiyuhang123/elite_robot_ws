@@ -50,9 +50,10 @@ class LinkerHandGripper(GripperBase):
 
     @property
     def grasp_offset_world(self) -> np.ndarray:
-        # 掌心 Z 偏移：0 = 物体表面，负值 = 低于表面（包握深度）
-        # 根据物体大小调整：橘子 ~-0.02，苹果 ~-0.04，硬物 0
-        return np.array([0.0, 0.0, 0.03])  # 0.03m = 3cm，手心在物体上方 3cm
+        # 掌心 Z 偏移（相对 YOLO 检测到的物体上表面）。
+        # 手水平伸出、手心朝下姿态下，握拳后指尖会低于手心平面，
+        # 偏移太小会压住物体。苹果可先试 0.06，压物就调大、抓空就调小。
+        return np.array([0.0, 0.0, 0.04])  # 手心在物体上表面上方 6cm
 
     @property
     def tool_length(self) -> float:
