@@ -211,9 +211,9 @@ class YoloGrasp:
 
     def _srv_home2(self, request, response):
         self.robot.get_logger().info('[服务] 收到回 Home2 指令')
-        self.home2()
+        threading.Thread(target=self.home2, daemon=True).start()
         response.success = True
-        response.message = '已到 Home2 位姿'
+        response.message = 'Home2 运动已触发'
         return response
 
     def _srv_ready(self, request, response):
@@ -254,8 +254,10 @@ class YoloGrasp:
         self.latest_target_time = time.time()
 
     def spin(self, n=10, dt=0.05):
-        for _ in range(n):
-            rclpy.spin_once(self.robot, timeout_sec=dt)
+        # 后台 MultiThreadedExecutor 已在全程处理订阅/服务回调，
+        # 这里不能再 rclpy.spin_once 同一节点（一个节点挂两个执行器会
+        # 互踩 wait set，导致服务回调卡死），只需等待数据更新。
+        time.sleep(n * dt)
 
     # ---------------- 运动原语 ----------------
     def send_movej(self, joints_rad, a=MOVEJ_A, v=MOVEJ_V):
