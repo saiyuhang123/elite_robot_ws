@@ -36,6 +36,16 @@ class LinkerHandGripper(GripperBase):
     def default_grasp_rotation(self, v_up_in_base):
         return None  # 灵巧手必须手动示教，不能自动构造
 
+    def grasp_rotation(self, world_x_in_base, v_up_in_base):
+        """灵巧手固定抓取姿态：法兰面（法兰 Z）朝世界 X+，
+        手沿法兰 Z 水平伸出；法兰 Y = 世界正下方 → 手心朝下。"""
+        z = np.asarray(world_x_in_base, dtype=float)
+        z /= np.linalg.norm(z)
+        y = -np.asarray(v_up_in_base, dtype=float)
+        y /= np.linalg.norm(y)
+        x = np.cross(y, z)
+        return np.column_stack([x, y, z])
+
     @property
     def needs_orientation_calibration(self) -> bool:
         return True  # 手心朝向有要求，必须示教

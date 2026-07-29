@@ -55,6 +55,13 @@ class GripperBase(ABC):
         y = np.cross(z, x)
         return np.column_stack([x, y, z])
 
+    def grasp_rotation(self, world_x_in_base: "np.ndarray",
+                       v_up_in_base: "np.ndarray") -> "np.ndarray":
+        """抓取姿态旋转矩阵（基座系，列为法兰 X/Y/Z 轴）。
+        默认（直装夹爪）：法兰 Z = 世界下方，竖直向下抓。
+        安装方式特殊的夹爪（如灵巧手）应覆盖此方法。"""
+        return self.default_grasp_rotation(v_up_in_base)
+
     @property
     def needs_orientation_calibration(self) -> bool:
         """是否需要 k 键示教抓取姿态。

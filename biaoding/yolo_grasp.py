@@ -4,8 +4,8 @@
 流程（按 G 触发）：
   1. 取 YOLO 感知节点发布的目标点（/target_object_pose，基座系）
   2. 抓取点 = 目标点 + 世界系偏移（由夹爪类型决定语义）
-  3. 抓取姿态固定：法兰面（法兰 Z 轴）朝世界 X+，灵巧手沿法兰 Z
-     水平伸出，手心朝世界正下方
+  3. 抓取姿态由夹爪定义（gripper.grasp_rotation）：直装夹爪法兰 Z
+     朝下竖直抓；灵巧手法兰面朝世界 X+、手水平伸出、手心朝下
   4. movej 到预抓取点 = 目标点正上方 10cm（世界系）
   5. movel 竖直下降到抓取点
   6. 闭合夹爪
@@ -159,16 +159,6 @@ class YoloGrasp:
                 print(f"已从 {PLACE_POSE_FILE} 加载放置位姿")
             except Exception as e:
                 print(f"读取 {PLACE_POSE_FILE} 失败: {e}（按 j 重新示教）")
-
-    # ---------------- 抓取姿态（固定姿态，无需示教） ----------------
-    def _compute_grasp_rotation(self):
-        """构造固定抓取姿态旋转矩阵（基座系，列为法兰 X/Y/Z 轴）：
-        法兰 Z 轴（法兰面法线）= 世界 X+，灵巧手沿法兰 Z 水平伸出；
-        法兰 Y 轴 = 世界正下方，使该姿态下手心朝下。"""
-        z = WORLD_X_IN_BASE / np.linalg.norm(WORLD_X_IN_BASE)  # 法兰面朝世界 X+
-        y = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)       # 法兰 Y = 世界下方 → 手心朝下
-        x = np.cross(y, z)
-        return np.column_stack([x, y, z])
 
     # ---------------- 放置位姿示教 ----------------
     def teach_place_pose(self):
@@ -372,12 +362,13 @@ class YoloGrasp:
                       PRE_GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
         pre_tip = obj + pre_offset
 
-        # 固定抓取姿态：法兰面朝世界 X+，手沿法兰 Z 水平伸出，手心朝下
-        grasp_rot = self._compute_grasp_rotation()
-        tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 世界 X+（手伸出方向）
+        # 抓取姿态由夹爪定义：直装夹爪法兰 Z 朝下竖直抓；
+        # 灵巧手法兰面朝世界 X+、手水平伸出、手心朝下
+        grasp_rot = gripper.grasp_rotation(WORLD_X_IN_BASE, V_UP_IN_BASE)
+        tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 工具伸出方向
         L = gripper.tool_length
-        print(f"   [诊断] 法兰面朝向(法兰Z轴): {np.round(tool_dir, 3)}  "
-              f"手心朝向(法兰Y轴): {np.round(grasp_rot[:, 1], 3)}  "
+        print(f"   [诊断] 法兰Z轴: {np.round(tool_dir, 3)}  "
+              f"法兰Y轴: {np.round(grasp_rot[:, 1], 3)}  "
               f"长度: {L:.3f}m")
 
         pre_flange = pre_tip - L * tool_dir
