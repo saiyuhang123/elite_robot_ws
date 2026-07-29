@@ -25,11 +25,12 @@
   python3 yolo_grasp.py --headless               # 无人值守：仅服务驱动
 
 调度集成：
-  调 /yolo_grasp/grasp（Trigger）触发抓取，response.success/message
-  为真实结果（失败原因如 无稳定目标/IK 解算失败/movel 下降超时）。
-  抓取前会检查目标新鲜度（<1s）与稳定性（0.6s 内漂移 <5mm）。
+  调 /yolo_grasp/grasp（Trigger）触发抓取：先到预备位姿（相机视野
+  最佳）→ 锁存目标 → 抓取，结束后无论成败都收拢到 Home2。
+  response.success/message 为真实结果。
   调 /yolo_grasp/place（Trigger）执行放置：movej 到示教放置位姿
-  （按 j 示教，存 place_pose.json）→ 张手放下 → 退回预备位姿。
+  （按 j 示教，存 place_pose.json）→ 张手放下 → 退回 Home2。
+  底盘导航期间机械臂必须处于 Home2 收拢位姿（/yolo_grasp/home2）。
 """
 
 import argparse
@@ -211,9 +212,10 @@ class YoloGrasp:
 
     def _srv_home2(self, request, response):
         self.robot.get_logger().info('[服务] 收到回 Home2 指令')
-        threading.Thread(target=self.home2, daemon=True).start()
+        # 同步执行：调度方（mission_executor）需要等到位后再让底盘导航
+        self.home2()
         response.success = True
-        response.message = 'Home2 运动已触发'
+        response.message = '已回 Home2 位姿'
         return response
 
     def _srv_ready(self, request, response):
@@ -339,7 +341,25 @@ class YoloGrasp:
         return self.latest_target.copy()
 
     def grasp(self):
-        """执行一次抓取流程。返回 (成功与否, 结果描述)。"""
+        """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 抓取 →
+        无论成败都收拢到 Home2（底盘导航期间的安全姿态）。
+        返回 (成功与否, 结果描述)。"""
+        # 0. 先到抓取预备位姿，此位姿下相机视野最好
+        print("0. movej 到抓取预备位姿...")
+        self.send_movej(READY_JOINTS)
+        if not self.wait_motion_done():
+            print("   !! 到预备位姿超时，放弃")
+            return False, "到预备位姿超时"
+        self.spin(10)  # 等感知在新位姿下刷新几帧
+
+        ok, msg = self._grasp_impl()
+
+        # 无论成败，收拢到 Home2，保证底盘导航期间机械臂处于安全姿态
+        self.home2()
+        return ok, msg
+
+    def _grasp_impl(self):
+        """抓取流程本体（在预备位姿下调用）。返回 (成功与否, 结果描述)。"""
         gripper = self.gripper
         print(f"\n======= 开始抓取流程 [{gripper.name}] =======")
 
@@ -494,7 +514,7 @@ class YoloGrasp:
             print("已到预备位姿")
 
     def place(self):
-        """移动到示教放置位姿 → 张手放下 → 退回预备位姿。返回 (成功与否, 描述)。"""
+        """移动到示教放置位姿 → 张手放下 → 退回 Home2 收拢位姿。返回 (成功与否, 描述)。"""
         print(f"\n======= 开始放置流程 [{self.gripper.name}] =======")
         if self.place_joints is None:
             print("   !! 放置位姿未示教，请先按 j 示教")
@@ -512,11 +532,11 @@ class YoloGrasp:
         self.gripper.open()
         time.sleep(self.gripper.close_delay)
 
-        # 3. 退回预备位姿（让开工作区，方便底盘继续导航）
-        print("3. 退回预备位姿...")
-        self.send_movej(READY_JOINTS)
+        # 3. 退回 Home2 收拢位姿（底盘导航期间的安全姿态）
+        print("3. 退回 Home2 位姿...")
+        self.send_movej(HOME2_JOINTS)
         if not self.wait_motion_done():
-            return False, "退回预备位姿超时（物体已放下）"
+            return False, "退回 Home2 超时（物体已放下）"
 
         print(f"======= 放置完成 [{self.gripper.name}] =======\n")
         return True, "放置完成"

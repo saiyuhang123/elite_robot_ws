@@ -119,7 +119,10 @@ python3 yolo_grasp.py
 | `c` | 闭合机械手 |
 | `p` | 打印当前目标点坐标 |
 | `h` | 回零位 |
+| `2` | 回 Home2 位姿（-2.2, 19.7, -154.8, -86.3, 94.1, 84.2°） |
 | `r` | 移动到抓取预备位姿 |
+| `j` | 示教放置位姿（记录当前关节角到 place_pose.json） |
+| `l` | 执行放置（到放置位姿→张手→退回 Home2） |
 | `t apple` | 切换目标类别为 apple |
 | `t cup` | 切换目标类别为 cup |
 | `t apple,cup` | 同时检测多个类别 |
@@ -163,8 +166,14 @@ ros2 service call /yolo_grasp/close std_srvs/srv/Trigger
 # 回零位
 ros2 service call /yolo_grasp/home std_srvs/srv/Trigger
 
+# 回 Home2 位姿（收拢姿态，同步执行，返回时已到位；底盘导航前必调）
+ros2 service call /yolo_grasp/home2 std_srvs/srv/Trigger
+
 # 到抓取预备位姿
 ros2 service call /yolo_grasp/ready std_srvs/srv/Trigger
+
+# 放置（movej 到示教放置位姿 → 张手 → 退回 Home2，需先按 j 示教）
+ros2 service call /yolo_grasp/place std_srvs/srv/Trigger
 
 # 查看当前目标状态
 ros2 service call /yolo_grasp/status std_srvs/srv/Trigger
@@ -225,10 +234,14 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 |---|---|
 | `biaoding/hand_eye_result.json` | 手眼标定结果（相机→法兰变换矩阵） |
 | `biaoding/yolo_grasp.py` | 抓取主程序（支持多夹爪，`--gripper` 选择） |
-| `biaoding/grippers/` | 夹爪抽象层（base / linkerhand / two_finger / soft_touch） |
-| `biaoding/grasp_orientation_*.json` | 各夹爪的示教姿态文件 |
+| `biaoding/grippers/` | 夹爪抽象层（base / linkerhand / two_finger / soft_touch），**抓取姿态由各夹爪的 `grasp_rotation()` 定义** |
+| `biaoding/place_pose.json` | 放置位姿示教文件（按 `j` 示教） |
 | `YOLO/yolo_grasp_perception.py` | YOLO 感知节点（模型路径、目标类别、置信度阈值） |
 | `YOLO/yolov8s.pt` | YOLOv8 模型权重 |
+
+注：`grasp_orientation_*.json` 示教姿态文件已废弃不再使用。抓取姿态现在是代码构造的固定姿态：
+灵巧手 = 法兰面朝世界 X+、手水平伸出、手心朝下（`linkerhand.py`）；
+二指/柔触 = 法兰 Z 朝世界正下方竖直抓（`base.py` 默认）。
 
 ### 夹爪参数速查
 
@@ -236,8 +249,9 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 |---|---|---|---|
 | 控制方式 | topic (JointState) | 服务 (serial→ROS) | 服务 (Modbus TCP) |
 | IK 模式 | 6dof | 6dof | 5dof（旋转对称） |
+| 抓取姿态 | 法兰面朝世界X+，手心朝下 | 法兰Z朝下 | 法兰Z朝下 |
 | tool_length | 0.13 | 0.12 | 0.15 |
-| grasp_offset Z | -0.04（包握） | 0.0（对准中心） | 0.02（略高） |
+| grasp_offset Z | 0.06（压物调大/抓空调小） | 0.0（对准中心） | 0.02（略高） |
 | close_delay | 1.5s | 1.0s | 2.0s |
 
 ---
@@ -249,5 +263,7 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 | 感知节点不检测目标 | 确认相机三话题都有数据；`ros2 topic pub /yolo/target_class ...` 切换类别试试 |
 | 抓取偏差大 | `hand_eye_result.json` 可能过期，重新标定后跑 `update_hand_eye_json.py` |
 | 机械臂不动 | 确认远程模式 + `resend_external_script` |
+| 服务调用卡住没反应 | 旧版 `yolo_grasp.py` 的 bug：业务代码 `spin_once` 了已被后台执行器管理的节点。用最新代码（`spin()` 已改为纯 sleep），重启主程序 |
+| 抓取时压住物体 | 调 `grippers/linkerhand.py` 的 `grasp_offset_world` Z 值（压物调大、抓空调小） |
 | YOLO 推理卡死 | 确认用的是 `.pt` 模型而非跨机器导出的 `.engine` |
 | TF 报错 `two unconnected trees` | 确认机械臂驱动已启动（TF 前缀 `cs66_`） |

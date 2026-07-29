@@ -30,7 +30,7 @@ HAND_EYE_JSON = os.path.expanduser(
 # 空集合 = 处理所有类别
 DEFAULT_TARGET_CLASSES = {'apple'}
 # 置信度阈值：低于此值的检测框直接忽略
-CONF_THRESHOLD = 0.4
+CONF_THRESHOLD = 0.25
 
 
 def load_hand_eye_matrix(path):
@@ -191,16 +191,32 @@ class YoloGraspPerceptionNode(Node):
 
         # 4. 类别/置信度过滤，多个目标取深度最近的一个
         candidates = []
+        all_detections = []  # 调试：记录所有原始检测
         for box in results.boxes:
             cls_id = int(box.cls[0])
             cls_name = self.yolo_model.names[cls_id]
             conf = float(box.conf[0])
+            all_detections.append(f'{cls_name}({conf:.2f})')
             if self.target_classes and cls_name not in self.target_classes:
                 continue
             if conf < CONF_THRESHOLD:
                 continue
             xyxy = box.xyxy[0].cpu().numpy().astype(int)
             candidates.append((xyxy, cls_name, conf))
+
+        # 定期打印所有原始检测（帮助排查换环境后识别问题）
+        if int(_time.time()) % 5 == 0 and not hasattr(self, '_last_diag_time'):
+            self._last_diag_time = int(_time.time())
+            self.get_logger().info(
+                f'[诊断] 原始检测({len(all_detections)}个): {", ".join(all_detections[:10])}'
+                f'{"..." if len(all_detections) > 10 else ""}'
+                f' | 阈值={CONF_THRESHOLD} 候选={len(candidates)}')
+        elif abs(int(_time.time()) - getattr(self, '_last_diag_time', 0)) >= 5:
+            self._last_diag_time = int(_time.time())
+            self.get_logger().info(
+                f'[诊断] 原始检测({len(all_detections)}个): {", ".join(all_detections[:10])}'
+                f'{"..." if len(all_detections) > 10 else ""}'
+                f' | 阈值={CONF_THRESHOLD} 候选={len(candidates)}')
 
         if not candidates:
             # 没有目标类别的检测框：画出所有检测框（灰色）提示用户
