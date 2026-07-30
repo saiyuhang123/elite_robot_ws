@@ -63,7 +63,7 @@ class LinkerHandGripper(GripperBase):
         # 掌心 Z 偏移（相对 YOLO 检测到的物体上表面）。
         # 手水平伸出、手心朝下姿态下，握拳后指尖会低于手心平面，
         # 偏移太小会压住物体。苹果可先试 0.06，压物就调大、抓空就调小。
-        return np.array([0.0, 0.0, 0.04])  # 手心在物体上表面上方 6cm
+        return np.array([0.0, 0.0, 0.03])  # 手心在物体上表面上方 6cm
 
     @property
     def tool_length(self) -> float:

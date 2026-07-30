@@ -40,3 +40,5 @@ deb依赖项:
 
 7. Set the IP info of the network device
   ros2 run percipio_camera network_ip_config
+  
+外记住这个坑，后面你做任何节点都要注意：想用 camera_info，必须同时订阅对应的 image_raw，否则驱动一帧都不发。用 rqt_image_view 看图时它自己订了 image，所以那个路径下 camera_info 是有的。

@@ -87,11 +87,11 @@ class YoloGraspPerceptionNode(Node):
         self.latest_depth = None
         self.latest_info = None
         self.create_subscription(
-            Image, '/camera/camera/color/image_raw', self._color_cb, 10)
+            Image, '/camera/color/image_raw', self._color_cb, 10)
         self.create_subscription(
-            Image, '/camera/camera/aligned_depth_to_color/image_raw', self._depth_cb, 10)
+            Image, '/camera/depth/image_raw', self._depth_cb, 10)
         self.create_subscription(
-            CameraInfo, '/camera/camera/color/camera_info', self._info_cb, 10)
+            CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
         self.create_timer(5.0, self._report_status)
 
         # 订阅目标类别切换话题（可动态切换检测目标，如 "apple" -> "cup"）
@@ -279,9 +279,9 @@ class YoloGraspPerceptionNode(Node):
                 self.get_logger().warn(f'目标 [{cls_name}] 中心点深度无效，跳过...')
                 continue
 
-            # 取深度中位数 (单位: mm -> 转换为 m)
-            depth_mm = np.median(valid_depths)
-            Z_c = float(depth_mm) / 1000.0
+            # 取深度中位数 (Percipio 原始值 0.25mm/LSB -> 转换为 m)
+            depth_raw = np.median(valid_depths)
+            Z_c = float(depth_raw) * 0.25 / 1000.0
 
             # 过滤不合理的深度值 (比如小于10cm 或 大于 3m)
             if Z_c < 0.1 or Z_c > 3.0:

@@ -5,7 +5,6 @@
 """
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
@@ -51,14 +50,15 @@ class ArucoSingleTF(Node):
         self.last_seen_ids = []
         self.diag_timer = self.create_timer(5.0, self.diagnostic_cb)
 
-        # RealSense 以 SENSOR_DATA(best-effort) QoS 发布图像话题，
-        # 订阅端必须用兼容的 QoS，否则一条消息都收不到
+        # Percipio 相机以 RELIABLE QoS 发布，默认订阅 QoS 即可匹配。
+        # 注意：该驱动只在 image_raw 有订阅者时才发布 camera_info，
+        # 所以两个订阅缺一不可。
         self.camera_info_sub = self.create_subscription(
-            CameraInfo, '/camera/camera/color/camera_info',
-            self.camera_info_cb, qos_profile_sensor_data)
+            CameraInfo, '/camera/color/camera_info',
+            self.camera_info_cb, 10)
         self.image_sub = self.create_subscription(
-            Image, '/camera/camera/color/image_raw',
-            self.image_cb, qos_profile_sensor_data)
+            Image, '/camera/color/image_raw',
+            self.image_cb, 10)
 
         self.get_logger().info(f'ArucoSingleTF ready (dict={dict_name}, id={self.marker_id}, size={self.marker_size}m)')
 
@@ -111,8 +111,9 @@ class ArucoSingleTF(Node):
     def diagnostic_cb(self):
         if self.camera_matrix is None:
             self.get_logger().warn(
-                '仍未收到 camera_info，请确认相机已启动、/camera/camera/color/camera_info 有数据'
-                '（可用 ros2 topic hz /camera/camera/color/image_raw 检查）')
+                '仍未收到 camera_info，请确认相机已启动、/camera/color/image_raw 有数据'
+                '（该驱动只在 image_raw 有订阅者时才发布 camera_info；'
+                '可用 ros2 topic hz /camera/color/image_raw 检查）')
             return
         if self.last_detect_time is not None:
             elapsed = (self.get_clock().now() - self.last_detect_time).nanoseconds / 1e9

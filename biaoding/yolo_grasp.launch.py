@@ -3,7 +3,7 @@
 """
 YOLO 视觉抓取一体化 Launch 文件（LinkerHand O6 机械手版）。
 
-一键启动：机械臂驱动 + RealSense 相机 + LinkerHand SDK + YOLO 感知节点。
+一键启动：机械臂驱动 + Percipio 相机 + LinkerHand SDK + YOLO 感知节点。
 
 启动前确保：
   1. CAN 端口已开启（每次插拔/重启后执行一次）：
@@ -51,7 +51,7 @@ YOLO 视觉抓取一体化 Launch 文件（LinkerHand O6 机械手版）。
   launch_rviz      启动 RViz（默认 false）
   run_perception   启动 YOLO 感知节点（默认 true）
   run_linker_hand  启动 LinkerHand SDK（默认 true）
-  run_camera       启动 RealSense 相机（默认 true）
+  run_camera       启动 Percipio 相机（默认 true）
 """
 
 import os
@@ -98,7 +98,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "run_camera",
             default_value="true",
-            description="是否启动 RealSense 相机",
+            description="是否启动 Percipio 相机",
         ),
     ]
 
@@ -127,25 +127,21 @@ def generate_launch_description():
     )
 
     # ============================================================
-    # 2. RealSense D435 相机（彩色 + 深度 + 对齐）
+    # 2. Percipio 相机（彩色 1280x960 + 深度 1280x960，registration 默认开，
+    #    深度图已对齐到彩色坐标系，与手眼标定分辨率一致）
     # ============================================================
-    realsense_camera = IncludeLaunchDescription(
+    percipio_camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [
                 PathJoinSubstitution(
-                    [FindPackageShare("realsense2_camera"), "launch"]
+                    [FindPackageShare("percipio_camera"), "launch"]
                 ),
-                "/rs_launch.py",
+                "/percipio_camera.launch.py",
             ]
         ),
         launch_arguments={
-            "camera_namespace": "camera",
-            "serial_no": '"944122073226"',
-            "enable_color": "true",
-            "enable_depth": "true",
-            "rgb_camera.color_profile": "1280x720x30",
-            "depth_module.depth_profile": "640x480x30",
-            "align_depth.enable": "true",
+            "color_resolution": "1280x960",
+            "depth_resolution": "1280x960",
         }.items(),
         condition=IfCondition(run_camera),
     )
@@ -185,7 +181,7 @@ def generate_launch_description():
     #
     # 启动顺序：
     #   T+0s:  机械臂驱动 + LinkerHand SDK（并行，互不依赖）
-    #   T+3s:  RealSense 相机（需要在驱动之后以确保 TF 树完整）
+    #   T+3s:  Percipio 相机（需要在驱动之后以确保 TF 树完整）
     #   T+6s:  YOLO 感知节点（需要相机话题 + 驱动 TF 都就绪）
     # ============================================================
 
@@ -199,7 +195,7 @@ def generate_launch_description():
         robot_driver,
         linker_hand,
         # 相机在驱动后 3s 启动
-        TimerAction(period=3.0, actions=[realsense_camera]),
+        TimerAction(period=3.0, actions=[percipio_camera]),
         # YOLO 感知在相机后 3s 启动（总延时 6s）
         TimerAction(period=6.0, actions=[yolo_perception]),
         # 启动完成提示

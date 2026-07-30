@@ -70,19 +70,15 @@ ros2 launch my_elite_robot_cell_control start_robot.launch.py \
     headless_mode:=true launch_rviz:=false
 ```
 
-**终端2 — RealSense 相机**
+**终端2 — Percipio 相机**（彩色+深度 1280×960，registration 默认开，深度已对齐到彩色坐标系）
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py \
-    camera_namespace:=camera \
-    enable_color:=true \
-    enable_depth:=true \
-    rgb_camera.color_profile:=1280x720x30 \
-    depth_module.depth_profile:=640x480x30 \
-    align_depth.enable:=true
+ros2 launch percipio_camera percipio_camera.launch.py \
+    color_resolution:=1280x960 \
+    depth_resolution:=1280x960
 ```
 
-验证：`ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw` 有数据。
+验证：`timeout 8 ros2 topic hz /camera/color/image_raw` 有数据；对齐状态用 `python3 ~/Documents/elite_robot_ws/check_camera_info.py` 复核（depth 与 color 内参应一致）。
 
 **终端3 — LinkerHand SDK**
 
