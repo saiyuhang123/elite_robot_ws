@@ -102,6 +102,10 @@ FORCE_DIVE_OVERSHOOT = 0.015  # 下探过冲：位置偏高时竖直探测的余
 FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
 FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
 LIFT_BEFORE_CLOSE = 0.0050    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
+# 闭合卸力：闭合过程中挤压力超阈值就自动上抬一点（防收拢时力控报警）
+FORCE_RELIEF_THRESHOLD = 2.0  # 闭合挤压力阈值（N，竖直方向投影）
+FORCE_RELIEF_STEP = 0.004     # 每次卸力上抬 4mm
+FORCE_RELIEF_MAX = 0.02       # 卸力累计上抬上限 2cm
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
@@ -363,6 +367,35 @@ class YoloGrasp:
             traveled += d
         print(f"   [力控] 走满行程未触力，过程中最大力变化 {max_df:.1f}N")
         return False
+
+    def close_with_force_relief(self, up_dir_base, up_dir_flange,
+                                threshold=FORCE_RELIEF_THRESHOLD,
+                                step=FORCE_RELIEF_STEP,
+                                max_lift=FORCE_RELIEF_MAX):
+        """闭合夹爪，闭合过程中监测竖直方向挤压力，超阈值就上抬一小段卸力。
+        防止收拢时挤压物体导致力控报警。返回累计上抬量（米）。"""
+        base = self._force_baseline(0.3)
+        self.gripper.close()
+        lifted = 0.0
+        t_end = time.time() + self.gripper.close_delay
+        while time.time() < t_end:
+            if base is not None and self.latest_force is not None \
+                    and lifted < max_lift:
+                proj = float((self.latest_force - base) @ up_dir_flange)
+                if proj > threshold:
+                    tcp = self.robot.get_tcp_pose()
+                    if tcp is not None:
+                        target = np.array(tcp[0]) + step * up_dir_base
+                        print(f"   [卸力] 闭合挤压力 {proj:.1f}N > {threshold}N，"
+                              f"上抬 {step*1000:.0f}mm")
+                        self.send_movel_keep_orientation(target, a=0.3, v=0.02)
+                        self.wait_motion_done(timeout=5.0)
+                        lifted += step
+                        t_end = time.time() + 0.5  # 抬完留点时间让夹爪走完
+            time.sleep(0.02)
+        if lifted > 0:
+            print(f"   [卸力] 累计上抬 {lifted*1000:.0f}mm")
+        return lifted
 
     def spin(self, n=10, dt=0.05):
         # 后台 MultiThreadedExecutor 已在全程处理订阅/服务回调，
@@ -626,28 +659,26 @@ class YoloGrasp:
             contact_dir_flange=contact_dir_flange)
         if contact is None:
             return False, "力传感器异常或无法读取位姿"
-        if not contact:
-            # 位置已较准：走满行程未达力阈值 = 软接触到位（手指缓冲使力
-            # 变化很小），按位置到位处理，继续闭合。力控仅作下压保护。
-            print("   [力控] 未达力阈值但已到位（软接触），按位置到位继续")
+        if contact:
+            # 真正触到力才上抬：卸掉接触力再闭合，避免收拢挤压触发报警
+            print(f"   [力控] 触力到位，上抬 {LIFT_BEFORE_CLOSE*1000:.0f}mm 再闭合...")
+            tcp = self.robot.get_tcp_pose()
+            if tcp is None:
+                return False, "无法读取当前位姿"
+            lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
+            if not self.send_movel_keep_orientation(lift_flange):
+                return False, "无法读取当前位姿"
+            if not self.wait_motion_done():
+                print("   !! 上抬超时，放弃")
+                return False, "触力后上抬超时"
+        else:
+            # 未触到力（位置到位/软接触）：原地直接闭合，不上抬，
+            # 避免本来就没碰到的情况下抬得离目标更远
+            print("   [力控] 未触力，原位闭合")
 
-        # 触力后先沿世界上抬一小段卸掉接触力，再闭合，
-        # 避免收拢时挤压物体产生过大力触发力控报警
-        print(f"   [力控] 触力到位，上抬 {LIFT_BEFORE_CLOSE*1000:.0f}mm 再闭合...")
-        tcp = self.robot.get_tcp_pose()
-        if tcp is None:
-            return False, "无法读取当前位姿"
-        lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
-        if not self.send_movel_keep_orientation(lift_flange):
-            return False, "无法读取当前位姿"
-        if not self.wait_motion_done():
-            print("   !! 上抬超时，放弃")
-            return False, "触力后上抬超时"
-
-        # 5. 闭合
-        print(f"7. 闭合 [{gripper.name}]...")
-        gripper.close()
-        time.sleep(gripper.close_delay)
+        # 5. 闭合（监测挤压力，超阈值自动上抬卸力，防收拢时力控报警）
+        print(f"7. 闭合 [{gripper.name}]（力控卸力）...")
+        self.close_with_force_relief(V_UP_IN_BASE, contact_dir_flange)
 
         # 6. movel 退回
         print("8. movel 退回...")
