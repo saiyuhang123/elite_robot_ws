@@ -99,7 +99,13 @@ cd ~/Documents/elite_robot_ws/YOLO
 python3 yolo_grasp_perception.py
 ```
 
-正常标志：打印 `识别到 [apple] ... 基座系: [...]`
+正常标志：按 `e`（或在 yolo_grasp.py 里按 g 触发抓取）后打印 `识别到 [apple] ... 基座系: [...]`。
+
+**注意：识别默认是关闭的（按需识别）** —— 感知节点只缓存图像不推理，
+省算力也防止导航途中的旧检测污染抓取。抓取流程会在预备位姿停稳后
+自动临时开启（`/yolo_perception/set_enabled`），锁存目标后立即关闭。
+调试看标注图像/目标点时，需先在 yolo_grasp.py 按 `e` 或：
+`ros2 service call /yolo_perception/set_enabled std_srvs/srv/SetBool "data: true"`
 
 **终端5 — 抓取主程序**
 
@@ -123,6 +129,7 @@ python3 yolo_grasp.py
 | `r` | 移动到抓取预备位姿 |
 | `j` | 示教放置位姿（记录当前关节角到 place_pose.json） |
 | `l` | 执行放置（到放置位姿→张手→退回 Home2） |
+| `e` | 开关持续识别（调试用；识别默认关闭，抓取时自动临时开启） |
 | `t apple` | 切换目标类别为 apple |
 | `t cup` | 切换目标类别为 cup |
 | `t apple,cup` | 同时检测多个类别 |

@@ -26,7 +26,8 @@
 
 调度集成：
   调 /yolo_grasp/grasp（Trigger）触发抓取：先到预备位姿（相机视野
-  最佳）→ 锁存目标 → 抓取，结束后无论成败都收拢到 Home2。
+  最佳）→ 开启按需识别（/yolo_perception/set_enabled）→ 只用停稳后
+  的新帧锁存目标 → 关闭识别 → 抓取，结束后无论成败都收拢到 Home2。
   response.success/message 为真实结果。
   调 /yolo_grasp/place（Trigger）执行放置：movej 到示教放置位姿
   （按 j 示教，存 place_pose.json）→ 张手放下 → 退回 Home2。
@@ -48,7 +49,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'elite_robot_example'))
 from elite_robot_example.robot_cartesian_control import (
@@ -135,6 +136,10 @@ class YoloGrasp:
         self._target_locked = False
         self.robot.create_subscription(
             PoseStamped, TARGET_TOPIC, self._target_cb, 10)
+
+        # 按需识别开关（感知节点默认关闭识别，抓取前才临时开启）
+        self.perception_enable_cli = self.robot.create_client(
+            SetBool, '/yolo_perception/set_enabled')
 
         # ---- ROS 服务 ----
         self.robot.create_service(Trigger, '/yolo_grasp/grasp', self._srv_grasp,
@@ -340,9 +345,27 @@ class YoloGrasp:
             return None
         return self.latest_target.copy()
 
+    def _set_perception(self, enabled: bool) -> bool:
+        """开关感知节点的按需识别。返回服务是否调用成功。"""
+        if not self.perception_enable_cli.wait_for_service(timeout_sec=2.0):
+            print("   !! 感知开关服务不可用（yolo_grasp_perception.py 未启动？）")
+            return False
+        req = SetBool.Request()
+        req.data = bool(enabled)
+        future = self.perception_enable_cli.call_async(req)
+        # 节点由后台 MultiThreadedExecutor  spinning，轮询等待即可，
+        # 不能再 spin_until_future_complete（一个节点挂两个执行器会互踩）
+        start = time.time()
+        while not future.done() and time.time() - start < 3.0:
+            time.sleep(0.02)
+        if not future.done():
+            print("   !! 感知开关服务超时")
+            return False
+        return True
+
     def grasp(self):
-        """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 抓取 →
-        无论成败都收拢到 Home2（底盘导航期间的安全姿态）。
+        """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 开启按需识别
+        → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2。
         返回 (成功与否, 结果描述)。"""
         # 0. 先到抓取预备位姿，此位姿下相机视野最好
         print("0. movej 到抓取预备位姿...")
@@ -350,9 +373,26 @@ class YoloGrasp:
         if not self.wait_motion_done():
             print("   !! 到预备位姿超时，放弃")
             return False, "到预备位姿超时"
-        self.spin(10)  # 等感知在新位姿下刷新几帧
+        self.spin(10)  # 等机械臂完全停稳
 
-        ok, msg = self._grasp_impl()
+        # 1. 清空旧目标，开启按需识别：只用开启后拍的新帧，
+        #    避免混入导航/摆臂过程中的旧检测结果导致抓取点跑偏
+        self.latest_target = None
+        self.latest_target_time = 0.0
+        if not self._set_perception(True):
+            return False, "感知节点未响应（识别未开启，放弃）"
+        try:
+            # 2. 等待停稳后新位姿下的第一帧检测结果
+            start = time.time()
+            while self.latest_target is None and time.time() - start < 5.0:
+                time.sleep(0.05)
+            if self.latest_target is None:
+                ok, msg = False, "开启识别后 5s 内未检测到目标"
+            else:
+                ok, msg = self._grasp_impl()
+        finally:
+            # 目标已锁存（或抓取失败），关闭识别省算力
+            self._set_perception(False)
 
         # 无论成败，收拢到 Home2，保证底盘导航期间机械臂处于安全姿态
         self.home2()
@@ -582,8 +622,10 @@ def main():
     print(f"  IK: {g.gripper.ik_mode}  偏移: {g.gripper.grasp_offset_world}")
     print(f"  工具长度: {g.gripper.tool_length:.3f}m")
     print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  h=回零  2=Home2  r=预备位姿")
-    print("        j=示教放置位姿  l=放置  t=切换目标类别  q=退出")
+    print("        j=示教放置位姿  l=放置  e=开关持续识别(调试)  t=切换目标类别  q=退出")
     print("  ROS服务: /yolo_grasp/grasp /open /close /home /home2 /ready /place /status")
+    print("  注意: 识别默认关闭（按需识别），抓取时自动临时开启；"
+          "调试看图像/目标请先按 e 开启")
     print("=" * 60)
 
     try:
@@ -630,6 +672,12 @@ def main():
                     elif cmd == 'l':
                         ok, msg = g.place()
                         print(f"  结果: {'成功' if ok else '失败'} - {msg}")
+                    elif cmd == 'e':
+                        g.perception_on = not getattr(g, 'perception_on', False)
+                        if g._set_perception(g.perception_on):
+                            print(f"  持续识别: {'开' if g.perception_on else '关'}")
+                        else:
+                            g.perception_on = False
                     elif cmd.startswith('t'):
                         parts = cmd.split(maxsplit=1)
                         cls = parts[1] if len(parts) > 1 else 'apple'
@@ -639,7 +687,7 @@ def main():
                     else:
                         print("  未知命令。g=抓取 o=张开 c=闭合 p=打印 "
                               "h=回零 2=Home2 r=预备 j=示教放置 l=放置 "
-                              "t=切换目标 q=退出")
+                              "e=开关识别 t=切换目标 q=退出")
             except KeyboardInterrupt:
                 pass
     finally:

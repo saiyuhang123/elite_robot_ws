@@ -6,6 +6,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from std_msgs.msg import String
+from std_srvs.srv import SetBool
 from cv_bridge import CvBridge
 import message_filters
 from tf2_ros import Buffer, TransformListener, TransformBroadcaster
@@ -56,7 +57,15 @@ class YoloGraspPerceptionNode(Node):
 
         # 加载 YOLO 模型 (首次运行会自动下载 yolov8n.pt，可换成你自己的 pt 模型)
         self.get_logger().info('正在加载 YOLO 模型...')
-        self.yolo_model = YOLO('yolov8s.pt') 
+        self.yolo_model = YOLO('yolov8s.pt')
+
+        # 启动时预热一次推理（CUDA 初始化），避免首次开启识别时卡顿 30~60s
+        self.get_logger().info('预热推理中（CUDA 初始化）...')
+        try:
+            self.yolo_model(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False)
+            self.get_logger().info('预热完成')
+        except Exception as e:
+            self.get_logger().warn(f'预热推理失败（不影响使用）: {e}')
 
         # 手眼标定矩阵 (Camera -> Tool/Flange)，从 hand_eye_result.json 读取
         try:
@@ -89,6 +98,14 @@ class YoloGraspPerceptionNode(Node):
         self.create_subscription(
             String, '/yolo/target_class', self._target_class_cb, 10)
 
+        # 按需识别开关（默认关闭）：
+        # 关闭时只缓存图像帧、不推理不发布 —— 省算力，也防止导航/摆臂
+        # 过程中的旧检测结果污染抓取。抓取主程序在预备位姿停稳后通过
+        # /yolo_perception/set_enabled 开启，锁存目标后关闭。
+        self.enabled = False
+        self.create_service(
+            SetBool, '/yolo_perception/set_enabled', self._set_enabled_cb)
+
         # ---------------- 4. 话题发布与 TF 广播 ----------------
         # 发布算出的目标 3D 位姿 (基座坐标系下)
         self.pose_pub = self.create_publisher(PoseStamped, '/target_object_pose', 10)
@@ -103,8 +120,9 @@ class YoloGraspPerceptionNode(Node):
     def _color_cb(self, msg):
         self._mark('color')
         self.latest_color = msg
-        # 彩色图到达时驱动一次感知（深度和内参需已就绪）
-        if self.latest_depth is not None and self.latest_info is not None:
+        # 彩色图到达时驱动一次感知（仅在按需识别开启时；深度和内参需已就绪）
+        if (self.enabled and self.latest_depth is not None
+                and self.latest_info is not None):
             try:
                 self.perception_callback(msg, self.latest_depth, self.latest_info)
             except Exception as e:
@@ -118,6 +136,15 @@ class YoloGraspPerceptionNode(Node):
     def _info_cb(self, msg):
         self._mark('info')
         self.latest_info = msg
+
+    # ---- 按需识别开关服务 ----
+    def _set_enabled_cb(self, request, response):
+        self.enabled = bool(request.data)
+        response.success = True
+        response.message = '识别已开启' if self.enabled else '识别已关闭'
+        self.get_logger().info(
+            f'[开关] 按需识别: {"ON" if self.enabled else "OFF"}')
+        return response
 
     # ---- 目标类别切换回调 ----
     def _target_class_cb(self, msg):
