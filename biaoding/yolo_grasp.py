@@ -47,7 +47,7 @@ from scipy.spatial.transform import Rotation as Rot
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, WrenchStamped
 from std_msgs.msg import String
 from std_srvs.srv import Trigger, SetBool
 
@@ -90,6 +90,18 @@ TARGET_STABLE_TOL = 0.05   # 窗口内允许的最大漂移（米）
 
 MOVEJ_A, MOVEJ_V = 1.0, 0.2
 MOVEL_A, MOVEL_V = 0.3, 0.05
+
+# 力控下探（guarded move）：最后几厘米慢速分段下降，触力即停，
+# 不再依赖精确的目标高度，防止压坏物体触发力报警
+FT_TOPIC = '/force_torque_sensor_broadcaster/wrench'
+FORCE_THRESHOLD = 2.0       # 硬保护阈值（N，力变化模长），任何方向大力即停
+FORCE_PROJ_THRESHOLD = 1.2   # 软接触阈值（N，下压方向投影），轻触也能检出
+FORCE_PROJ_HITS = 3          # 投影连续超阈值次数，滤毛刺
+FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
+FORCE_DIVE_OVERSHOOT = 0.015  # 下探过冲：位置偏高时竖直探测的余量
+FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
+FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
+LIFT_BEFORE_CLOSE = 0.0050    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
@@ -136,6 +148,12 @@ class YoloGrasp:
         self._target_locked = False
         self.robot.create_subscription(
             PoseStamped, TARGET_TOPIC, self._target_cb, 10)
+
+        # ---- 末端力传感器（力控下探用）----
+        self.latest_force = None
+        self.latest_force_time = 0.0
+        self.robot.create_subscription(
+            WrenchStamped, FT_TOPIC, self._ft_cb, 10)
 
         # 按需识别开关（感知节点默认关闭识别，抓取前才临时开启）
         self.perception_enable_cli = self.robot.create_client(
@@ -259,6 +277,92 @@ class YoloGrasp:
         self.latest_target = np.array([
             msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         self.latest_target_time = time.time()
+
+    # ---------------- 末端力传感器 ----------------
+    def _ft_cb(self, msg):
+        self.latest_force = np.array([
+            msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z])
+        self.latest_force_time = time.time()
+
+    def _force_baseline(self, duration=0.5):
+        """静止时采力均值作零点（补偿残余零漂）。无数据返回 None。"""
+        if self.latest_force is None or time.time() - self.latest_force_time > 1.0:
+            return None
+        samples = []
+        start = time.time()
+        while time.time() - start < duration:
+            if self.latest_force is not None:
+                samples.append(self.latest_force.copy())
+            time.sleep(0.02)
+        return np.mean(samples, axis=0) if samples else None
+
+    def send_stopl(self, a=0.5):
+        """急停当前直线运动。"""
+        self._send(f"def prog():\n    stopl({a})\nend")
+
+    def force_guided_descend(self, down_dir, max_dist, step=FORCE_DIVE_STEP,
+                             v=FORCE_DIVE_V, threshold=FORCE_THRESHOLD,
+                             contact_dir_flange=None,
+                             proj_threshold=FORCE_PROJ_THRESHOLD):
+        """慢速分段下探：每走一小步检查力变化，触力即停。
+        停止判据（任一满足）：
+          - 力变化模长 > threshold（硬保护，任意方向大力）
+          - 力变化在接触方向上的投影 > proj_threshold 连续 FORCE_PROJ_HITS 次
+            （软接触，轻触也能检出；contact_dir_flange 为接触力方向在法兰系
+            下的单位向量，None 则关闭投影判据）
+        返回 True=触力停止，False=走满行程未触力，None=出错。"""
+        base = self._force_baseline()
+        if base is None:
+            print(f"   !! 力传感器无数据（{FT_TOPIC}）")
+            return None
+        print(f"   [力控] 零点 {np.round(base, 2)}，模长阈值 {threshold}N，"
+              f"投影阈值 {proj_threshold}N，"
+              f"步长 {step*1000:.0f}mm，行程 {max_dist*1000:.0f}mm")
+        traveled = 0.0
+        max_df = 0.0
+        proj_hits = 0
+        while traveled < max_dist - 1e-6:
+            d = min(step, max_dist - traveled)
+            tcp = self.robot.get_tcp_pose()
+            if tcp is None:
+                return None
+            nxt = np.array(tcp[0]) + d * down_dir
+            if not self.send_movel_keep_orientation(nxt, a=0.3, v=v):
+                return None
+            # 等本步走完，中途触力立即停
+            start = time.time()
+            while time.time() - start < 10.0:
+                if self.latest_force is not None:
+                    dvec = self.latest_force - base
+                    df = float(np.linalg.norm(dvec))
+                    max_df = max(max_df, df)
+                    if df > threshold:
+                        print(f"   [力控] 硬触发 {df:.1f}N > {threshold}N，停止下探"
+                              f"（已下探 {traveled*1000:.0f}mm）")
+                        self.send_stopl()
+                        time.sleep(0.3)
+                        return True
+                    if contact_dir_flange is not None:
+                        proj = float(dvec @ contact_dir_flange)
+                        proj_hits = proj_hits + 1 if proj > proj_threshold else 0
+                        if proj_hits >= FORCE_PROJ_HITS:
+                            print(f"   [力控] 软接触触发（投影 {proj:.1f}N "
+                                  f"连续 {proj_hits} 次），停止下探"
+                                  f"（已下探 {traveled*1000:.0f}mm）")
+                            self.send_stopl()
+                            time.sleep(0.3)
+                            return True
+                tcp2 = self.robot.get_tcp_pose()
+                if tcp2 is not None and \
+                        np.linalg.norm(np.array(tcp2[0]) - nxt) < 0.002:
+                    break
+                time.sleep(0.01)
+            else:
+                print("   !! 下探单步超时")
+                return None
+            traveled += d
+        print(f"   [力控] 走满行程未触力，过程中最大力变化 {max_df:.1f}N")
+        return False
 
     def spin(self, n=10, dt=0.05):
         # 后台 MultiThreadedExecutor 已在全程处理订阅/服务回调，
@@ -499,33 +603,54 @@ class YoloGrasp:
             tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - pre_flange)
             print(f"   [诊断] movej 后偏差: {tcp_err*1000:.1f}mm")
 
-        # 4. movel 下降
+        # 4. movel 下降：先快速接近到抓取点上方，再慢速力控下探（触力即停）
         reach_flange = grasp_tip - L * tool_dir
-        print(f"   TCP目标: [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
+        approach_tip = grasp_tip + FORCE_APPROACH_H * V_UP_IN_BASE
+        approach_flange = approach_tip - L * tool_dir
+        print(f"   抓取TCP: [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
               f"{grasp_tip[2]:.4f}]")
-        print(f"   法兰目标: [{reach_flange[0]:.4f}, {reach_flange[1]:.4f}, "
-              f"{reach_flange[2]:.4f}]")
-        print("5. movel 下降...")
-        if not self.send_movel_keep_orientation(reach_flange):
+        print(f"5. movel 快速接近（抓取点上方 {FORCE_APPROACH_H*100:.0f}cm）...")
+        if not self.send_movel_keep_orientation(approach_flange):
             print("   !! 无法读取当前位姿，放弃")
             return False, "无法读取当前位姿"
         if not self.wait_motion_done():
-            print("   !! movel 超时，放弃")
-            return False, "movel 下降超时"
+            print("   !! movel 接近超时，放弃")
+            return False, "movel 接近超时"
 
-        self.spin(5)
-        actual_tcp = self.robot.get_tcp_pose()
-        if actual_tcp is not None:
-            tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - reach_flange)
-            print(f"   [诊断] movel 后偏差: {tcp_err*1000:.1f}mm")
+        print("6. 慢速力控下探（触力即停）...")
+        # 接触力方向（世界上）转到法兰系，用于软接触投影判据
+        contact_dir_flange = grasp_rot.T @ V_UP_IN_BASE
+        contact_dir_flange /= np.linalg.norm(contact_dir_flange)
+        contact = self.force_guided_descend(
+            -V_UP_IN_BASE, FORCE_APPROACH_H + FORCE_DIVE_OVERSHOOT,
+            contact_dir_flange=contact_dir_flange)
+        if contact is None:
+            return False, "力传感器异常或无法读取位姿"
+        if not contact:
+            # 位置已较准：走满行程未达力阈值 = 软接触到位（手指缓冲使力
+            # 变化很小），按位置到位处理，继续闭合。力控仅作下压保护。
+            print("   [力控] 未达力阈值但已到位（软接触），按位置到位继续")
+
+        # 触力后先沿世界上抬一小段卸掉接触力，再闭合，
+        # 避免收拢时挤压物体产生过大力触发力控报警
+        print(f"   [力控] 触力到位，上抬 {LIFT_BEFORE_CLOSE*1000:.0f}mm 再闭合...")
+        tcp = self.robot.get_tcp_pose()
+        if tcp is None:
+            return False, "无法读取当前位姿"
+        lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
+        if not self.send_movel_keep_orientation(lift_flange):
+            return False, "无法读取当前位姿"
+        if not self.wait_motion_done():
+            print("   !! 上抬超时，放弃")
+            return False, "触力后上抬超时"
 
         # 5. 闭合
-        print(f"6. 闭合 [{gripper.name}]...")
+        print(f"7. 闭合 [{gripper.name}]...")
         gripper.close()
         time.sleep(gripper.close_delay)
 
         # 6. movel 退回
-        print("7. movel 退回...")
+        print("8. movel 退回...")
         if not self.send_movel_keep_orientation(pre_flange):
             print("   !! 无法读取当前位姿")
             return False, "退回失败（无法读取位姿，物体可能已夹住）"
@@ -621,7 +746,7 @@ def main():
     print(f"YOLO 抓取主程序（夹爪: {g.gripper.name}）")
     print(f"  IK: {g.gripper.ik_mode}  偏移: {g.gripper.grasp_offset_world}")
     print(f"  工具长度: {g.gripper.tool_length:.3f}m")
-    print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  h=回零  2=Home2  r=预备位姿")
+    print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  f=打印力  h=回零  2=Home2  r=预备位姿")
     print("        j=示教放置位姿  l=放置  e=开关持续识别(调试)  t=切换目标类别  q=退出")
     print("  ROS服务: /yolo_grasp/grasp /open /close /home /home2 /ready /place /status")
     print("  注意: 识别默认关闭（按需识别），抓取时自动临时开启；"
@@ -661,6 +786,12 @@ def main():
                         else:
                             print(f"  目标: {np.round(g.latest_target, 4)}"
                                   f"（{time.time()-g.latest_target_time:.1f}s 前）")
+                    elif cmd == 'f':
+                        if g.latest_force is None:
+                            print(f"  无力数据（{FT_TOPIC}）")
+                        else:
+                            print(f"  力: {np.round(g.latest_force, 2)}N  "
+                                  f"幅值: {np.linalg.norm(g.latest_force):.2f}N")
                     elif cmd == 'h':
                         g.home()
                     elif cmd == '2':
@@ -685,7 +816,7 @@ def main():
                     elif cmd == '':
                         pass
                     else:
-                        print("  未知命令。g=抓取 o=张开 c=闭合 p=打印 "
+                        print("  未知命令。g=抓取 o=张开 c=闭合 p=打印 f=打印力 "
                               "h=回零 2=Home2 r=预备 j=示教放置 l=放置 "
                               "e=开关识别 t=切换目标 q=退出")
             except KeyboardInterrupt:
