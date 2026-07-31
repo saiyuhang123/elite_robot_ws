@@ -55,9 +55,9 @@ class YoloGraspPerceptionNode(Node):
         # 目标类别集合（可通过 /yolo/target_class 话题动态修改）
         self.target_classes = set(DEFAULT_TARGET_CLASSES)
 
-        # 加载 YOLO 模型 (首次运行会自动下载 yolov8n.pt，可换成你自己的 pt 模型)
+        # 加载 YOLO 模型 (首次运行会自动下载 yolo11m.pt，可换成你自己的 pt 模型)
         self.get_logger().info('正在加载 YOLO 模型...')
-        self.yolo_model = YOLO('yolov8s.pt')
+        self.yolo_model = YOLO('yolo11x.pt')
 
         # 启动时预热一次推理（CUDA 初始化），避免首次开启识别时卡顿 30~60s
         self.get_logger().info('预热推理中（CUDA 初始化）...')

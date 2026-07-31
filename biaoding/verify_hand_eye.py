@@ -16,6 +16,8 @@
 """
 import math
 import sys
+import threading
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
@@ -43,6 +45,9 @@ def main():
     marker_frame = sys.argv[2] if len(sys.argv) > 2 else 'aruco_marker_frame'
     rclpy.init()
     node = Verify(base_frame, marker_frame)
+    # input() 会阻塞主线程，必须在后台线程 spin，否则 TF buffer 永远是空的
+    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
+    time.sleep(1.5)  # 等 TF buffer 填充
     samples = []
     print('机械臂移动到新位姿并停稳后，按回车采样（输入 q 回车结束并统计）')
     while True:
@@ -76,8 +81,9 @@ def main():
         print('判定: 正常 (~1cm)，可用于抓取')
     else:
         print('判定: 偏差过大 (>1.5cm)，建议重标定')
-    node.destroy_node()
-    rclpy.shutdown()
+    # 后台 spin 线程与 rclpy 清理顺序会冲突导致 abort，直接退进程即可
+    import os
+    os._exit(0)
 
 
 if __name__ == '__main__':

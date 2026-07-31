@@ -98,6 +98,11 @@ class GripperBase(ABC):
         """张开/释放。"""
         ...
 
+    def close_cage(self):
+        """半闭合成笼（两段式闭合第一段）。默认不支持半闭合，
+        退化为直接闭合；支持的夹爪（如灵巧手）应覆盖。"""
+        self.close()
+
     @abstractmethod
     def close(self):
         """闭合/抓取。"""

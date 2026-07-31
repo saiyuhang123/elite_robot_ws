@@ -98,12 +98,12 @@ FORCE_THRESHOLD = 2.0       # 硬保护阈值（N，力变化模长），任何�
 FORCE_PROJ_THRESHOLD = 1.2   # 软接触阈值（N，下压方向投影），轻触也能检出
 FORCE_PROJ_HITS = 3          # 投影连续超阈值次数，滤毛刺
 FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
-FORCE_DIVE_OVERSHOOT = 0.015  # 下探过冲：位置偏高时竖直探测的余量
+FORCE_DIVE_OVERSHOOT = 0.03   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
 FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
 FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
-LIFT_BEFORE_CLOSE = 0.0050    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
+LIFT_BEFORE_CLOSE = 0.0120    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
 # 闭合卸力：闭合过程中挤压力超阈值就自动上抬一点（防收拢时力控报警）
-FORCE_RELIEF_THRESHOLD = 2.0  # 闭合挤压力阈值（N，竖直方向投影）
+FORCE_RELIEF_THRESHOLD = 2.0  # 闭合挤压力阈值（N，力变化模长）
 FORCE_RELIEF_STEP = 0.004     # 每次卸力上抬 4mm
 FORCE_RELIEF_MAX = 0.02       # 卸力累计上抬上限 2cm
 
@@ -324,6 +324,7 @@ class YoloGrasp:
               f"步长 {step*1000:.0f}mm，行程 {max_dist*1000:.0f}mm")
         traveled = 0.0
         max_df = 0.0
+        proj_min, proj_max = 0.0, 0.0
         proj_hits = 0
         while traveled < max_dist - 1e-6:
             d = min(step, max_dist - traveled)
@@ -348,7 +349,11 @@ class YoloGrasp:
                         return True
                     if contact_dir_flange is not None:
                         proj = float(dvec @ contact_dir_flange)
-                        proj_hits = proj_hits + 1 if proj > proj_threshold else 0
+                        proj_min = min(proj_min, proj)
+                        proj_max = max(proj_max, proj)
+                        # abs：传感器力方向约定不明，接触/拉扯都触发
+                        proj_hits = proj_hits + 1 \
+                            if abs(proj) > proj_threshold else 0
                         if proj_hits >= FORCE_PROJ_HITS:
                             print(f"   [力控] 软接触触发（投影 {proj:.1f}N "
                                   f"连续 {proj_hits} 次），停止下探"
@@ -365,15 +370,16 @@ class YoloGrasp:
                 print("   !! 下探单步超时")
                 return None
             traveled += d
-        print(f"   [力控] 走满行程未触力，过程中最大力变化 {max_df:.1f}N")
+        print(f"   [力控] 走满行程未触力，最大力变化 {max_df:.1f}N，"
+              f"投影范围 [{proj_min:.1f}, {proj_max:.1f}]N")
         return False
 
-    def close_with_force_relief(self, up_dir_base, up_dir_flange,
+    def close_with_force_relief(self, up_dir_base,
                                 threshold=FORCE_RELIEF_THRESHOLD,
                                 step=FORCE_RELIEF_STEP,
                                 max_lift=FORCE_RELIEF_MAX):
-        """闭合夹爪，闭合过程中监测竖直方向挤压力，超阈值就上抬一小段卸力。
-        防止收拢时挤压物体导致力控报警。返回累计上抬量（米）。"""
+        """闭合夹爪（攥紧段），闭合过程中监测挤压力（模长），超阈值就上抬
+        一小段卸力。防止收拢时挤压物体导致力控报警。返回累计上抬量（米）。"""
         base = self._force_baseline(0.3)
         self.gripper.close()
         lifted = 0.0
@@ -381,12 +387,12 @@ class YoloGrasp:
         while time.time() < t_end:
             if base is not None and self.latest_force is not None \
                     and lifted < max_lift:
-                proj = float((self.latest_force - base) @ up_dir_flange)
-                if proj > threshold:
+                df = float(np.linalg.norm(self.latest_force - base))
+                if df > threshold:
                     tcp = self.robot.get_tcp_pose()
                     if tcp is not None:
                         target = np.array(tcp[0]) + step * up_dir_base
-                        print(f"   [卸力] 闭合挤压力 {proj:.1f}N > {threshold}N，"
+                        print(f"   [卸力] 闭合挤压力 {df:.1f}N > {threshold}N，"
                               f"上抬 {step*1000:.0f}mm")
                         self.send_movel_keep_orientation(target, a=0.3, v=0.02)
                         self.wait_motion_done(timeout=5.0)
@@ -659,26 +665,28 @@ class YoloGrasp:
             contact_dir_flange=contact_dir_flange)
         if contact is None:
             return False, "力传感器异常或无法读取位姿"
-        if contact:
-            # 真正触到力才上抬：卸掉接触力再闭合，避免收拢挤压触发报警
-            print(f"   [力控] 触力到位，上抬 {LIFT_BEFORE_CLOSE*1000:.0f}mm 再闭合...")
-            tcp = self.robot.get_tcp_pose()
-            if tcp is None:
-                return False, "无法读取当前位姿"
-            lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
-            if not self.send_movel_keep_orientation(lift_flange):
-                return False, "无法读取当前位姿"
-            if not self.wait_motion_done():
-                print("   !! 上抬超时，放弃")
-                return False, "触力后上抬超时"
-        else:
-            # 未触到力（位置到位/软接触）：原地直接闭合，不上抬，
-            # 避免本来就没碰到的情况下抬得离目标更远
-            print("   [力控] 未触力，原位闭合")
+        if not contact:
+            # 力反馈是抓取的必要条件：探到底都没力说明目标不在，不闭合
+            print("   !! 下探到底未触到力，退回预抓取点")
+            self.send_movel_keep_orientation(pre_flange)
+            self.wait_motion_done()
+            return False, "未触到物体（抓空）"
 
-        # 5. 闭合（监测挤压力，超阈值自动上抬卸力，防收拢时力控报警）
-        print(f"7. 闭合 [{gripper.name}]（力控卸力）...")
-        self.close_with_force_relief(V_UP_IN_BASE, contact_dir_flange)
+        # 触到力后上抬卸掉接触力，再进入闭合流程
+        print(f"   [力控] 触力到位，上抬 {LIFT_BEFORE_CLOSE*1000:.0f}mm 再闭合...")
+        tcp = self.robot.get_tcp_pose()
+        if tcp is None:
+            return False, "无法读取当前位姿"
+        lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
+        if not self.send_movel_keep_orientation(lift_flange):
+            return False, "无法读取当前位姿"
+        if not self.wait_motion_done():
+            print("   !! 上抬超时，放弃")
+            return False, "触力后上抬超时"
+
+        # 5. 闭合（一次性攥紧，带力控卸力兜底）
+        print(f"7. 闭合 [{gripper.name}]...")
+        self.close_with_force_relief(V_UP_IN_BASE)
 
         # 6. movel 退回
         print("8. movel 退回...")
