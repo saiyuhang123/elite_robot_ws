@@ -83,10 +83,12 @@ WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 # 预抓取点偏移（世界系，米）：目标点 + 偏移 = 预抓取点
 PRE_GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.10])
 
-# 目标新鲜度/稳定性门限（调度集成：防止抓旧目标或移动中的目标）
+# 抓取点整体下探偏移（世界系，米）：在目标点基础上再往下 0.5cm，
+# 桌面模式与悬挂模式都生效（沿世界"下"方向 -V_UP_IN_BASE 平移）
+GRASP_DOWN_OFFSET = 0.005
+
+# 目标新鲜度门限（调度集成：防止抓旧目标或移动中的目标）
 TARGET_MAX_AGE = 5.0        # 目标点最大龄期（秒），超龄视为无目标
-TARGET_STABLE_WINDOW = 1.2  # 稳定采样窗口（秒）
-TARGET_STABLE_TOL = 0.05   # 窗口内允许的最大漂移（米）
 
 MOVEJ_A, MOVEJ_V = 1.0, 0.2
 MOVEL_A, MOVEL_V = 0.3, 0.05
@@ -493,36 +495,11 @@ class YoloGrasp:
         return False
 
     # ---------------- 抓取流程 ----------------
-    def get_stable_target(self, window=TARGET_STABLE_WINDOW,
-                          tol=TARGET_STABLE_TOL):
-        """眼在手上：拍照位姿下快速确认目标新鲜即可，不要求运动过程中持续跟踪。
-        短暂采样若干帧取均值（过滤单帧噪声），返回稳定目标均值（基座系）。"""
-        samples = []
-        start = time.time()
-        while time.time() - start < window:
-            t = self.latest_target
-            age = time.time() - self.latest_target_time
-            if t is not None and age < TARGET_MAX_AGE:
-                samples.append(t.copy())
-            time.sleep(0.05)
-        if len(samples) < 2:
-            print(f"   [诊断] 稳定采样: 窗口{window}s内仅{len(samples)}个有效样本")
-            return None
-        arr = np.array(samples)
-        spread = float(np.max(np.linalg.norm(arr - arr.mean(axis=0), axis=1)))
-        mean = arr.mean(axis=0)
-        print(f"   [诊断] 稳定采样: OK, 漂移 {spread*1000:.1f}mm, "
-              f"样本{len(samples)}个, 均值[{mean[0]:.3f},{mean[1]:.3f},{mean[2]:.3f}]")
-        if spread > tol:
-            print(f"   [诊断] 注意: 漂移偏大 ({spread*1000:.1f}mm > {tol*1000:.0f}mm)，"
-                  f"但仍使用均值（眼在手上模式）")
-        # 锁存目标，后续运动不再依赖感知
-        self._locked_target = mean.copy()
-        self._target_locked = True
-        return mean
-
     def _check_fresh_target(self):
-        """快速检查：是否有新鲜目标（不采样，不回 None 时直接返回最新值）。"""
+        """取最后一帧感知结果：有新鲜目标（龄期 < TARGET_MAX_AGE）就返回
+        最新一帧的 3D 目标点副本，否则返回 None。
+        不做跨帧平均：多目标时感知每帧发布当帧"深度最近"的目标，帧间切换
+        目标时平均会把不同苹果的位置混在一起导致抓取点跑偏。"""
         if self.latest_target is None:
             return None
         if time.time() - self.latest_target_time > TARGET_MAX_AGE:
@@ -626,9 +603,9 @@ class YoloGrasp:
         if self.latest_target is None:
             print("   [补拍] 补拍位姿下未检测到目标，沿用首次估计")
             return None
-        new_obj = self.get_stable_target()
+        new_obj = self._check_fresh_target()
         if new_obj is None:
-            print("   [补拍] 补拍采样不足，沿用首次估计")
+            print("   [补拍] 补拍位姿未检测到目标，沿用首次估计")
             return None
         diff = float(np.linalg.norm(new_obj - obj))
         print(f"   [补拍] 精定位 [{np.round(new_obj, 4)}]，"
@@ -721,17 +698,13 @@ class YoloGrasp:
         self._target_locked = False
         self._locked_target = None
 
-        # 先快速检查是否有新鲜目标
+        # 只使用最后一帧感知结果（不做跨帧平均）：
+        # 多目标时感知每帧发布当帧"深度最近"的目标，若帧间切换目标，
+        # 平均会把不同苹果的位置混在一起导致抓取点跑偏
         obj = self._check_fresh_target()
         if obj is None:
             print("没有目标（感知未检测到或目标超龄）")
             return False, "无目标"
-
-        # 短暂采样取均值，过滤单帧噪声（不要求全程稳定）
-        obj = self.get_stable_target()
-        if obj is None:
-            print("目标采样不足（感知帧率过低或窗口内目标丢失次数过多）")
-            return False, "目标采样不足"
         print(f"1. 目标点(基座系): [{obj[0]:.4f}, {obj[1]:.4f}, {obj[2]:.4f}]")
 
         # 1.5 补拍精定位（仅桌面模式）：移动到更陡的视角重拍一次，
@@ -757,7 +730,7 @@ class YoloGrasp:
         offset_base = (g_off[0] * WORLD_X_IN_BASE +
                        g_off[1] * WORLD_Y_IN_BASE +
                        g_off[2] * V_UP_IN_BASE)
-        grasp_tip = obj + offset_base
+        grasp_tip = obj + offset_base - GRASP_DOWN_OFFSET * V_UP_IN_BASE
         print(f"2. 抓取点(TCP): [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
               f"{grasp_tip[2]:.4f}]（偏移 {g_off}）")
 
@@ -908,7 +881,8 @@ class YoloGrasp:
         L = gripper.tool_length
         # 掌心 = 目标点右侧（手心朝左对着果实）+ 竖直微调
         grasp_tip = (obj - HANG_PALM_SIDE * y
-                     - HANG_PALM_BELOW * V_UP_IN_BASE)
+                     - HANG_PALM_BELOW * V_UP_IN_BASE
+                     - GRASP_DOWN_OFFSET * V_UP_IN_BASE)
         pre_tip = grasp_tip - HANG_PRE_DIST * z           # 预抓取：X- 后方
         reach_flange = grasp_tip - L * z
         pre_flange = pre_tip - L * z

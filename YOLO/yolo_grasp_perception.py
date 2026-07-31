@@ -57,7 +57,7 @@ class YoloGraspPerceptionNode(Node):
 
         # 加载 YOLO 模型 (首次运行会自动下载 yolo11m.pt，可换成你自己的 pt 模型)
         self.get_logger().info('正在加载 YOLO 模型...')
-        self.yolo_model = YOLO('yolov8n.pt')
+        self.yolo_model = YOLO('best_apple_1.pt')
 
         # 启动时预热一次推理（CUDA 初始化），避免首次开启识别时卡顿 30~60s
         self.get_logger().info('预热推理中（CUDA 初始化）...')
