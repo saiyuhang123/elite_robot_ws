@@ -23,7 +23,7 @@ class LinkerHandGripper(GripperBase):
     # 关节顺序: [大拇指弯曲, 大拇指横摆, 食指, 中指, 无名指, 小拇指]
     HAND_OPEN_POSE = [255.0] * 6                    # 五指张开
     HAND_CAGE_POSE = [180.0, 25.0, 180.0, 180.0, 180.0, 180.0]  # 半闭合成笼（不发力）
-    HAND_CLOSE_POSE = [0.0, 15.0, 50.0, 50.0, 50.0, 50.0]  # 握拳
+    HAND_CLOSE_POSE = [0.0, 5.0, 50.0, 50.0, 50.0, 50.0]  # 握拳
 
     def __init__(self, robot_node, speed: int = 20, torque: int = 30):
         self._node = robot_node

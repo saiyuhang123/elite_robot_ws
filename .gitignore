@@ -142,3 +142,5 @@ core.*
 *.pt
 *.engine
 *.onnx
+YOLO/fruit-detection-dataset/
+

@@ -116,11 +116,29 @@ RESHOOT_SETTLE = 0.8          # 到位后停稳时间（秒）
 # 手眼标定文件（与感知节点同一份），用于把相机位姿换算成法兰位姿
 HAND_EYE_JSON = os.path.join(os.path.dirname(__file__), 'hand_eye_result.json')
 
+# 抓取模式：'table'=桌面（力控下探）  'hanging'=悬挂（侧抓包络+拉拽摘取）
+GRASP_MODE = 'hanging'
+HANG_PRE_DIST = 0.12       # 预抓取点在目标后方（世界 X- 方向，米）
+HANG_PALM_SIDE = 0.035      # 掌心在目标点右侧偏移（米，世界 Y-，手心朝左
+                           # 从右侧包住果实；贴太紧调大、包不住调小）
+HANG_PALM_BELOW = 0.0      # 掌心在目标点下方偏移（米，侧抓时一般取 0）
+HANG_DETACH_PULL = 0.05    # 摘取下拉（米）
+HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，当前未启用）
+
+# 观察位姿：预备位姿 5s 内检测不到目标时，依次转到这些位姿找，
+# 检测到目标即停并在该位姿继续抓取
+OBSERVE_POSES = [
+    [-0.0384, 0.3438, -2.7018, -0.9128, 1.6424, 1.4696],
+    [-0.0384, 0.3438, -2.7018, -0.7034, 0.9791, 1.4696],
+    [-0.0384, 0.3438, -2.7018, -0.7034, 2.0612, 1.4696],
+]
+OBSERVE_WAIT = 3.0         # 每个观察位姿等待检测的时间（秒）
+
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
 HOME2_JOINTS = [-0.0384, 0.3438, -2.7018, -1.5062, 1.6424, 1.4696]
 # 抓取预备位姿（角度: -2.2, -38.3, -124.8, -16.3, 102.1, 94.2）
-READY_JOINTS = [-0.0384, 0.4503, -2.7262, -0.6929, 1.6424, 1.4696]
+READY_JOINTS = [-0.0384, 0.4503, -2.7262, -0.1693, 1.6424, 1.4696]
 SHOULDER_Z = 0.1625
 ARM_REACH = 0.92
 
@@ -513,38 +531,59 @@ class YoloGrasp:
 
     # ---------------- 补拍精定位 ----------------
     def _plan_reshoot_pose(self, obj):
-        """规划补拍关节角：相机在目标上方尽量陡的位置，光轴对准 obj。
-        按 RESHOOT_ELEVATIONS 俯角候选逐个尝试（臂展不够直上直下时
-        自动降级），返回关节角或 None。"""
+        """规划补拍关节角，按抓取模式生成候选相机位姿，逐个试 IK：
+        table   - 相机在目标上方尽量陡（俯角候选自动降级），修正视角滑动；
+        hanging - 相机在目标世界 X- 侧，光轴沿 X+ 平视近拍（挂果高，
+                  俯视臂展不够，平视近拍同样能精化水平/高度）。
+        返回关节角或 None。"""
         if self.T_cam_to_tool is None:
             return None
         tcp = self.robot.get_tcp_pose()
         if tcp is None:
             return None
-        # 水平方向取"目标指向当前相机一侧"：移动量小、臂展压力小
-        h = np.array(tcp[0]) - obj
-        h = h - (h @ V_UP_IN_BASE) * V_UP_IN_BASE
-        if np.linalg.norm(h) < 1e-3:
-            h = WORLD_X_IN_BASE.copy()
-        h = h / np.linalg.norm(h)
         q_guess = self.robot.get_joint_positions()
         if q_guess is None:
             return None
-        T_tool_cam = np.linalg.inv(self.T_cam_to_tool)
-        for el in RESHOOT_ELEVATIONS:
-            elr = math.radians(el)
-            cam_pos = obj + RESHOOT_DIST * (
-                math.sin(elr) * V_UP_IN_BASE + math.cos(elr) * h)
-            z = obj - cam_pos
-            z /= np.linalg.norm(z)          # 光轴对准目标
-            x = WORLD_X_IN_BASE - (WORLD_X_IN_BASE @ z) * z
-            if np.linalg.norm(x) < 1e-3:
-                continue
-            x /= np.linalg.norm(x)
-            y = np.cross(z, x)
+
+        # 候选列表：(标签, 相机位姿 T_cam)。两种模式锚定轴不同：
+        # 俯视时 z≈-V_UP 不能用 V_UP 投影（退化），平视时 z=WORLD_X
+        # 不能用 WORLD_X 投影（退化），所以各造各的。
+        candidates = []
+        if GRASP_MODE == 'hanging':
+            # 不旋转相机：保持当前相机姿态（本来就水平对着目标），
+            # 只沿当前光轴平移到拍照距离，法兰几乎不用转
+            R_fl = Rot.from_quat(tcp[1]).as_matrix()
+            R_cam = R_fl @ self.T_cam_to_tool[:3, :3]
+            z = R_cam[:, 2] / np.linalg.norm(R_cam[:, 2])   # 当前光轴
             T_cam = np.eye(4)
-            T_cam[:3, :3] = np.column_stack([x, y, z])
-            T_cam[:3, 3] = cam_pos
+            T_cam[:3, :3] = R_cam
+            T_cam[:3, 3] = obj - HANG_RESHOOT_DIST * z
+            candidates.append(('原位姿态近拍', T_cam))
+        else:
+            # 水平方向取"目标指向当前相机一侧"：移动量小、臂展压力小
+            h = np.array(tcp[0]) - obj
+            h = h - (h @ V_UP_IN_BASE) * V_UP_IN_BASE
+            if np.linalg.norm(h) < 1e-3:
+                h = WORLD_X_IN_BASE.copy()
+            h = h / np.linalg.norm(h)
+            for el in RESHOOT_ELEVATIONS:
+                elr = math.radians(el)
+                cam_pos = obj + RESHOOT_DIST * (
+                    math.sin(elr) * V_UP_IN_BASE + math.cos(elr) * h)
+                z = obj - cam_pos
+                z /= np.linalg.norm(z)      # 光轴对准目标
+                x = WORLD_X_IN_BASE - (WORLD_X_IN_BASE @ z) * z
+                if np.linalg.norm(x) < 1e-3:
+                    continue
+                x /= np.linalg.norm(x)
+                y = np.cross(z, x)
+                T_cam = np.eye(4)
+                T_cam[:3, :3] = np.column_stack([x, y, z])
+                T_cam[:3, 3] = cam_pos
+                candidates.append((f'俯角{el}°', T_cam))
+
+        T_tool_cam = np.linalg.inv(self.T_cam_to_tool)
+        for label, T_cam in candidates:
             T_fl = T_cam @ T_tool_cam       # 相机位姿 → 法兰位姿
             joints = cs66_inverse_kinematics(T_fl[:3, 3], T_fl[:3, :3], q_guess)
             if joints is None:
@@ -558,7 +597,7 @@ class YoloGrasp:
             if np.linalg.norm(T_fl[:3, 3]
                               - np.array([0, 0, SHOULDER_Z])) > ARM_REACH:
                 continue
-            print(f"   [补拍] 俯角 {el}° 可达，IK误差 "
+            print(f"   [补拍] {label} 可达，IK误差 "
                   f"{pos_err*1000:.1f}mm/{rot_err:.1f}°")
             return joints
         return None
@@ -614,6 +653,30 @@ class YoloGrasp:
             return False
         return True
 
+    def _wait_target(self, timeout):
+        """清空旧目标，等待新检测结果。返回是否在超时内检测到。"""
+        self.latest_target = None
+        self.latest_target_time = 0.0
+        start = time.time()
+        while self.latest_target is None and time.time() - start < timeout:
+            time.sleep(0.05)
+        return self.latest_target is not None
+
+    def _search_observe_poses(self):
+        """依次转到观察位姿找目标，检测到即停（留在该位姿）。"""
+        for i, pose in enumerate(OBSERVE_POSES):
+            print(f"   [观察] 预备位姿无目标，转观察位姿 "
+                  f"{i+1}/{len(OBSERVE_POSES)}...")
+            self.send_movej(pose)
+            if not self.wait_motion_done():
+                print("   [观察] 移动超时，试下一个")
+                continue
+            time.sleep(0.5)  # 停稳
+            if self._wait_target(OBSERVE_WAIT):
+                print(f"   [观察] 位姿 {i+1} 检测到目标")
+                return
+        print("   [观察] 所有观察位姿均未检测到目标")
+
     def grasp(self):
         """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 开启按需识别
         → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2。
@@ -633,12 +696,12 @@ class YoloGrasp:
         if not self._set_perception(True):
             return False, "感知节点未响应（识别未开启，放弃）"
         try:
-            # 2. 等待停稳后新位姿下的第一帧检测结果
-            start = time.time()
-            while self.latest_target is None and time.time() - start < 5.0:
-                time.sleep(0.05)
+            # 2. 默认（预备）位姿等 5s 检测；检测不到则遍历观察位姿，
+            #    哪个位姿检测到就在哪个位姿继续抓取
+            if not self._wait_target(5.0):
+                self._search_observe_poses()
             if self.latest_target is None:
-                ok, msg = False, "开启识别后 5s 内未检测到目标"
+                ok, msg = False, "所有位姿均未检测到目标"
             else:
                 ok, msg = self._grasp_impl()
         finally:
@@ -671,9 +734,9 @@ class YoloGrasp:
             return False, "目标采样不足"
         print(f"1. 目标点(基座系): [{obj[0]:.4f}, {obj[1]:.4f}, {obj[2]:.4f}]")
 
-        # 1.5 补拍精定位：移动到更陡的视角重拍一次，
+        # 1.5 补拍精定位（仅桌面模式）：移动到更陡的视角重拍一次，
         # 修正"检测点随视角在物体表面滑动"导致的高度/水平偏差
-        if RESHOOT_ENABLED:
+        if RESHOOT_ENABLED and GRASP_MODE != 'hanging':
             new_obj = self._reshoot_refine(obj)
             if new_obj is not None:
                 obj = new_obj
@@ -684,6 +747,10 @@ class YoloGrasp:
                 # 先回预备位姿再走正常抓取流程
                 print("   [补拍] 回预备位姿...")
                 self.go_ready()
+
+        # 悬挂模式：走专用流程（下托包络 + 拉拽摘取，不用力控下探）
+        if GRASP_MODE == 'hanging':
+            return self._grasp_hanging(obj)
 
         # 1. 抓取点 = 目标点 + 夹爪定义的偏移
         g_off = gripper.grasp_offset_world
@@ -819,6 +886,89 @@ class YoloGrasp:
             return False, "退回超时（物体可能已夹住，注意检查）"
 
         print(f"======= 抓取完成 [{gripper.name}] =======\n")
+        return True, "抓取完成"
+
+    # ---------------- 悬挂抓取（室内挂果） ----------------
+    def _grasp_hanging(self, obj):
+        """悬挂果实抓取（侧抓）：法兰面朝世界 X+ 水平伸出，手心朝世界左，
+        从右侧包住果实 → 闭合 → 下拉摘取 → 退回。
+        不用力控下探：果实无桌面支撑，一碰就让，力建立不起来。"""
+        gripper = self.gripper
+        print(f"\n--- 悬挂抓取流程 [{gripper.name}] ---")
+
+        # 抓取姿态（固定）：法兰面（法兰Z）= 世界 X+，手沿 X+ 水平伸出；
+        # 手心（法兰Y）= 世界左（Y+），从右侧包住果实
+        z = WORLD_X_IN_BASE / np.linalg.norm(WORLD_X_IN_BASE)
+        y = WORLD_Y_IN_BASE / np.linalg.norm(WORLD_Y_IN_BASE)
+        x = np.cross(y, z)
+        grasp_rot = np.column_stack([x, y, z])
+        print(f"   法兰面(法兰Z): {np.round(z, 3)}  "
+              f"手心(法兰Y): {np.round(y, 3)}")
+
+        L = gripper.tool_length
+        # 掌心 = 目标点右侧（手心朝左对着果实）+ 竖直微调
+        grasp_tip = (obj - HANG_PALM_SIDE * y
+                     - HANG_PALM_BELOW * V_UP_IN_BASE)
+        pre_tip = grasp_tip - HANG_PRE_DIST * z           # 预抓取：X- 后方
+        reach_flange = grasp_tip - L * z
+        pre_flange = pre_tip - L * z
+
+        dist = float(np.linalg.norm(pre_flange - np.array([0, 0, SHOULDER_Z])))
+        if dist > ARM_REACH:
+            return False, f"目标不可达（距肩关节 {dist:.2f}m）"
+
+        self.spin(10)
+        q_guess = self.robot.get_joint_positions()
+        if q_guess is None:
+            return False, "无法获取当前关节角"
+        joint_target = cs66_inverse_kinematics(pre_flange, grasp_rot, q_guess)
+        if joint_target is None:
+            return False, "IK 解算失败"
+        fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
+        pos_err = float(np.linalg.norm(fk_pos - pre_flange))
+        rot_err = math.degrees(float(
+            Rot.from_matrix(fk_rot.T @ grasp_rot).magnitude()))
+        print(f"   IK: 位置误差 {pos_err*1000:.1f}mm, 方向误差 {rot_err:.2f}°")
+        if pos_err > 0.02 or rot_err > 5.0:
+            return False, (f"IK 误差过大（位置 {pos_err*1000:.1f}mm，"
+                           f"方向 {rot_err:.2f}°）")
+
+        # 1. 张开，movej 到侧后方预抓取点
+        print("1. 张开，movej 到预抓取点...")
+        gripper.open()
+        time.sleep(0.5)
+        self.send_movej(joint_target)
+        if not self.wait_motion_done():
+            return False, "movej 运动超时"
+
+        # 2. movel 水平前伸到托取位
+        print("2. movel 前伸下托...")
+        if not self.send_movel_keep_orientation(reach_flange, v=0.03):
+            return False, "无法读取当前位姿"
+        if not self.wait_motion_done():
+            return False, "movel 前伸超时"
+
+        # 3. 闭合（无桌面，直接握紧即可）
+        print(f"3. 闭合 [{gripper.name}]...")
+        gripper.close()
+        time.sleep(gripper.close_delay)
+
+        # 4. 摘取：movel 下拉拽断果柄
+        print("4. 摘取（下拉）...")
+        cur = np.array(self.robot.get_tcp_pose()[0])
+        if not self.send_movel_keep_orientation(
+                cur - HANG_DETACH_PULL * V_UP_IN_BASE, v=0.03):
+            return False, "摘取失败（无法读取位姿，物体可能已夹住）"
+        self.wait_motion_done()
+
+        # 5. movel 退回预抓取点
+        print("5. movel 退回...")
+        if not self.send_movel_keep_orientation(pre_flange):
+            return False, "退回失败（物体可能已夹住）"
+        if not self.wait_motion_done():
+            return False, "退回超时（物体可能已夹住，注意检查）"
+
+        print(f"--- 悬挂抓取完成 [{gripper.name}] ---\n")
         return True, "抓取完成"
 
     def home(self):

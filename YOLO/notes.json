@@ -1,0 +1,45 @@
+{
+  "categories": [
+    {
+      "id": 0,
+      "name": "apple"
+    },
+    {
+      "id": 1,
+      "name": "avacado"
+    },
+    {
+      "id": 2,
+      "name": "banana"
+    },
+    {
+      "id": 3,
+      "name": "guava"
+    },
+    {
+      "id": 4,
+      "name": "kiwi"
+    },
+    {
+      "id": 5,
+      "name": "mango"
+    },
+    {
+      "id": 6,
+      "name": "orange"
+    },
+    {
+      "id": 7,
+      "name": "peach"
+    },
+    {
+      "id": 8,
+      "name": "pineapple"
+    }
+  ],
+  "info": {
+    "year": 2025,
+    "version": "1.0",
+    "contributor": "Label Studio"
+  }
+}
