@@ -107,6 +107,15 @@ FORCE_RELIEF_THRESHOLD = 2.0  # 闭合挤压力阈值（N，力变化模长）
 FORCE_RELIEF_STEP = 0.004     # 每次卸力上抬 4mm
 FORCE_RELIEF_MAX = 0.02       # 卸力累计上抬上限 2cm
 
+# 补拍精定位：首次估计后移动相机到更陡的视角再拍一次，用第二次结果抓取。
+# 相机在臂展允许内尽量抬高（俯角大则检测点高度误差小），光轴对准首次估计点。
+RESHOOT_ENABLED = True
+RESHOOT_DIST = 0.40           # 相机到目标的拍照距离（米）
+RESHOOT_ELEVATIONS = [90, 70, 55]  # 俯角候选（度），逐个尝试直到 IK 可达
+RESHOOT_SETTLE = 0.8          # 到位后停稳时间（秒）
+# 手眼标定文件（与感知节点同一份），用于把相机位姿换算成法兰位姿
+HAND_EYE_JSON = os.path.join(os.path.dirname(__file__), 'hand_eye_result.json')
+
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
 HOME2_JOINTS = [-0.0384, 0.3438, -2.7018, -1.5062, 1.6424, 1.4696]
@@ -158,6 +167,20 @@ class YoloGrasp:
         self.latest_force_time = 0.0
         self.robot.create_subscription(
             WrenchStamped, FT_TOPIC, self._ft_cb, 10)
+
+        # ---- 手眼标定（补拍位姿规划用：相机系→法兰系）----
+        self.T_cam_to_tool = None
+        if os.path.exists(HAND_EYE_JSON):
+            try:
+                import json as _json
+                with open(HAND_EYE_JSON) as f:
+                    calib = _json.load(f)
+                self.T_cam_to_tool = np.eye(4)
+                self.T_cam_to_tool[:3, :3] = np.array(calib['R_cam2tool'])
+                self.T_cam_to_tool[:3, 3] = np.array(
+                    calib['t_cam2tool']).flatten()
+            except Exception as e:
+                print(f"读取手眼标定 {HAND_EYE_JSON} 失败: {e}（补拍将禁用）")
 
         # 按需识别开关（感知节点默认关闭识别，抓取前才临时开启）
         self.perception_enable_cli = self.robot.create_client(
@@ -488,6 +511,91 @@ class YoloGrasp:
             return None
         return self.latest_target.copy()
 
+    # ---------------- 补拍精定位 ----------------
+    def _plan_reshoot_pose(self, obj):
+        """规划补拍关节角：相机在目标上方尽量陡的位置，光轴对准 obj。
+        按 RESHOOT_ELEVATIONS 俯角候选逐个尝试（臂展不够直上直下时
+        自动降级），返回关节角或 None。"""
+        if self.T_cam_to_tool is None:
+            return None
+        tcp = self.robot.get_tcp_pose()
+        if tcp is None:
+            return None
+        # 水平方向取"目标指向当前相机一侧"：移动量小、臂展压力小
+        h = np.array(tcp[0]) - obj
+        h = h - (h @ V_UP_IN_BASE) * V_UP_IN_BASE
+        if np.linalg.norm(h) < 1e-3:
+            h = WORLD_X_IN_BASE.copy()
+        h = h / np.linalg.norm(h)
+        q_guess = self.robot.get_joint_positions()
+        if q_guess is None:
+            return None
+        T_tool_cam = np.linalg.inv(self.T_cam_to_tool)
+        for el in RESHOOT_ELEVATIONS:
+            elr = math.radians(el)
+            cam_pos = obj + RESHOOT_DIST * (
+                math.sin(elr) * V_UP_IN_BASE + math.cos(elr) * h)
+            z = obj - cam_pos
+            z /= np.linalg.norm(z)          # 光轴对准目标
+            x = WORLD_X_IN_BASE - (WORLD_X_IN_BASE @ z) * z
+            if np.linalg.norm(x) < 1e-3:
+                continue
+            x /= np.linalg.norm(x)
+            y = np.cross(z, x)
+            T_cam = np.eye(4)
+            T_cam[:3, :3] = np.column_stack([x, y, z])
+            T_cam[:3, 3] = cam_pos
+            T_fl = T_cam @ T_tool_cam       # 相机位姿 → 法兰位姿
+            joints = cs66_inverse_kinematics(T_fl[:3, 3], T_fl[:3, :3], q_guess)
+            if joints is None:
+                continue
+            fk_pos, fk_rot = cs66_forward_kinematics(joints)
+            pos_err = float(np.linalg.norm(fk_pos - T_fl[:3, 3]))
+            rot_err = math.degrees(float(
+                Rot.from_matrix(fk_rot.T @ T_fl[:3, :3]).magnitude()))
+            if pos_err > 0.02 or rot_err > 5.0:
+                continue
+            if np.linalg.norm(T_fl[:3, 3]
+                              - np.array([0, 0, SHOULDER_Z])) > ARM_REACH:
+                continue
+            print(f"   [补拍] 俯角 {el}° 可达，IK误差 "
+                  f"{pos_err*1000:.1f}mm/{rot_err:.1f}°")
+            return joints
+        return None
+
+    def _reshoot_refine(self, obj):
+        """移动到补拍位姿重新检测目标。成功返回新目标点，失败返回 None
+        （调用方退回用首次估计，流程不死）。移动过机械臂时置
+        self._reshoot_moved，调用方负责抓前回预备位姿。"""
+        self._reshoot_moved = False
+        joints = self._plan_reshoot_pose(obj)
+        if joints is None:
+            print("   [补拍] 所有俯角候选不可达，沿用首次估计")
+            return None
+        print("   [补拍] 移动到补拍位姿...")
+        self._reshoot_moved = True
+        self.send_movej(joints)
+        if not self.wait_motion_done():
+            print("   [补拍] 移动超时，沿用首次估计")
+            return None
+        time.sleep(RESHOOT_SETTLE)
+        # 等补拍位姿下的新检测帧
+        self.latest_target = None
+        start = time.time()
+        while self.latest_target is None and time.time() - start < 3.0:
+            time.sleep(0.05)
+        if self.latest_target is None:
+            print("   [补拍] 补拍位姿下未检测到目标，沿用首次估计")
+            return None
+        new_obj = self.get_stable_target()
+        if new_obj is None:
+            print("   [补拍] 补拍采样不足，沿用首次估计")
+            return None
+        diff = float(np.linalg.norm(new_obj - obj))
+        print(f"   [补拍] 精定位 [{np.round(new_obj, 4)}]，"
+              f"与首次估计差 {diff*1000:.1f}mm")
+        return new_obj
+
     def _set_perception(self, enabled: bool) -> bool:
         """开关感知节点的按需识别。返回服务是否调用成功。"""
         if not self.perception_enable_cli.wait_for_service(timeout_sec=2.0):
@@ -562,6 +670,20 @@ class YoloGrasp:
             print("目标采样不足（感知帧率过低或窗口内目标丢失次数过多）")
             return False, "目标采样不足"
         print(f"1. 目标点(基座系): [{obj[0]:.4f}, {obj[1]:.4f}, {obj[2]:.4f}]")
+
+        # 1.5 补拍精定位：移动到更陡的视角重拍一次，
+        # 修正"检测点随视角在物体表面滑动"导致的高度/水平偏差
+        if RESHOOT_ENABLED:
+            new_obj = self._reshoot_refine(obj)
+            if new_obj is not None:
+                obj = new_obj
+                print(f"1'. 精定位目标点(基座系): [{obj[0]:.4f}, "
+                      f"{obj[1]:.4f}, {obj[2]:.4f}]")
+            if getattr(self, '_reshoot_moved', False):
+                # 从拍照位姿直接 IK 预抓取点容易出翻转/奇异解，
+                # 先回预备位姿再走正常抓取流程
+                print("   [补拍] 回预备位姿...")
+                self.go_ready()
 
         # 1. 抓取点 = 目标点 + 夹爪定义的偏移
         g_off = gripper.grasp_offset_world
