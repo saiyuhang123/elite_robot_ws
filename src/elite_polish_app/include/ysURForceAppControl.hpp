@@ -1,6 +1,7 @@
 #ifndef ysUR_ForceAppControl_HPP
 #define ysUR_ForceAppControl_HPP
 
+#include <chrono>
 #include <vector>
 #include <mutex>
 #include "rclcpp/rclcpp.hpp"
@@ -11,6 +12,7 @@
 #include "std_msgs/msg/string.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "eli_common_interface/srv/force_mode.hpp"
 
 #include <Eigen/Geometry>
 #include <kdl/chainfksolverpos_recursive.hpp>
@@ -79,6 +81,8 @@ namespace elite_robot {
             void polish_endPolishtool();
             void polish_goBackHome();
             void polish_waitBackHome();
+            void sendEnableForceModeRequest();
+            bool disableForceMode();
 
             void goHome();
             void goHome_pubMoveHome();
@@ -105,6 +109,16 @@ namespace elite_robot {
             int control_dt_index_;
             bool debug_skip_force_contact_ = false;//调试空跑: 402免接触、404力控旁路
             double contact_fz_threshold_ = -16.0;//402接触判定阈值(N)
+            bool use_force_mode_ = true;//控制器内建力控(startForceMode)开关
+            double force_mode_wrench_z_ = -3.0;//力控目标力z(N, 压入工件=负, 与传感器约定一致)
+            double force_mode_z_vel_limit_ = 0.005;//力控z轴最大调整速度(m/s)
+            bool force_mode_enabled_ = false;//当前力控是否已开启
+            // 异步使能力控: 单线程 executor 内同步等 future 会死锁(响应处理不到),
+            // 改为 async_send_request + 响应回调置 done, 主流程逐拍轮询。
+            bool force_mode_enable_pending_ = false;//已发送请求, 等待响应中
+            bool force_mode_enable_done_ = false;//响应已收到
+            bool force_mode_enable_ok_ = false;//响应结果
+            std::chrono::steady_clock::time_point force_mode_enable_start_;//等待超时看门狗
             bool debug_approach_started_ = false;//空跑平滑接近状态
             KDL::JntArray debug_approach_target_q_;//空跑接近目标关节角
             double debug_approach_time_ = 4.0;//空跑接近轨迹时长(s)
@@ -183,6 +197,7 @@ namespace elite_robot {
             //vision
             rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr vision_job_publisher_;  
             rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr vision_pose_sub_; 
+            rclcpp::Client<eli_common_interface::srv::ForceMode>::SharedPtr force_mode_client_;
             //agv
             rclcpp::Publisher<std_msgs::msg::String>::SharedPtr agv_cmd_publisher_;  
             rclcpp::Subscription<std_msgs::msg::String>::SharedPtr agv_status_sub_;  

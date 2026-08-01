@@ -1,0 +1,12 @@
+# Enable/disable robot built-in force control mode (SDK startForceMode/endForceMode).
+# enable=true  -> startForceMode(reference_frame, selection_vector, wrench, mode, limits)
+# enable=false -> endForceMode()  (reference_frame/selection_vector/wrench/mode/limits ignored)
+bool enable
+float64[6] reference_frame    # [X,Y,Z,Rx,Ry,Rz] of force frame relative to base (rad, RPY)
+int32[6] selection_vector     # 0/1 per axis: 1 = compliant (force controlled)
+float64[6] wrench             # target force/torque [Fx,Fy,Fz,Mx,My,Mz] (robot applies to environment)
+int32 mode                    # 0=FIX 1=POINT 2=MOTION
+float64[6] limits             # max TCP speed on compliant axes [Vx,Vy,Vz,Wx,Wy,Wz]
+---
+bool success
+string message

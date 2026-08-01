@@ -37,8 +37,9 @@ private:
     auto goal = FollowJT::Goal();
     goal.trajectory = *msg;
 
-    RCLCPP_INFO(this->get_logger(), "Forwarding trajectory with %zu points",
-      msg->points.size());
+    // 流式打磨每 40ms 一个 goal, 该日志会刷屏, 注释掉(需要时开 DEBUG 级别)
+    // RCLCPP_DEBUG(this->get_logger(), "Forwarding trajectory with %zu points",
+    //   msg->points.size());
 
     auto send_goal_options = rclcpp_action::Client<FollowJT>::SendGoalOptions();
     // goal 被拒绝（如 time_from_start 非递增、关节名不匹配）时必须可见，否则表现为"不动且无报错"
@@ -54,8 +55,11 @@ private:
       [this](const GoalHandleFollowJT::WrappedResult & result) {
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           RCLCPP_INFO(this->get_logger(), "Trajectory succeeded");
+        } else if (result.code == rclcpp_action::ResultCode::ABORTED) {
+          // 流式打磨时新 goal 抢占旧 goal, 旧 goal 以 ABORTED(code 5)结束, 属正常现象,
+          // 每 40ms 刷屏, 直接注释掉
+          // RCLCPP_DEBUG(this->get_logger(), "Trajectory preempted (code: %d)", (int)result.code);
         } else {
-          // 流式打磨时新 goal 抢占旧 goal，旧 goal 会以 ABORTED 结束，降级为 WARN
           RCLCPP_WARN(this->get_logger(), "Trajectory finished with code: %d", (int)result.code);
         }
       };

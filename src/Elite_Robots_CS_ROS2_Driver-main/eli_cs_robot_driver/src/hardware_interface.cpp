@@ -396,6 +396,60 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
         return hardware_interface::CallbackReturn::ERROR;
     }
 
+    // Expose SDK force control mode (startForceMode/endForceMode) as a ROS service.
+    // The script command connection is owned by eli_driver_, so the service server
+    // must live in this process. A dedicated node + executor thread is used because
+    // ros2_control hardware interfaces have no node handle in Humble.
+    try {
+        force_mode_node_ = std::make_shared<rclcpp::Node>("force_mode_server");
+        force_mode_service_ = force_mode_node_->create_service<eli_common_interface::srv::ForceMode>(
+            // 显式全限定名，避免嵌入式节点在 controller_manager 进程内
+            // 服务名解析成 /set_force_mode（丢失节点前缀）导致客户端找不到
+            "/force_mode_server/set_force_mode",
+            [this](const std::shared_ptr<eli_common_interface::srv::ForceMode::Request> req,
+                   std::shared_ptr<eli_common_interface::srv::ForceMode::Response> res) {
+                if (!eli_driver_) {
+                    res->success = false;
+                    res->message = "driver not initialized";
+                    return;
+                }
+                try {
+                    if (req->enable) {
+                        ELITE::vector6d_t reference_frame, wrench, limits;
+                        ELITE::vector6int32_t selection_vector;
+                        for (size_t i = 0; i < 6; ++i) {
+                            reference_frame[i] = req->reference_frame[i];
+                            selection_vector[i] = req->selection_vector[i];
+                            wrench[i] = req->wrench[i];
+                            limits[i] = req->limits[i];
+                        }
+                        const bool ok = eli_driver_->startForceMode(
+                            reference_frame, selection_vector, wrench,
+                            static_cast<ELITE::ForceMode>(req->mode), limits);
+                        force_mode_started_ = ok;
+                        res->success = ok;
+                        res->message = ok ? "startForceMode sent" : "startForceMode failed (robot not connected?)";
+                    } else {
+                        const bool ok = eli_driver_->endForceMode();
+                        force_mode_started_ = force_mode_started_ && !ok;
+                        res->success = ok;
+                        res->message = ok ? "endForceMode sent" : "endForceMode failed (robot not connected?)";
+                    }
+                } catch (const ELITE::EliteException& e) {
+                    res->success = false;
+                    res->message = std::string("force mode exception: ") + e.what();
+                }
+            });
+        force_mode_executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+        force_mode_executor_->add_node(force_mode_node_);
+        force_mode_thread_ = std::make_unique<std::thread>([this]() { force_mode_executor_->spin(); });
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Force mode service ready: /force_mode_server/set_force_mode");
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Failed to create force mode service: %s", e.what());
+    }
+
     // Timeout before the reverse interface will be dropped by the robot
     recv_timeout_ = std::stof(info_.hardware_parameters["robot_receive_timeout"]);
 
@@ -416,6 +470,14 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_activate
 hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_cleanup(const rclcpp_lifecycle::State& previous_state) {
     (void)previous_state;
     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Stopping ...please wait...");
+
+    if (force_mode_thread_) {
+        force_mode_executor_->cancel();
+        force_mode_thread_->join();
+        force_mode_thread_.reset();
+    }
+    force_mode_executor_.reset();
+    force_mode_node_.reset();
 
     if (async_thread_) {
         async_thread_alive_ = false;

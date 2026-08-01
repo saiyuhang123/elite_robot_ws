@@ -32,6 +32,18 @@ ysURForceAppControl:
     # 2026-08-01: 接触力平均窗口。20≈0.16s(125Hz)，原 200 滞后~1.6s 过冲严重。
     wrench_average_count: 20
 
+    # ---- 控制器内建力控（2026-08-02 起，startForceMode）----
+    # true=接触后调用 startForceMode，z 向恒力由机器人控制器内部闭环完成，
+    # 404 不再做 ±0.5mm bang-bang 位置修正（根治刚性板往复振荡）。
+    # false=回退旧的 404 bang-bang 修正（仅调试用）。
+    use_force_mode: true
+    # 力控目标力 z(N)。与传感器读数约定一致(压入工件=负)。
+    # wrench 与 get_tcp_force 同约定(施加给环境的力)，实测压入=force.z 负 → -3.0。
+    # 若真机表现是"越压越深/越退越轻"，再把符号反过来，只改这里。
+    force_mode_wrench_z: -3.0
+    # 力控 z 轴允许的最大调整速度(m/s)，防过冲；可先按接触逼近速度量级(0.005)试。
+    force_mode_z_vel_limit: 0.005
+
     # ---- 力传感器重力补偿（2026-08-01 起为参数，换负载只改这里）----
     # 实测驱动端负载识别只做当前姿态归零，非全姿态补偿；此处为真实工具重力模型：
     # tool_gravity = m*g*(世界系向下在base系方向)；tool_gcenter = 工具质心(m)。

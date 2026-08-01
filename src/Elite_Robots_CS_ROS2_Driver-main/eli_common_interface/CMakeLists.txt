@@ -19,6 +19,7 @@ rosidl_generate_interfaces(
   "srv/SetIO.srv"
   "srv/SetSpeedSliderFraction.srv"
   "srv/SetPayload.srv"
+  "srv/ForceMode.srv"
   "msg/RobotMode.msg"
   "msg/TaskStatus.msg"
   "msg/SafetyMode.msg"

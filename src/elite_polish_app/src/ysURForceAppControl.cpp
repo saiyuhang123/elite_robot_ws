@@ -7,6 +7,7 @@
 #include <kdl/chainfksolverpos_recursive.hpp>
 #include <list>
 #include <chrono>
+#include <future>
 #include <eli_common_interface/srv/set_io.hpp>
 
 namespace elite_robot {
@@ -34,6 +35,14 @@ namespace elite_robot {
           // 2026-08-01: 402 接触下压每控制周期步进(m)。原 0.01 在 40ms 周期下接近速度约 250mm/s，
           // 接触冲击过大触发示教器报警；0.001 = 1mm/周期 ≈ 25mm/s 慢压。
           contact_step_ = this->declare_parameter<double>("contact_step", 0.001);
+          // 2026-08-02: 控制器内建力控(startForceMode)。true=404 不再自己做 ±0.5mm
+          // bang-bang 修正，z 向恒力由机器人控制器内部闭环完成。
+          use_force_mode_ = this->declare_parameter<bool>("use_force_mode", true);
+          // 力控目标力 z(N)。wrench 与 get_tcp_force 同约定(施加给环境的力)，
+          // 实测压入工件=force.z 负 → 默认取 target_fz_(负)；方向反了再改符号。
+          force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", target_fz_);
+          // 力控 z 轴允许的最大调整速度(m/s)，防过冲。
+          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.005);
           control_dt_count_ = 10;//todo, n*4ms for timer
           // 调试/工艺参数（ROS 参数，可在 launch 中覆盖）:
           // debug_skip_force_contact=true 时空跑: 402 免接触直接过、404 力控旁路
@@ -224,6 +233,8 @@ namespace elite_robot {
             ys_wrench_sub_ = this->create_subscription<geometry_msgs::msg::WrenchStamped>(       
                 "/force_torque_sensor_broadcaster/wrench", 1, std::bind(&ysURForceAppControl::ys_subWrenchCB, this, _1)); 
             ys_contact_wrench_publisher_ = this->create_publisher<geometry_msgs::msg::WrenchStamped>("ys_contact_fts_broadcaster/wrench", 1); 
+            // 控制器内建力控服务（驱动硬件接口暴露）
+            force_mode_client_ = this->create_client<eli_common_interface::srv::ForceMode>("/force_mode_server/set_force_mode");
             // //tool
             // ys_polishtool_client_ = this->create_client<std_srvs::srv::SetBool>("ys_polishtool_setting"); //todo
             //timer
@@ -867,6 +878,86 @@ namespace elite_robot {
           }
         }
       }
+
+      void ysURForceAppControl::sendEnableForceModeRequest() {
+        if (!use_force_mode_ || force_mode_enabled_ || force_mode_enable_pending_) {
+          return;
+        }
+        if (!force_mode_client_) {
+          RCLCPP_ERROR(this->get_logger(), "force mode client not created");
+          force_mode_enable_pending_ = true;
+          force_mode_enable_done_ = true;
+          force_mode_enable_ok_ = false;
+          return;
+        }
+        if (!force_mode_client_->service_is_ready()) {
+          if (!force_mode_client_->wait_for_service(std::chrono::seconds(1))) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "force mode service /force_mode_server/set_force_mode not available");
+            force_mode_enable_pending_ = true;
+            force_mode_enable_done_ = true;
+            force_mode_enable_ok_ = false;
+            return;
+          }
+        }
+        auto req = std::make_shared<eli_common_interface::srv::ForceMode::Request>();
+        req->enable = true;
+        // 力控参考系 = 接触瞬间的 tool0 位姿(相对 base)。直线打磨工具姿态恒定，
+        // FIX 模式固定参考系即可保证 z 轴始终沿打磨头轴线(压紧方向)。
+        double rx = 0.0, ry = 0.0, rz = 0.0;
+        ys_curP_tcp_.M.GetRPY(rx, ry, rz);
+        req->reference_frame = {ys_curP_tcp_.p.x(), ys_curP_tcp_.p.y(), ys_curP_tcp_.p.z(), rx, ry, rz};
+        req->selection_vector = {0, 0, 1, 0, 0, 0};  // 仅 z 轴(打磨头轴线)力控
+        req->wrench = {0, 0, force_mode_wrench_z_, 0, 0, 0};
+        req->mode = 0;  // FIX: 力控坐标系 = 参考坐标系
+        req->limits = {0, 0, force_mode_z_vel_limit_, 0, 0, 0};
+        RCLCPP_INFO(this->get_logger(),
+                    "force mode enable request sent: ref(x,y,z,rx,ry,rz)=(%.4f,%.4f,%.4f,%.3f,%.3f,%.3f) Fz=%.2f vlim=%.4f",
+                    req->reference_frame[0], req->reference_frame[1], req->reference_frame[2],
+                    req->reference_frame[3], req->reference_frame[4], req->reference_frame[5],
+                    force_mode_wrench_z_, force_mode_z_vel_limit_);
+        // 异步发送: 单线程 executor 不能在这里同步等 future(会死锁)，
+        // 响应由 executor 在回调间处理, 置 done 标志, 402 主流程逐拍轮询。
+        force_mode_client_->async_send_request(
+            req,
+            [this](rclcpp::Client<eli_common_interface::srv::ForceMode>::SharedFuture future) {
+              try {
+                auto res = future.get();
+                force_mode_enable_ok_ = res->success;
+                if (!res->success) {
+                  RCLCPP_ERROR(this->get_logger(), "enable force mode failed: %s", res->message.c_str());
+                }
+              } catch (const std::exception& e) {
+                force_mode_enable_ok_ = false;
+                RCLCPP_ERROR(this->get_logger(), "enable force mode exception: %s", e.what());
+              }
+              force_mode_enable_done_ = true;
+              RCLCPP_INFO(this->get_logger(), "force mode enable response received, ok=%d",
+                          (int)force_mode_enable_ok_);
+            });
+        force_mode_enable_pending_ = true;
+        force_mode_enable_done_ = false;
+        force_mode_enable_start_ = std::chrono::steady_clock::now();
+      }
+
+      bool ysURForceAppControl::disableForceMode() {
+        if (!force_mode_enabled_) {
+          return true;
+        }
+        force_mode_enabled_ = false;
+        force_mode_enable_pending_ = false;
+        if (!force_mode_client_ || !force_mode_client_->service_is_ready()) {
+          // 服务不可用(驱动重启等)时直接清状态，不阻塞退刀
+          return false;
+        }
+        auto req = std::make_shared<eli_common_interface::srv::ForceMode::Request>();
+        req->enable = false;
+        // 不等待响应(单线程 executor 会死锁), 命令发出即视为已处理
+        force_mode_client_->async_send_request(req);
+        RCLCPP_INFO(this->get_logger(), "force mode disable request sent");
+        return true;
+      }
+
       void ysURForceAppControl::polish_doForceContact() {
         if (sub_step_ == 402 ) 
         {
@@ -906,6 +997,34 @@ namespace elite_robot {
             }
             return;
           }
+
+          // 力控使能请求已发出: 等待响应(响应回调由 executor 处理, 不阻塞本回调)
+          if (force_mode_enable_pending_) {
+            if (!force_mode_enable_done_) {
+              // 看门狗: 等待超过 3s 视为失败
+              auto elapsed = std::chrono::steady_clock::now() - force_mode_enable_start_;
+              if (elapsed > std::chrono::seconds(3)) {
+                force_mode_enable_pending_ = false;
+                RCLCPP_ERROR(this->get_logger(), "enable force mode: response timeout, polish aborted");
+                app_cmd_ = AppCommand::NOTHING;
+                sub_step_ = 9999;
+              }
+              return;
+            }
+            force_mode_enable_pending_ = false;
+            if (!force_mode_enable_ok_) {
+              RCLCPP_ERROR(this->get_logger(), "enable force mode failed, polish aborted");
+              app_cmd_ = AppCommand::NOTHING;
+              sub_step_ = 9999;
+              return;
+            }
+            force_mode_enabled_ = true;
+            RCLCPP_INFO(this->get_logger(), "force mode ENABLED");
+            RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
+            sub_step_++;
+            return;
+          }
+
           bool touch = false;
 
           //start up point
@@ -1011,8 +1130,24 @@ namespace elite_robot {
             RCLCPP_INFO(this->get_logger()," ys offsetFrame, x: %f, y: %f, z: %f", 
             offsetFrame.p.data[0], offsetFrame.p.data[1], offsetFrame.p.data[2]);
             frame_forceadjust_base_ = offsetFrame * frame_forceadjust_base_;
-            RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
-            sub_step_++;
+            // 2026-08-02: 接触后开启控制器内建力控，后续 z 向恒力交给控制器闭环
+            if (use_force_mode_) {
+              // 异步发送使能请求, 不阻塞; 响应到达后下一控制拍推进到 403
+              sendEnableForceModeRequest();
+              if (force_mode_enable_pending_) {
+                RCLCPP_INFO(this->get_logger(), "contact done, waiting for force mode enable response");
+                return;
+              }
+              // 发送失败(服务不可用等) 已在 sendEnableForceModeRequest 内置失败标志,
+              // 下一拍 pending 分支会中止, 这里也直接中止
+              RCLCPP_ERROR(this->get_logger(), "enable force mode request failed, polish aborted");
+              app_cmd_ = AppCommand::NOTHING;
+              sub_step_ = 9999;
+              return;
+            } else {
+              RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
+              sub_step_++;
+            }
           }
         }
       }
@@ -1028,6 +1163,8 @@ namespace elite_robot {
         if (sub_step_ == 405
         ) {
           ysPolishTool_Close();
+          // 退刀前关闭力控，406 抬刀回到纯位置控制
+          disableForceMode();
           RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
             sub_step_++;
         }
@@ -1132,8 +1269,8 @@ namespace elite_robot {
           KDL::Frame  curFrame, tmpFrame, moveFrame;
           curFrame = ys_curP_tcp_;
           double k=0,dz;
-          if (debug_skip_force_contact_) {
-            k = 0;  // 调试空跑: 力控旁路，轨迹不叠加力调整
+          if (debug_skip_force_contact_ || (use_force_mode_ && force_mode_enabled_)) {
+            k = 0;  // 调试空跑 / 控制器内建力控: 轨迹不叠加 z 力调整(z 由控制器闭环)
           } else if (fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)<force_deadband_) {
             k=0;
           } else {
@@ -1179,6 +1316,7 @@ namespace elite_robot {
                 RCLCPP_INFO(this->get_logger()," polish job break");
                 RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
                 sub_step_++;
+                disableForceMode();
                 //init
                 frame_forceadjust_base_.p = KDL::Vector(0,0,0);
                 frame_forceadjust_base_.M = KDL::Rotation::RPY(0, 0, 0);
@@ -1187,8 +1325,9 @@ namespace elite_robot {
                 polishcurve_yindex_=0;
                 return;
               } else {
-                RCLCPP_INFO(this->get_logger()," curve polish target %d target, %f, %f, %f, %f, %f, %f", i+1,
-                  ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
+                // 每控制周期(40ms)打印目标关节角会刷屏, 注释掉(需要时开 DEBUG 级别)
+                // RCLCPP_DEBUG(this->get_logger()," curve polish target %d target, %f, %f, %f, %f, %f, %f", i+1,
+                //   ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
               }
               lastQ = ys_resultJnt;
             } else {
@@ -1208,7 +1347,9 @@ namespace elite_robot {
           //pub
           ys_traj_publisher_->publish(ys_goal);   
 
-          if ((tmpFrame.p-curFrame.p).Norm()<0.001) {
+          // 力控模式下 z 由控制器闭环调整, 实际位姿与名义路径点可能有偏差,
+          // 不再用到位距离判断进度, 直接按控制周期推进。
+          if (force_mode_enabled_ || (tmpFrame.p-curFrame.p).Norm()<0.001) {
             //update index
             if (polishcurve_step_index_==polishcurve_step_count_){
               if (sidepolish_step_index_==sidepolish_step_count_){
@@ -1246,6 +1387,8 @@ namespace elite_robot {
       }
 
       void ysURForceAppControl::goHome() {
+        // 防御: 若力控仍开着(异常中止后回Home), 先关掉, 避免位置控制与力控打架
+        disableForceMode();
         switch (sub_step_)
         {
         case 0://AppCommand::GO_HOME*100

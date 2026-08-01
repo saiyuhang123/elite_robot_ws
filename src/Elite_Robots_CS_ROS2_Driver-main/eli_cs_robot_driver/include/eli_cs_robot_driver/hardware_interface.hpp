@@ -10,10 +10,18 @@
 
 // ROS
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp/macros.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <rclcpp_lifecycle/state.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
+// Messages
+#include <eli_common_interface/srv/force_mode.hpp>
+
+// System
+#include <thread>
 
 // ros2_control hardware_interface
 #include <hardware_interface/visibility_control.h>
@@ -170,6 +178,15 @@ class EliteCSPositionHardwareInterface : public hardware_interface::SystemInterf
     double freedrive_async_success_;
     double freedrive_start_cmd_;
     double freedrive_end_cmd_;
+
+    // Force mode (SDK startForceMode/endForceMode) service.
+    // Created inside the hardware interface because the SDK script command
+    // connection (script_command_port) is owned by eli_driver_.
+    std::shared_ptr<rclcpp::Node> force_mode_node_;
+    std::shared_ptr<rclcpp::Service<eli_common_interface::srv::ForceMode>> force_mode_service_;
+    std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> force_mode_executor_;
+    std::unique_ptr<std::thread> force_mode_thread_;
+    bool force_mode_started_ = false;
 
     // transform stuff
     tf2::Vector3 tcp_force_;
