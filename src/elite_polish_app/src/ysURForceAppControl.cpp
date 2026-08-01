@@ -94,13 +94,18 @@ namespace elite_robot {
           ys_average_wrench_.force = KDL::Vector(0,0,0);
           ys_average_wrench_.torque = KDL::Vector(0,0,0);
           ys_first_wrench_ = true;
-          // 重力补偿参数（保持为零！）:
-          // 示教器负载识别(1.478kg)后 Elite 控制器已在驱动端补偿重力——实测装工具原始读数仅 ~1N，
-          // 而代码内补偿后去皮值达 -11.8N（双重补偿）。故驱动端补偿已足够，此处不再补偿。
-          // 若日后确认驱动端未补偿，再填: ys_tool_gravity_ = m*g*(世界系向下在 base 系方向)，
-          // 即 (10.7654, -0.1738, -9.6917)，ys_tool_gcenter_ = (-0.05632, 0.01936, -0.01986)。
-          ys_tool_gravity_ = KDL::Vector(0.0, 0.0, 0.0);
-          ys_tool_gcenter_ = KDL::Vector(0.0, 0.0, 0.0);
+          // 重力补偿参数（2026-08-01 起为 yaml 参数 tool_gravity/tool_gcenter）:
+          // 实测驱动端负载识别只做"当前姿态归零(tare)"，非全姿态重力补偿——
+          // 三姿态原始读数 0~14N 随姿态变化。代码内补偿 = 真实工具重力模型
+          // (m*g*世界系向下在base系方向)，配合启动 bias 可抵消 tare 残留。
+          // 默认值 = 2026-07-27 负载识别: 1.478kg 含打磨机+相机。
+          auto get_grav = [this](const std::string& name, std::vector<double> def) {
+            return this->declare_parameter<std::vector<double>>(name, def);
+          };
+          auto grav = get_grav("tool_gravity", {10.7654, -0.1738, -9.6917});
+          auto gcen = get_grav("tool_gcenter", {-0.05632, 0.01936, -0.01986});
+          ys_tool_gravity_ = KDL::Vector(grav[0], grav[1], grav[2]);
+          ys_tool_gcenter_ = KDL::Vector(gcen[0], gcen[1], gcen[2]);
           // Bias will be auto-calibrated from first 200 samples
           ys_bias_wrench_.force = KDL::Vector(0.0, 0.0, 0.0);
           ys_bias_wrench_.torque = KDL::Vector(0.0, 0.0, 0.0);
@@ -532,37 +537,35 @@ namespace elite_robot {
       }
 
       KDL::Frame ysURForceAppControl::calcCurvePolishPoint(int stepindex, int yindex){
+        // 2026-08-01 直线打磨: 工件板面为平面，扫掠改为固定高度直线。
+        // 起止点 x = R*sin(π+ry) 在 start/end_ry 处的值（与圆弧版扫掠端点一致，
+        // 扫掠长度仍由 polishcurve_start/end_ry_deg 控制）；z 恒为 center_dz - R；
+        // 姿态恒为 RPY(0,0,0)（tool z 始终沿平面法向，不再随圆弧旋转）。
         KDL::Frame target;
-        double start_ry = 0; 
-        double end_ry = 0; 
-        if (0 == yindex%2) {
-          start_ry = polishcurve_start_ry_;
-          end_ry = polishcurve_end_ry_;
-        } else {
-          start_ry = polishcurve_end_ry_;
-          end_ry = polishcurve_start_ry_;
+        double start_x = polishcurve_radius_ * sin(M_PI + polishcurve_start_ry_);
+        double end_x   = polishcurve_radius_ * sin(M_PI + polishcurve_end_ry_);
+        if (1 == yindex%2) {  // 之字形: 偶数道 start→end, 奇数道 end→start
+          double tmp = start_x; start_x = end_x; end_x = tmp;
         }
-        double ry = start_ry + stepindex *(end_ry - start_ry) / polishcurve_step_count_;
-        target.p.data[0] = polishcurve_radius_ * sin(M_PI + ry);
+        target.p.data[0] = start_x + stepindex*(end_x - start_x) / polishcurve_step_count_;
         target.p.data[1] = polishproduct_width_/2-(0.5+yindex)*(polishproduct_width_/polishcurve_ycount_);
-        target.p.data[2] = polishcurve_center_dz_ + polishcurve_radius_ * cos(M_PI + ry);
-        target.M = KDL::Rotation::RPY(0, ry, 0);
+        target.p.data[2] = polishcurve_center_dz_ + polishcurve_radius_ * cos(M_PI);  // = center_dz - R
+        target.M = KDL::Rotation::RPY(0, 0, 0);
         // RCLCPP_INFO(this->get_logger(), "Y %d polishcurve %d: x %f ; y %f ; z %f",yindex, stepindex, target.p.data[0], target.p.data[1], target.p.data[2]);
 
         return target;
       }
       KDL::Frame ysURForceAppControl::calcSidePolishPoint(int sideindex, int yindex){
+        // 换道段: x 保持在当前道扫掠末端不动，y 从当前道平移到下一道，z/姿态恒定。
         KDL::Frame target;
-        double ry = 0; 
-        if (0 == yindex%2) {
-          ry = polishcurve_end_ry_;
-        } else {
-          ry = polishcurve_start_ry_;
+        double end_x = polishcurve_radius_ * sin(M_PI + polishcurve_end_ry_);
+        if (1 == yindex%2) {  // 奇数道结束在 start_x 端
+          end_x = polishcurve_radius_ * sin(M_PI + polishcurve_start_ry_);
         }
-        target.p.data[0] = polishcurve_radius_ * sin(M_PI + ry);
+        target.p.data[0] = end_x;
         target.p.data[1] = polishproduct_width_/2-(0.5+yindex+(1.0*sideindex/sidepolish_step_count_))*(polishproduct_width_/polishcurve_ycount_);
-        target.p.data[2] = polishcurve_center_dz_ + polishcurve_radius_ * cos(M_PI + ry);
-        target.M = KDL::Rotation::RPY(0, ry, 0);
+        target.p.data[2] = polishcurve_center_dz_ + polishcurve_radius_ * cos(M_PI);  // = center_dz - R
+        target.M = KDL::Rotation::RPY(0, 0, 0);
         // RCLCPP_INFO(this->get_logger(), "Y %d polishside %d: x %f ; y %f ; z %f", yindex, sideindex, target.p.data[0], target.p.data[1], target.p.data[2]);
 
         return target;
@@ -1322,5 +1325,3 @@ namespace elite_robot {
 
     }
 }
-
-
