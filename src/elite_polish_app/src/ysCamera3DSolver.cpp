@@ -265,6 +265,10 @@ namespace elite_robot {
         calcFrame.curve_center_dz = curve_center_dz_;
         calcFrame.curve_tool_offset = curve_tool_offset_;
         calcFrame.curve_y_offset = curve_y_offset_;
+        // 2026-08-01: 工具姿态世界水平化（板面垂直但拟合平面倾斜时启用）
+        calcFrame.tool_align_world = this->declare_parameter<bool>("tool_align_world", false);
+        auto wup = this->declare_parameter<std::vector<double>>("world_up_in_base", {-0.7431, 0.0120, 0.6691});
+        calcFrame.world_up_in_base = Eigen::Vector3f(wup[0], wup[1], wup[2]);
         Eigen::Matrix4f result;
         if (!calcFrame.calc(base_cloud_, result)) {
           RCLCPP_ERROR(this->get_logger(),
@@ -385,5 +389,4 @@ namespace elite_robot {
 
     }
 }
-
 

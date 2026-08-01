@@ -76,6 +76,10 @@ class YsPCLCalcTransform
     double curve_center_dz = 1.89539;
     double curve_tool_offset = 0.18;   // 打磨头伸出法兰长度(m)
     double curve_y_offset = 0.1;
+    // 2026-08-01: 工具姿态世界水平化。板面物理垂直但拟合平面因相机/手眼畸变倾斜时，
+    // 强制工具轴 = 世界X+(水平)、扫掠 = 世界Y(水平)、换道 = 世界Z(竖直)。
+    bool tool_align_world = false;
+    Eigen::Vector3f world_up_in_base{-0.7431, 0.0120, 0.6691};
 
     void getTargetCloud() {
       std::cout<<"base cloud size "<<baseCloud_->points.size()<<std::endl;
@@ -260,6 +264,24 @@ class YsPCLCalcTransform
       mid.y = (min.y+max.y)/2;
       mid.z = (min.z+max.z)/2;
       std::cout<<"curve frame bbox x ["<<min.x<<","<<max.x<<"] y ["<<min.y<<","<<max.y<<"] z ["<<min.z<<","<<max.z<<"]"<<std::endl;
+
+      if (tool_align_world) {
+        // 世界水平化参考系: 轨迹点 = p_new + x*WY + y*WZ + z_line*WX。
+        // 工具尖端在 z_line 处贴 c_base(弧面中心), 法兰 = 表面 - tool_offset*WX。
+        Eigen::Vector3f wup = world_up_in_base; wup.normalize();
+        Eigen::Vector3f wy = Eigen::Vector3f(0,1,0) - (Eigen::Vector3f(0,1,0).dot(wup))*wup; wy.normalize();
+        Eigen::Vector3f wx = wy.cross(wup);              // 世界 X+ 在 base 系 = 工具压入方向
+        Eigen::Vector3f midO_b = planeFrame_.block<3,1>(0,3);
+        Eigen::Vector3f c_base = planeFrame_.topLeftCorner<3,3>() * Eigen::Vector3f(mid.x, mid.y, mid.z) + midO_b;
+        float z_line = curve_center_dz - curve_radius;  // 轨迹 z 线高度(曲线系)
+        Eigen::Vector3f p_new = c_base - (z_line + curve_tool_offset) * wx;
+        Eigen::Matrix3f R_plane = planeFrame_.topLeftCorner<3,3>();
+        Eigen::Matrix3f R_world; R_world.col(0) = wy; R_world.col(1) = wup; R_world.col(2) = wx;
+        curveFrame_.setIdentity();
+        curveFrame_.topLeftCorner<3,3>() = R_plane.transpose() * R_world;
+        curveFrame_.block<3,1>(0,3) = R_plane.transpose() * (p_new - midO_b);
+        return;
+      }
 
       Eigen::Vector3f trans;
       trans(0) = mid.x;
