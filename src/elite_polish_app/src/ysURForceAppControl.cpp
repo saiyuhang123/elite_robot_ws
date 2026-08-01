@@ -28,6 +28,12 @@ namespace elite_robot {
           //init force control（参数见 config/polish_params.yaml）
           target_fz_ = this->declare_parameter<double>("target_fz", -8.0);//N
           adjust_dz_ = this->declare_parameter<double>("adjust_dz", 0.0003);//m
+          // 2026-08-01: 力控死区(N)。原写死 3N，target -3N 时死区覆盖(-6,0)N，
+          // 轻接触不修正导致"不贴合"；1.5N 让修正更主动。
+          force_deadband_ = this->declare_parameter<double>("force_deadband", 1.5);
+          // 2026-08-01: 402 接触下压每控制周期步进(m)。原 0.01 在 40ms 周期下接近速度约 250mm/s，
+          // 接触冲击过大触发示教器报警；0.001 = 1mm/周期 ≈ 25mm/s 慢压。
+          contact_step_ = this->declare_parameter<double>("contact_step", 0.001);
           control_dt_count_ = 10;//todo, n*4ms for timer
           // 调试/工艺参数（ROS 参数，可在 launch 中覆盖）:
           // debug_skip_force_contact=true 时空跑: 402 免接触直接过、404 力控旁路
@@ -88,7 +94,9 @@ namespace elite_robot {
           ys_contact_wrench_sensor_.torque = KDL::Vector(0,0,0);
           ys_contact_wrench_base_.force = KDL::Vector(0,0,0);
           ys_contact_wrench_base_.torque = KDL::Vector(0,0,0);
-          ys_contact_wrench_count = 200;
+          // 2026-08-01: 平均窗口 200→20(参数 wrench_average_count)。200 在 125Hz 下滞后 ~1.6s，
+          // 接触过冲严重；20 ≈ 0.16s，判定更快且仍平滑。
+          ys_contact_wrench_count = this->declare_parameter<int>("wrench_average_count", 20);
           ys_contact_wrench_arr.resize(ys_contact_wrench_count);
           ys_contact_wrench_index = 0;
           ys_average_wrench_.force = KDL::Vector(0,0,0);
@@ -583,7 +591,6 @@ namespace elite_robot {
         default:
           break;
         }
-
       }
       void ysURForceAppControl::agv_goHomeCommand() {
         // Elite: no AGV, skip immediately
@@ -913,14 +920,20 @@ namespace elite_robot {
           curFrame = ys_curP_tcp_;
           curFrame.M = startPos.M;
 
-          double dcontact = 0.01;
+          // 2026-08-01: 恢复简单逻辑——固定步长沿 tool z 逼近，直到力阈值判定接触。
+          // 不做任何位置推算(covered/remain): 框架深度不准时会提前把步长算成 0，
+          // 导致停在板面前。此逻辑不管板面实际在哪，一直压到力触发为止。
+          double dcontact = contact_step_;
+          int trajCount = 30*speed_level_;
+          RCLCPP_INFO(this->get_logger(),
+            "402 approach: step=%.5f forcez=%.3f", dcontact, ys_average_wrench_.force.data[2]);
           if ( ys_average_wrench_.force.data[2] < contact_fz_threshold_)
           // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
           //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
           //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
           //     )>fabs(dz_polish_startup_tool_))
           {
-            dcontact = -0.001;
+            dcontact = -contact_step_;
             touch = true;
             RCLCPP_INFO(this->get_logger()," contact delta d %f ", dcontact);
           }
@@ -942,8 +955,7 @@ namespace elite_robot {
           lastQ = ys_cur_q_;
           rclcpp::Duration deltaT(0, 1E9/125);
 
-          int trajCount=30*speed_level_;
-          for (size_t i = 0; i < trajCount; i++)
+          for (size_t i = 0; i < (size_t)trajCount; i++)
           {
             //ys_ik
             moveFrame.p = KDL::Vector(0,0,dcontact)*(i+1)/trajCount;//offset tool z 
@@ -1119,7 +1131,7 @@ namespace elite_robot {
           double k=0,dz;
           if (debug_skip_force_contact_) {
             k = 0;  // 调试空跑: 力控旁路，轨迹不叠加力调整
-          } else if (fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)<3) {
+          } else if (fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)<force_deadband_) {
             k=0;
           } else {
             k=fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)/(ys_contact_wrench_sensor_.force.data[2] - target_fz_);

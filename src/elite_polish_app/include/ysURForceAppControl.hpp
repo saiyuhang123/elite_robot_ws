@@ -100,6 +100,8 @@ namespace elite_robot {
             double target_fz_;
             double adjust_dz_;
             int control_dt_count_;//n*4ms for timer
+            double contact_step_;//402 接触下压每周期步进(m)
+            double force_deadband_;//404 力控死区(N)
             int control_dt_index_;
             bool debug_skip_force_contact_ = false;//调试空跑: 402免接触、404力控旁路
             double contact_fz_threshold_ = -16.0;//402接触判定阈值(N)
