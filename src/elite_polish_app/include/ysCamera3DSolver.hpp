@@ -73,6 +73,7 @@ namespace elite_robot {
             double plane_box_zmin_, plane_box_zmax_;
             double plane_ox_, plane_oy_, plane_xx_, plane_xy_, plane_yx_, plane_yy_;
             double curve_radius_, curve_center_dz_, curve_tool_offset_, curve_y_offset_;
+            int cloud_min_points_ = 100000;//点云最少点数门槛（低于则丢帧）
 
             //topic and service
             rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_; 

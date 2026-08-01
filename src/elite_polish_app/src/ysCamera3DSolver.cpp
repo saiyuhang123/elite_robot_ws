@@ -60,6 +60,7 @@ namespace elite_robot {
         curve_center_dz_ = getd("curve_center_dz", 1.89539);
         curve_tool_offset_ = getd("curve_tool_offset", 0.18);
         curve_y_offset_ = getd("curve_y_offset", 0.1);
+        cloud_min_points_ = this->declare_parameter<int>("cloud_min_points", 100000);
 
         //init app
           app_cmd_ = -1;
@@ -220,7 +221,8 @@ namespace elite_robot {
           pcl_conversions::toPCL(msg,pcl_pc2);
           eye_cloud_ = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
           pcl::fromPCLPointCloud2(pcl_pc2,*eye_cloud_);
-          if (eye_cloud_->size()<250000)  return;
+          // 点数门槛（ROS 参数 cloud_min_points）：Camport 约 23.7 万点，D435 约 40 万点
+          if ((int)eye_cloud_->size() < cloud_min_points_)  return;
 
           if (ys_first_q_==false&&ys_eye_fk_solver_!=nullptr)
           {

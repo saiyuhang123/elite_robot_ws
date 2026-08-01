@@ -24,7 +24,7 @@ ysURForceAppControl:
     polishcurve_center_dz: 1.89539  # 弧心 z 偏移(m)，与 radius 配对决定路径在圆弧系的高度
     polishcurve_start_ry_deg: -9.2  # 扫掠起始角(度)
     polishcurve_end_ry_deg: 9.2     # 扫掠结束角(度)
-    polishproduct_width: 0.2        # 打磨宽度(m)
+    polishproduct_width: 0.12        # 打磨宽度(m)，2026-07-31 新打磨板宽 15.5cm，留边距取 0.12
     polishcurve_ycount: 3           # 打磨道数(>=2 才出现之字形)
     dz_polish_startup_tool: -0.08   # 打磨预备点沿 tool z 抬高(m, 负值=远离工件)
     speed_level: 2                  # 速度等级(影响轨迹点数/时长)
@@ -43,34 +43,44 @@ ysURForceAppControl:
 ysCamera3DSolver:
   ros__parameters:
     template_file: /tmp/    # 调试点云保存路径前缀(模板配准代码已注释, 不加载模板)
+    # 点云最少点数门槛（低于则丢帧）：Camport 约 23.7 万点，D435 约 40 万点
+    cloud_min_points: 100000
 
     # ---- 手眼标定: tool0 -> 相机光学系 ----
     # 来源: biaoding/hand_eye_result.json (cv2.calibrateHandEye 的 R_cam2tool/t_cam2tool)
-    # 重新标定手眼后只需改这里！
-    handeye_rpy: [-0.063913, 0.009927, -1.552858]          # rad (R_cam2tool 换算)
-    handeye_translation: [-0.135488, 0.025233, 0.033736]   # m (t_cam2tool)
+    # 重新标定手眼后只需改这里！2026-07-31 更新: 已换 Camport(Percipio) 相机
+    handeye_rpy: [0.009141, 0.026441, -1.610494]            # rad (R_cam2tool 换算)
+    handeye_translation: [-0.127097, 0.046615, 0.083001]    # m (t_cam2tool)
 
     # ---- 大盒 (cs66_base_link 系, 工件整体包围盒) ----
-    # 2026-07-27 锚点法标定(竖直纸盒粘墙 32x20cm)。工件/治具变动后需重标。
-    target_box_min: [0.620, -0.250, 0.700]
-    target_box_max: [0.950,  0.120, 1.060]
+    # 2026-08-01 手动单帧法重标(碰板心+点云探针)。工件/治具变动后需重标。
+    target_box_min: [0.56, -0.30, 0.50]
+    target_box_max: [0.92,  0.30, 0.83]
 
     # ---- 三测点盒 (base_link 系, 拟合工件平面系) ----
     # 每盒 x/y 方向 ±5mm，z 方向贯通 [plane_box_z_range]。
     # 点序约定: X点必须在"离机器人更远"的位置, 使 法向=(X-O)×(Y-O) 指向工件内部！
-    plane_box_z_range: [0.78, 0.95]
-    plane_point_o: [0.705, -0.066]    # 原点测点 (x, y)
-    plane_point_x: [0.705,  0.054]    # X 轴测点(离机器人更远的那个!)
-    plane_point_y: [0.637, -0.072]    # Y 参考测点
+    plane_box_z_range: [0.50, 0.82]
+    plane_point_o: [0.6844, -0.0091]  # 原点测点 (x, y) = 打磨头碰板心
+    plane_point_x: [0.684,  0.111]    # X 轴测点(离机器人更远的那个!)
+    plane_point_y: [0.638, -0.015]    # Y 参考测点
 
     # ---- 圆弧盒 (工件平面系下, 圈打磨特征区域) ----
     # 2026-07-27 v2: 放大到罩住盒面四边(+2cm 余量)，使包围盒=盒的真实边缘，
     # 盒子面内移动(上下左右)时 trans 跟随——实现面内跟踪。
-    curve_box_min: [-0.18, -0.13, -0.02]
-    curve_box_max: [ 0.21,  0.13,  0.02]
+    # 2026-07-31: z 下限从 -0.02 抬到 -0.010（排除工件下方桌面的点），
+    # z 上限从 +0.02 扩到 +0.042（弧面顶部 z≈0.038，原值会切掉顶部）。
+    # 2026-08-01: y 下限从 -0.13 抬到 +0.015（排除地面：地面在平面系 y<0.015，
+    # 弧面 y 从 0.015 开始且其 min.z 在 y≈0.125 高端，裁底边不影响 trans(2)）；
+    # z 上限 +0.042 → +0.046 罩住弧面顶部。两个支撑块在圆弧盒外（平面系 x≈±0.24），不影响。
+    curve_box_min: [-0.18, 0.015, -0.010]
+    curve_box_max: [ 0.21,  0.13,  0.046]
 
     # ---- 圆弧坐标系常数 ----
     curve_radius: 0.9306       # 与状态机 polishcurve_radius 一致
     curve_center_dz: 1.89539   # 与状态机 polishcurve_center_dz 一致
     curve_tool_offset: 0.205    # 打磨头(含沙盘)沿 tool z 伸出法兰长度(m)，2026-07-27 平贴实测 0.205；法兰目标=表面-此值×法向
-    curve_y_offset: 0.1        # trans(1) = max.y - 此值
+    # 2026-08-01: 0.1 → 0.05。旧值按旧工件弧面 y 范围(-0.04~0.13)调，
+    # 新工件弧面 y 范围 [0.018, 0.128]，旧值导致打磨带整体偏低、第一道从弧面中间开始。
+    # 0.05 使三道 y≈0.118/0.078/0.038，第一道落在弧面上部（接近左上角）。
+    curve_y_offset: 0.05       # trans(1) = max.y - 此值

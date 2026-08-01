@@ -47,12 +47,15 @@ def generate_launch_description():
         ),
 
         # Vision solver (required for command 3 / vision job; missing it blocks sub_step 302/303)
+        # 2026-07-31: 相机已从 RealSense D435 换成 Camport(Percipio)，
+        # 点云话题重映射 /camera/depth/points；换回 RealSense 时删掉 remappings 即可。
         Node(
             package='elite_polish_app',
             executable='ysCamera3DSolver',
             name='ysCamera3DSolver',
             output='screen',
             parameters=[params_file],
+            remappings=[('/camera/camera/depth/color/points', '/camera/depth_registered/points')],
         ),
 
         # Interactive command line interface
