@@ -926,8 +926,11 @@ namespace elite_robot {
           double dcontact = contact_step_;
           int trajCount = 30*speed_level_;
           RCLCPP_INFO(this->get_logger(),
-            "402 approach: step=%.5f forcez=%.3f", dcontact, ys_average_wrench_.force.data[2]);
-          if ( ys_average_wrench_.force.data[2] < contact_fz_threshold_)
+            "402 approach: step=%.5f forcez_avg=%.3f forcez_inst=%.3f",
+            dcontact, ys_average_wrench_.force.data[2], ys_contact_wrench_sensor_.force.data[2]);
+          // 2026-08-01: 接触判定改用瞬时力(原平均窗口滞后 ~0.16s, 刚性板会多压 1~2mm
+          // 造成力尖峰触发示教器报警)；瞬时力噪声小(±0.1N), 阈值 2N 足够抗噪。
+          if ( ys_contact_wrench_sensor_.force.data[2] < contact_fz_threshold_)
           // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
           //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
           //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
@@ -990,7 +993,7 @@ namespace elite_robot {
           // RCLCPP_INFO(this->get_logger(),"pub contact start polish trajectory");
           ys_traj_publisher_->publish(ys_goal);   
 
-          if ( ys_average_wrench_.force.data[2] < contact_fz_threshold_)
+          if ( ys_contact_wrench_sensor_.force.data[2] < contact_fz_threshold_)
           // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
           //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
           //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
