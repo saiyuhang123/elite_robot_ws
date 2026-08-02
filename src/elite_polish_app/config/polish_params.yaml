@@ -55,12 +55,16 @@ ysURForceAppControl:
     force_mode_verify_tolerance: 0.6 # 传感器反作用力目标为-applied_Fz，允许误差(N)
     force_mode_verify_time: 0.5      # 连续在目标带内多久才开始打磨(s)
     force_mode_verify_timeout: 5.0   # 建立不了目标力则在切向运动前安全退出(s)
-    # 首行实测板面跟随补偿达到10.0mm，原10mm阈值在行末误触发；放宽到15mm并持续监控。
+    # 当前实机接触点与视觉名义路径存在约27mm差异，临时放宽至40mm继续验证。
     force_mode_max_axial_deviation: 0.040 # 实际TCP相对接触偏置后名义路径的最大轴向偏移(m)
     force_mode_monitor_log_period: 1.0    # 每秒输出实际力和轴向补偿，确认第二行反向时是否回落
-    force_mode_abort_fz: -5.0        # 相对反作用力过大立即退出力控(N)
+    force_mode_abort_fz: -5.0        # 20帧平均反作用力的持续过力阈值(N)
+    force_mode_hard_abort_fz: -15.0  # 单帧瞬时硬保护阈值(N)
+    force_mode_abort_confirm_time: 0.12 # 平均力越过-5N需要持续的时间(s)
     force_mode_min_contact_fz: -0.15 # 高于此值视为失去接触(N)
     force_mode_contact_loss_timeout: 2.0  # 连续失去接触多久后退出(s)
+    polish_tool_spinup_time: 1.0     # IO开启确认后原地稳压，期间不走切向轨迹(s)
+    polish_tool_io_timeout: 2.0      # 等待打磨头SetIO开启响应的超时(s)
 
     # ---- 力传感器重力补偿（2026-08-01 起为参数，换负载只改这里）----
     # 实测驱动端负载识别只做当前姿态归零，非全姿态补偿；此处为真实工具重力模型：

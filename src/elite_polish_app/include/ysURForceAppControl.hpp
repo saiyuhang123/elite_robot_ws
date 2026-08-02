@@ -153,7 +153,11 @@ namespace elite_robot {
             double force_mode_max_axial_deviation_ = 0.040;//相对名义轨迹最大轴向偏移(m)
             double force_mode_monitor_log_period_ = 1.0;//404 力/轴向补偿监控日志周期(s)
             std::chrono::steady_clock::time_point force_mode_monitor_last_log_;
-            double force_mode_abort_fz_ = -5.0;//相对力超过此负值立即退出力控(N)
+            double force_mode_abort_fz_ = -5.0;//平均相对力超过此负值持续确认后退出(N)
+            double force_mode_hard_abort_fz_ = -15.0;//单帧相对力硬保护阈值(N)
+            double force_mode_abort_confirm_time_ = 0.12;//平均过力持续确认时间(s)
+            bool force_mode_overforce_active_ = false;
+            std::chrono::steady_clock::time_point force_mode_overforce_start_;
             double force_mode_min_contact_fz_ = -0.15;//小于此值视为仍有接触(N)
             double force_mode_contact_loss_timeout_ = 2.0;//失去接触允许时间(s)
             KDL::Vector force_mode_axis_base_{0.0, 0.0, 1.0};
@@ -171,6 +175,13 @@ namespace elite_robot {
             KDL::Vector world_up_in_base_;//退刀: 世界系"上"在 base 系的方向(参数)
             double retract_lift_height_ = 0.15;//退刀: 世界系竖直抬刀高度(m)
             double retract_axial_distance_ = 0.03;//退刀: 先沿接触轴反向离开工件(m)
+            double polish_tool_spinup_time_ = 1.0;//打磨头开启确认后原地稳压时间(s)
+            double polish_tool_io_timeout_ = 2.0;//SetIO 开启响应超时(s)
+            bool polish_tool_open_pending_ = false;
+            bool polish_tool_open_done_ = false;
+            bool polish_tool_open_ok_ = false;
+            std::chrono::steady_clock::time_point polish_tool_open_request_start_;
+            std::chrono::steady_clock::time_point polish_tool_spinup_start_;
             //polish data
             KDL::Frame frame_polishcloud_base_;
             KDL::Frame frame_polishcloud_transform_;

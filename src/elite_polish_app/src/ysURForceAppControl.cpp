@@ -51,8 +51,13 @@ namespace elite_robot {
           force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.040);
           force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
           force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -5.0);
+          force_mode_hard_abort_fz_ = this->declare_parameter<double>("force_mode_hard_abort_fz", -15.0);
+          force_mode_abort_confirm_time_ = this->declare_parameter<double>(
+            "force_mode_abort_confirm_time", 0.12);
           force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
           force_mode_contact_loss_timeout_ = this->declare_parameter<double>("force_mode_contact_loss_timeout", 2.0);
+          polish_tool_spinup_time_ = this->declare_parameter<double>("polish_tool_spinup_time", 1.0);
+          polish_tool_io_timeout_ = this->declare_parameter<double>("polish_tool_io_timeout", 2.0);
           control_dt_count_ = 10;//todo, n*4ms for timer
           // 调试/工艺参数（ROS 参数，可在 launch 中覆盖）:
           // debug_skip_force_contact=true 时空跑: 402 免接触直接过、404 力控旁路
@@ -931,6 +936,10 @@ namespace elite_robot {
         contact_hold_started_ = false;
         contact_ik_failure_count_ = 0;
         force_mode_verify_stable_ = false;
+        force_mode_overforce_active_ = false;
+        polish_tool_open_pending_ = false;
+        polish_tool_open_done_ = false;
+        polish_tool_open_ok_ = false;
         debug_approach_started_ = false;
         control_dt_index_ = 0;
         frame_forceadjust_base_.p = KDL::Vector(0, 0, 0);
@@ -1213,6 +1222,7 @@ namespace elite_robot {
                 force_mode_last_contact_ = now;
                 force_mode_monitor_last_log_ = now;
                 force_mode_verify_stable_ = false;
+                force_mode_overforce_active_ = false;
                 RCLCPP_INFO(this->get_logger(),
                   "force mode VERIFIED: relative_fz=%.3f stable_for=%.2fs; sub step done: %d",
                   relative_fz, stable_for, sub_step_);
@@ -1389,9 +1399,53 @@ namespace elite_robot {
       void ysURForceAppControl::polish_startPolishtool() {
         if (sub_step_ == 403
         ) {
+          const KDL::Frame nominal_start = frame_forceadjust_base_
+            * frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
+
+          // 打磨头启动期间不发切向轨迹，但仍持续执行力、失联和轴向监控。
+          if (!forceModeWatchdog(nominal_start)) {
+            return;
+          }
+
+          if (!polish_tool_open_pending_ && !polish_tool_open_done_) {
             ysPolishTool_Open();
-            RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
-            sub_step_++;
+            return;
+          }
+
+          if (polish_tool_open_pending_ && !polish_tool_open_done_) {
+            const double wait_elapsed = std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - polish_tool_open_request_start_).count();
+            if (wait_elapsed > polish_tool_io_timeout_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "Polish tool open response timeout after %.2fs; polishing aborted", wait_elapsed);
+              polish_tool_open_pending_ = false;
+              disableForceMode();
+              sub_step_ = 405;
+            }
+            return;
+          }
+
+          if (!polish_tool_open_ok_) {
+            RCLCPP_ERROR(this->get_logger(), "Polish tool failed to open; polishing aborted");
+            disableForceMode();
+            sub_step_ = 405;
+            return;
+          }
+
+          const double spinup_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - polish_tool_spinup_start_).count();
+          if (spinup_elapsed < polish_tool_spinup_time_) {
+            return;
+          }
+
+          RCLCPP_INFO(this->get_logger(),
+            "Polish tool spin-up complete: stable_for=%.2fs; starting tangential trajectory",
+            spinup_elapsed);
+          polish_tool_open_pending_ = false;
+          polish_tool_open_done_ = false;
+          polish_tool_open_ok_ = false;
+          RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
+          sub_step_++;
         }
       }
       void ysURForceAppControl::polish_endPolishtool() {
@@ -1510,14 +1564,44 @@ namespace elite_robot {
 
         const auto now = std::chrono::steady_clock::now();
         const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
-        if (relative_fz <= force_mode_abort_fz_) {
+        const double relative_fz_avg = ys_average_wrench_.force.data[2] - contact_fz_zero_;
+
+        // 硬保护仍使用单帧力，真实冲击不等待滤波。
+        if (relative_fz <= force_mode_hard_abort_fz_) {
           RCLCPP_ERROR(this->get_logger(),
-            "force-mode watchdog: excessive contact force %.3f N (limit %.3f N)",
-            relative_fz, force_mode_abort_fz_);
+            "force-mode watchdog: instantaneous hard overforce %.3f N (limit %.3f N, avg=%.3f N)",
+            relative_fz, force_mode_hard_abort_fz_, relative_fz_avg);
           disableForceMode();
           publishCurrentPositionHold(contact_hold_time_);
           sub_step_ = 405;
           return false;
+        }
+
+        // 普通 -5N 阈值使用20帧滑动平均，并要求持续一小段时间，
+        // 避免打磨头电机启动振动的单次尖峰直接中止流程。
+        if (relative_fz_avg <= force_mode_abort_fz_) {
+          if (!force_mode_overforce_active_) {
+            force_mode_overforce_active_ = true;
+            force_mode_overforce_start_ = now;
+            RCLCPP_WARN(this->get_logger(),
+              "force-mode watchdog: averaged overforce candidate avg=%.3f N inst=%.3f N; confirming %.2fs",
+              relative_fz_avg, relative_fz, force_mode_abort_confirm_time_);
+          } else {
+            const double overforce_for = std::chrono::duration<double>(
+              now - force_mode_overforce_start_).count();
+            if (overforce_for >= force_mode_abort_confirm_time_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "force-mode watchdog: sustained averaged overforce %.3f N for %.2fs "
+                "(limit %.3f N, inst=%.3f N)",
+                relative_fz_avg, overforce_for, force_mode_abort_fz_, relative_fz);
+              disableForceMode();
+              publishCurrentPositionHold(contact_hold_time_);
+              sub_step_ = 405;
+              return false;
+            }
+          }
+        } else {
+          force_mode_overforce_active_ = false;
         }
 
         if (relative_fz <= force_mode_min_contact_fz_) {
@@ -1758,31 +1842,49 @@ namespace elite_robot {
       }
 
       void ysURForceAppControl::ysPolishTool_Open() {
+        polish_tool_open_pending_ = false;
+        polish_tool_open_done_ = false;
+        polish_tool_open_ok_ = false;
         if (!polish_tool_io_client_ || !polish_tool_io_client_->service_is_ready()) {
           RCLCPP_ERROR(this->get_logger(), "SetIO service not available for tool open");
+          polish_tool_open_done_ = true;
           return;
         }
         auto req = std::make_shared<eli_common_interface::srv::SetIO::Request>();
         req->fun = eli_common_interface::srv::SetIO::Request::FUN_SET_CONFIGURE_OUT;  // fun=2
         req->pin = 7;
         req->state = eli_common_interface::srv::SetIO::Request::STATE_ON;
+        polish_tool_open_pending_ = true;
+        polish_tool_open_request_start_ = std::chrono::steady_clock::now();
         polish_tool_io_client_->async_send_request(
           req,
           [this](rclcpp::Client<eli_common_interface::srv::SetIO>::SharedFuture future) {
+            if (!polish_tool_open_pending_) {
+              RCLCPP_WARN(this->get_logger(), "Ignoring stale polish tool open response");
+              return;
+            }
             try {
-              if (future.get()->success) {
+              polish_tool_open_ok_ = future.get()->success;
+              if (polish_tool_open_ok_) {
+                polish_tool_spinup_start_ = std::chrono::steady_clock::now();
                 RCLCPP_INFO(this->get_logger(), "Polish tool open confirmed: fun=2 pin=7 state=true");
               } else {
                 RCLCPP_ERROR(this->get_logger(), "Polish tool open rejected by SetIO service");
               }
             } catch (const std::exception & e) {
+              polish_tool_open_ok_ = false;
               RCLCPP_ERROR(this->get_logger(), "Polish tool open SetIO exception: %s", e.what());
             }
+            polish_tool_open_done_ = true;
           });
         RCLCPP_INFO(this->get_logger(), "Polish tool open command sent: fun=2 pin=7 state=true");
       }
 
       void ysURForceAppControl::ysPolishTool_Close() {
+        // 关闭命令使尚未返回的开启响应失效，避免退出后污染状态。
+        polish_tool_open_pending_ = false;
+        polish_tool_open_done_ = false;
+        polish_tool_open_ok_ = false;
         if (!polish_tool_io_client_ || !polish_tool_io_client_->service_is_ready()) {
           RCLCPP_ERROR(this->get_logger(), "SetIO service not available for tool close");
           return;
