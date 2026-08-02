@@ -61,6 +61,9 @@ namespace elite_robot {
         plane_fit_min_inlier_ratio_ = getd("plane_fit_min_inlier_ratio", 0.15);
         plane_fit_max_rms_ = getd("plane_fit_max_rms", 0.0025);
         plane_fit_max_normal_angle_deg_ = getd("plane_fit_max_normal_angle_deg", 10.0);
+        plane_fit_refit_enabled_ = this->declare_parameter<bool>("plane_fit_refit_enabled", true);
+        plane_fit_min_extent_x_ = getd("plane_fit_min_extent_x", 0.12);
+        plane_fit_min_extent_y_ = getd("plane_fit_min_extent_y", 0.10);
         curve_box_min_ = v4(getv3("curve_box_min", {-0.08, -0.14, -0.02}));
         curve_box_max_ = v4(getv3("curve_box_max", { 0.28,  0.24,  0.02}));
         curve_radius_ = getd("curve_radius", 0.9306);
@@ -74,11 +77,12 @@ namespace elite_robot {
 
         RCLCPP_INFO(this->get_logger(),
           "plane fit: enabled=%d dist=%.4fm iterations=%d min_inliers=%d min_ratio=%.2f "
-          "max_rms=%.4fm max_angle=%.1fdeg tool_align_world=%d",
+          "max_rms=%.4fm max_angle=%.1fdeg tool_align_world=%d refit=%d min_extent=%.2f/%.2fm",
           static_cast<int>(plane_fit_enabled_), plane_fit_distance_threshold_,
           plane_fit_max_iterations_, plane_fit_min_inliers_, plane_fit_min_inlier_ratio_,
           plane_fit_max_rms_, plane_fit_max_normal_angle_deg_,
-          static_cast<int>(tool_align_world_));
+          static_cast<int>(tool_align_world_), static_cast<int>(plane_fit_refit_enabled_),
+          plane_fit_min_extent_x_, plane_fit_min_extent_y_);
 
         //init app
           app_cmd_ = -1;
@@ -284,6 +288,9 @@ namespace elite_robot {
         calcFrame.plane_fit_min_inlier_ratio = plane_fit_min_inlier_ratio_;
         calcFrame.plane_fit_max_rms = plane_fit_max_rms_;
         calcFrame.plane_fit_max_normal_angle_deg = plane_fit_max_normal_angle_deg_;
+        calcFrame.plane_fit_refit_enabled = plane_fit_refit_enabled_;
+        calcFrame.plane_fit_min_extent_x = plane_fit_min_extent_x_;
+        calcFrame.plane_fit_min_extent_y = plane_fit_min_extent_y_;
         calcFrame.curve_box_min = curve_box_min_;
         calcFrame.curve_box_max = curve_box_max_;
         calcFrame.curve_radius = curve_radius_;

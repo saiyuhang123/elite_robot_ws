@@ -79,6 +79,9 @@ namespace elite_robot {
             double plane_fit_min_inlier_ratio_ = 0.15;
             double plane_fit_max_rms_ = 0.0025;
             double plane_fit_max_normal_angle_deg_ = 10.0;
+            bool plane_fit_refit_enabled_ = true;
+            double plane_fit_min_extent_x_ = 0.12;
+            double plane_fit_min_extent_y_ = 0.10;
             double curve_radius_, curve_center_dz_, curve_tool_offset_, curve_y_offset_;
             bool tool_align_world_ = false;
             Eigen::Vector3f world_up_in_base_{-0.7431, 0.0120, 0.6691};

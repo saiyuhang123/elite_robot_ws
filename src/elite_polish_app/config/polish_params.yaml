@@ -162,6 +162,11 @@ ysCamera3DSolver:
     plane_fit_min_inlier_ratio: 0.15    # 内点/target_box点数下限
     plane_fit_max_rms: 0.0025           # 拟合内点距离RMS上限(m)
     plane_fit_max_normal_angle_deg: 10.0 # 工件法向相对世界X+最大允许偏角
+    # 2026-08-02 鲁棒化: 板子挪动后固定裁剪框可能压到板边/杂物导致拟合歪。
+    # 第二遍在首遍内点上重拟合剔除离面污染; 内点只是一窄条(板边/棱)时判失败重拍。
+    plane_fit_refit_enabled: true       # 首遍拟合后再在内点上重拟合一遍
+    plane_fit_min_extent_x: 0.12        # 内点平面局部x(扫掠向)最小覆盖(m)
+    plane_fit_min_extent_y: 0.10        # 内点平面局部y(竖直向)最小覆盖(m)
 
     # plane_point_o 的 x/y 继续作为轨迹局部原点锚点，实际原点会投影到拟合平面。
     # 其余两个点只供 plane_fit_enabled=false 的旧三点法回退使用。

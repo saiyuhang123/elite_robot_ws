@@ -81,5 +81,31 @@ int main()
     std::cerr << "fitted normal sign flipped away from world X+" << std::endl;
     return 3;
   }
+
+  // 负例: 只有一条窄带(模拟板边/棱)时, 数量/比例/RMS 都能过,
+  // 必须被内点覆盖面校验拒绝(2026-08-02 新增)。
+  {
+    auto strip = std::make_shared<YsPCLCalcTransform::PointCloud>();
+    strip->reserve(6000);
+    for (int iu = -7; iu <= 7; ++iu) {          // x 向仅 ~0.02m 宽
+      for (int iv = -100; iv <= 100; ++iv) {
+        const float u = static_cast<float>(iu) * 0.0015f;
+        const float v = static_cast<float>(iv) * 0.0015f;
+        const float noise = 0.0003f * std::sin(0.31f * iu + 0.17f * iv);
+        const Eigen::Vector3f point = center + u * desired_x + v * desired_y
+          + noise * desired_normal;
+        strip->push_back(pcl::PointXYZ(point.x(), point.y(), point.z()));
+      }
+    }
+    strip->width = static_cast<std::uint32_t>(strip->size());
+    strip->height = 1;
+    strip->is_dense = true;
+    Eigen::Matrix4f strip_result = Eigen::Matrix4f::Identity();
+    if (solver.calc(strip, strip_result)) {
+      std::cerr << "narrow strip cloud should have been rejected by extent check" << std::endl;
+      return 4;
+    }
+    std::cout << "narrow strip cloud correctly rejected" << std::endl;
+  }
   return 0;
 }
