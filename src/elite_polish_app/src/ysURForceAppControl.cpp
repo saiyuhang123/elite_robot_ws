@@ -343,6 +343,11 @@ namespace elite_robot {
           sub_step_ = app_cmd_*100;
           break;
         case 3:
+          // 2026-08-02: 视觉+打磨命令也必须复位打磨状态。原只命令4复位，
+          // 导致第二次命令3沿用上次残留: 跳过402重新去皮(旧零点)、切向计时器
+          // 显示上次的elapsed、watchdog过力确认计时器残留致一过线即瞬间停摆。
+          disableForceMode();
+          resetForceContactState();
           app_cmd_ = AppCommand::DO_CAMERA_VISION_JOB;
           sub_step_ = app_cmd_*100;
           break;
