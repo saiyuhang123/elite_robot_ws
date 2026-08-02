@@ -111,7 +111,8 @@ FORCE_RELIEF_MAX = 0.02       # 卸力累计上抬上限 2cm
 
 # 补拍精定位：首次估计后移动相机到更陡的视角再拍一次，用第二次结果抓取。
 # 相机在臂展允许内尽量抬高（俯角大则检测点高度误差小），光轴对准首次估计点。
-RESHOOT_ENABLED = True
+# 2026-08-02 停用：耗时长且副作用多，恢复时改回 True 即可。
+RESHOOT_ENABLED = False
 RESHOOT_DIST = 0.40           # 相机到目标的拍照距离（米）
 RESHOOT_ELEVATIONS = [90, 70, 55]  # 俯角候选（度），逐个尝试直到 IK 可达
 RESHOOT_SETTLE = 0.8          # 到位后停稳时间（秒）
