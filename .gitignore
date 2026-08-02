@@ -145,3 +145,4 @@ core.*
 YOLO/fruit-detection-dataset/
 plane_trans.pcd
 curve_plane.pcd
+*.pcd

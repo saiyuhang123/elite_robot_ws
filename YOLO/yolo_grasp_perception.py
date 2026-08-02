@@ -55,9 +55,14 @@ class YoloGraspPerceptionNode(Node):
         # 目标类别集合（可通过 /yolo/target_class 话题动态修改）
         self.target_classes = set(DEFAULT_TARGET_CLASSES)
 
-        # 加载 YOLO 模型 (首次运行会自动下载 yolo11m.pt，可换成你自己的 pt 模型)
+        # 加载 YOLO 模型（YOLO-World 世界模型，开放词汇；可换成你自己的 pt 模型）
         self.get_logger().info('正在加载 YOLO 模型...')
-        self.yolo_model = YOLO('best_apple_1.pt')
+        self.yolo_model = YOLO('yolov8x-worldv2.pt')
+
+        # 保存模型默认类别（世界模型的默认 COCO 80 类），供“全部类别”时恢复
+        self._default_world_classes = list(self.yolo_model.names.values())
+        # 把目标类别作为世界模型提示词（开放词汇，只检测这些类别）
+        self._apply_world_classes()
 
         # 启动时预热一次推理（CUDA 初始化），避免首次开启识别时卡顿 30~60s
         self.get_logger().info('预热推理中（CUDA 初始化）...')
@@ -157,6 +162,32 @@ class YoloGraspPerceptionNode(Node):
         else:
             self.target_classes = {c.strip() for c in text.split(',') if c.strip()}
             self.get_logger().info(f'[目标类别] 已切换为: {self.target_classes}')
+        # 同步更新世界模型提示词，否则模型还在用旧的类别检测
+        self._apply_world_classes()
+
+    def _apply_world_classes(self):
+        """把当前目标类别同步给 YOLO-World 的提示词。
+        空集合（全部类别）= 恢复模型默认的 COCO 全部类别。"""
+        try:
+            if self.target_classes:
+                classes = sorted(self.target_classes)
+                log_text = f'提示词已设置为: {classes}'
+            else:
+                classes = list(self._default_world_classes)
+                log_text = '提示词已恢复为默认全部类别'
+            world = self.yolo_model.model
+            # 预热后 YOLO 会整体搬到 GPU，缓存的 CLIP 权重跟着搬但 device 属性
+            # 不会更新，导致文本在 CPU、权重在 GPU 的设备不一致。每次先丢弃重建，
+            # 让 CLIP 按 YOLO 当前设备重新加载。
+            if hasattr(world, 'clip_model'):
+                del world.clip_model
+            self.yolo_model.set_classes(classes)
+            # 提示词嵌入与 YOLO 模型保持同一设备
+            world.txt_feats = world.txt_feats.to(next(world.parameters()).device)
+            self.get_logger().info(f'[世界模型] {log_text}')
+        except Exception as e:
+            self.get_logger().warn(
+                f'[世界模型] 设置提示词失败（缺少 CLIP 依赖，使用模型默认类别）: {e}')
 
     # ---- 诊断辅助 ----
     def _mark(self, key):

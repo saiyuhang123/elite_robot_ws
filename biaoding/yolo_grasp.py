@@ -85,7 +85,7 @@ PRE_GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.10])
 
 # 抓取点整体下探偏移（世界系，米）：在目标点基础上再往下 0.5cm，
 # 桌面模式与悬挂模式都生效（沿世界"下"方向 -V_UP_IN_BASE 平移）
-GRASP_DOWN_OFFSET = 0.005
+GRASP_DOWN_OFFSET = 0.000
 
 # 目标新鲜度门限（调度集成：防止抓旧目标或移动中的目标）
 TARGET_MAX_AGE = 5.0        # 目标点最大龄期（秒），超龄视为无目标
@@ -119,7 +119,7 @@ RESHOOT_SETTLE = 0.8          # 到位后停稳时间（秒）
 HAND_EYE_JSON = os.path.join(os.path.dirname(__file__), 'hand_eye_result.json')
 
 # 抓取模式：'table'=桌面（力控下探）  'hanging'=悬挂（侧抓包络+拉拽摘取）
-GRASP_MODE = 'hanging'
+GRASP_MODE = 'table'
 HANG_PRE_DIST = 0.12       # 预抓取点在目标后方（世界 X- 方向，米）
 HANG_PALM_SIDE = 0.035      # 掌心在目标点右侧偏移（米，世界 Y-，手心朝左
                            # 从右侧包住果实；贴太紧调大、包不住调小）
@@ -127,14 +127,12 @@ HANG_PALM_BELOW = 0.0      # 掌心在目标点下方偏移（米，侧抓时一
 HANG_DETACH_PULL = 0.05    # 摘取下拉（米）
 HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，当前未启用）
 
-# 观察位姿：预备位姿 5s 内检测不到目标时，依次转到这些位姿找，
-# 检测到目标即停并在该位姿继续抓取
+# 观察位姿：预备位姿等待 OBSERVE_WAIT 秒仍检测不到目标时，
+# 转到该观察位姿寻找，检测到目标即停并在该位姿继续抓取
 OBSERVE_POSES = [
-    [-0.0384, 0.3438, -2.7018, -0.9128, 1.6424, 1.4696],
-    [-0.0384, 0.3438, -2.7018, -0.7034, 0.9791, 1.4696],
-    [-0.0384, 0.3438, -2.7018, -0.7034, 2.0612, 1.4696],
+    [-0.038397, 0.308923, -1.619919, -1.680604, 1.712094, 1.504874],
 ]
-OBSERVE_WAIT = 3.0         # 每个观察位姿等待检测的时间（秒）
+OBSERVE_WAIT = 3.0         # 观察位姿等待检测的时间（秒）
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
@@ -927,13 +925,13 @@ class YoloGrasp:
         gripper.close()
         time.sleep(gripper.close_delay)
 
-        # 4. 摘取：movel 下拉拽断果柄
-        print("4. 摘取（下拉）...")
-        cur = np.array(self.robot.get_tcp_pose()[0])
-        if not self.send_movel_keep_orientation(
-                cur - HANG_DETACH_PULL * V_UP_IN_BASE, v=0.03):
-            return False, "摘取失败（无法读取位姿，物体可能已夹住）"
-        self.wait_motion_done()
+        # 4. 摘取：movel 下拉拽断果柄（已注释：不需要下拉动作）
+        # print("4. 摘取（下拉）...")
+        # cur = np.array(self.robot.get_tcp_pose()[0])
+        # if not self.send_movel_keep_orientation(
+        #         cur - HANG_DETACH_PULL * V_UP_IN_BASE, v=0.03):
+        #     return False, "摘取失败（无法读取位姿，物体可能已夹住）"
+        # self.wait_motion_done()
 
         # 5. movel 退回预抓取点
         print("5. movel 退回...")
