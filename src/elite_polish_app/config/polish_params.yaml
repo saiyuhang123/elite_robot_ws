@@ -75,10 +75,9 @@ ysURForceAppControl:
     polishcurve_center_dz: 1.89539  # 弧心 z 偏移(m)，与 radius 配对决定路径在圆弧系的高度
     polishcurve_start_ry_deg: -9.2  # 扫掠起始角(度)
     polishcurve_end_ry_deg: 9.2     # 扫掠结束角(度)
-    # 2026-08-01: 打磨片直径 10cm、工件宽 15cm → width=0.15、ycount=2。
-    # 道间距 7.5cm < 10cm 盘径，全覆盖；3 道间距 4cm 重叠过大且第一道偏中。
+    # 当前试运行只打磨工件宽度中心的一行，完成后直接安全退刀返回。
     polishproduct_width: 0.15        # 打磨宽度(m) = 工件宽 15cm
-    polishcurve_ycount: 2            # 打磨道数(>=2 才出现之字形)
+    polishcurve_ycount: 1            # 单行打磨；目标行位于工件宽度中心
     dz_polish_startup_tool: -0.08   # 打磨预备点沿 tool z 抬高(m, 负值=远离工件)
     speed_level: 2                  # 速度等级(影响轨迹点数/时长)
 
