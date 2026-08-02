@@ -1594,6 +1594,21 @@ namespace elite_robot {
         RCLCPP_ERROR(this->get_logger(),
           "force-mode diag: reason=%s step=%d elapsed=%.2fs recent_fz=[%s]",
           reason.c_str(), last_polish_step_, elapsed, seq.c_str());
+        // 六维力诊断：停摆时输出工具系瞬时/20帧平均的完整力与力矩，以及 base 系合力。
+        // 部分停摆的冲击可能来自 Fx/Fy 或力矩（侧向力/振动耦合），不能只看 Fz。
+        RCLCPP_ERROR(this->get_logger(),
+          "force-mode diag six-axis: inst_f=(%.2f,%.2f,%.2f) inst_t=(%.2f,%.2f,%.2f) "
+          "avg_f=(%.2f,%.2f,%.2f) avg_t=(%.2f,%.2f,%.2f) base_f=(%.2f,%.2f,%.2f)",
+          ys_contact_wrench_sensor_.force.data[0], ys_contact_wrench_sensor_.force.data[1],
+          ys_contact_wrench_sensor_.force.data[2],
+          ys_contact_wrench_sensor_.torque.data[0], ys_contact_wrench_sensor_.torque.data[1],
+          ys_contact_wrench_sensor_.torque.data[2],
+          ys_average_wrench_.force.data[0], ys_average_wrench_.force.data[1],
+          ys_average_wrench_.force.data[2],
+          ys_average_wrench_.torque.data[0], ys_average_wrench_.torque.data[1],
+          ys_average_wrench_.torque.data[2],
+          ys_contact_wrench_base_.force.data[0], ys_contact_wrench_base_.force.data[1],
+          ys_contact_wrench_base_.force.data[2]);
       }
 
       bool ysURForceAppControl::forceModeWatchdog(const KDL::Frame &nominal_frame) {

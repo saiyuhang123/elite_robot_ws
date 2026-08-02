@@ -49,7 +49,7 @@ ysURForceAppControl:
     # SDK内部力与应用补偿/去皮后的relative_fz实测相差约1.1~1.2N：
     # SDK 0.5N -> relative约0N；SDK 2N -> relative约-0.85N。因此二者分开配置。
     force_mode_wrench_z: 3.0         # SDK内部施力目标；预计应用侧实际反作用力约-1.5~-2N
-    force_mode_z_vel_limit: 0.005    # 力控z轴最大调整速度: 0.5→2mm/s。
+    force_mode_z_vel_limit: 0.002    # 力控z轴最大调整速度: 0.5→2mm/s。
                                      # 原0.5mm/s追不上打磨切向运动造成的法向扰动(实测0.2s内力涨25~40N/s)，
                                      # 导致力控"来不及退让"、力涨到-10N触发保护。2mm/s起步，仍保留防过冲余量。
     # startForceMode返回只表示socket写入成功；实测力稳定到目标附近后才开始切向运动。
