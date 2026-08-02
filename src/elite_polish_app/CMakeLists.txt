@@ -99,6 +99,13 @@ if(BUILD_TESTING)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  add_executable(test_pcl_plane_fit
+    test/test_pcl_plane_fit.cpp)
+  target_link_libraries(test_pcl_plane_fit ${PCL_LIBRARIES})
+  add_test(NAME test_pcl_plane_fit COMMAND test_pcl_plane_fit)
+  set_tests_properties(test_pcl_plane_fit PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
 ament_package()

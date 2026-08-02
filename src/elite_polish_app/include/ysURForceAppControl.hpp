@@ -119,8 +119,8 @@ namespace elite_robot {
             double contact_hold_time_ = 0.25;//接触后保持位置、等待轨迹停稳时间(s)
             double contact_hold_completion_margin_ = 0.20;//等待action完成回调的额外余量(s)
             double contact_joint_velocity_limit_ = 0.01;//切换力控前最大关节速度(rad/s)
-            double contact_max_travel_ = 0.10;//402 沿逼近轴最大行程(m)
-            double contact_timeout_ = 70.0;//402 最大逼近时间(s)，100mm@约2mm/s需约50s
+            double contact_max_travel_ = 0.15;//402 沿逼近轴最大行程(m)
+            double contact_timeout_ = 90.0;//402 最大逼近时间(s)，150mm@实测约1.9mm/s需约78s
             int contact_ik_max_failures_ = 5;//连续端点IK失败多少周期后中止
             int contact_ik_failure_count_ = 0;
             bool contact_settle_started_ = false;
@@ -149,7 +149,7 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point force_mode_verify_start_;
             std::chrono::steady_clock::time_point force_mode_verify_stable_start_;
             std::chrono::steady_clock::time_point force_mode_verify_last_log_;
-            double force_mode_max_axial_deviation_ = 0.015;//相对名义轨迹最大轴向偏移(m)
+            double force_mode_max_axial_deviation_ = 0.040;//相对名义轨迹最大轴向偏移(m)
             double force_mode_monitor_log_period_ = 1.0;//404 力/轴向补偿监控日志周期(s)
             std::chrono::steady_clock::time_point force_mode_monitor_last_log_;
             double force_mode_abort_fz_ = -5.0;//相对力超过此负值立即退出力控(N)

@@ -48,7 +48,7 @@ namespace elite_robot {
           force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 0.6);
           force_mode_verify_time_ = this->declare_parameter<double>("force_mode_verify_time", 0.5);
           force_mode_verify_timeout_ = this->declare_parameter<double>("force_mode_verify_timeout", 5.0);
-          force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.015);
+          force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.040);
           force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
           force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -5.0);
           force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
@@ -67,8 +67,8 @@ namespace elite_robot {
           contact_hold_time_ = this->declare_parameter<double>("contact_hold_time", 0.25);
           contact_hold_completion_margin_ = this->declare_parameter<double>("contact_hold_completion_margin", 0.20);
           contact_joint_velocity_limit_ = this->declare_parameter<double>("contact_joint_velocity_limit", 0.01);
-          contact_max_travel_ = this->declare_parameter<double>("contact_max_travel", 0.10);
-          contact_timeout_ = this->declare_parameter<double>("contact_timeout", 70.0);
+          contact_max_travel_ = this->declare_parameter<double>("contact_max_travel", 0.15);
+          contact_timeout_ = this->declare_parameter<double>("contact_timeout", 90.0);
           contact_ik_max_failures_ = std::max(
             1, static_cast<int>(this->declare_parameter<int>("contact_ik_max_failures", 5)));
           debug_approach_time_ = this->declare_parameter<double>("debug_approach_time", 4.0);//空跑接近轨迹时长(s)

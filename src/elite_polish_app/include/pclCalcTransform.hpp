@@ -11,6 +11,9 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/crop_box.h>
 #include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/common/centroid.h>
+#include <cmath>
 
 class YsPCLCalcTransform
 {
@@ -68,6 +71,14 @@ class YsPCLCalcTransform
     double plane_ox = 0.590, plane_oy = -0.120;  // 原点测点
     double plane_xx = 0.670, plane_xy = -0.010;  // X 轴测点(离机器人更远!)
     double plane_yx = 0.590, plane_yy =  0.100;  // Y 参考测点
+    // RANSAC 平面拟合。约束法向接近世界 X+，避免把桌面等其它大平面误识别为工件面。
+    bool plane_fit_enabled = true;
+    double plane_fit_distance_threshold = 0.003;
+    int plane_fit_max_iterations = 1000;
+    int plane_fit_min_inliers = 1000;
+    double plane_fit_min_inlier_ratio = 0.15;
+    double plane_fit_max_rms = 0.0025;
+    double plane_fit_max_normal_angle_deg = 10.0;
     // 圆弧盒 (平面系)
     Eigen::Vector4f curve_box_min{-0.08, -0.14, -0.02, 1.0};
     Eigen::Vector4f curve_box_max{ 0.28,  0.24,  0.02, 1.0};
@@ -93,7 +104,165 @@ class YsPCLCalcTransform
       std::cout<<"target cloud size "<<targetCloud_->points.size()<<std::endl;
     }
 
+    Eigen::Vector3f expectedWorldX() const {
+      Eigen::Vector3f wup = world_up_in_base;
+      if (wup.norm() < 1e-6f) {
+        return Eigen::Vector3f::Zero();
+      }
+      wup.normalize();
+      Eigen::Vector3f world_y = Eigen::Vector3f(0, 1, 0)
+        - Eigen::Vector3f(0, 1, 0).dot(wup) * wup;
+      if (world_y.norm() < 1e-6f) {
+        return Eigen::Vector3f::Zero();
+      }
+      world_y.normalize();
+      Eigen::Vector3f world_x = world_y.cross(wup);
+      world_x.normalize();
+      return world_x;
+    }
+
     void getPlaneFrame() {
+      if (!plane_fit_enabled) {
+        std::cout<<"[plane fit] disabled, using legacy three-box frame"<<std::endl;
+        getPlaneFrameThreePoint();
+        return;
+      }
+
+      const Eigen::Vector3f expected_normal = expectedWorldX();
+      if (expected_normal.norm() < 1e-6f) {
+        std::cout<<"[plane fit] FAIL: invalid world_up_in_base"<<std::endl;
+        failed_ = true;
+        return;
+      }
+
+      pcl::SACSegmentation<pcl::PointXYZ> segmentation;
+      pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+      pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+      segmentation.setOptimizeCoefficients(true);
+      segmentation.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+      segmentation.setMethodType(pcl::SAC_RANSAC);
+      segmentation.setAxis(expected_normal);
+      segmentation.setEpsAngle(
+        plane_fit_max_normal_angle_deg * 3.14159265358979323846 / 180.0);
+      segmentation.setDistanceThreshold(plane_fit_distance_threshold);
+      segmentation.setMaxIterations(plane_fit_max_iterations);
+      segmentation.setInputCloud(targetCloud_);
+      segmentation.segment(*inliers, *coefficients);
+
+      if (coefficients->values.size() < 4 || inliers->indices.empty()) {
+        std::cout<<"[plane fit] FAIL: RANSAC found no constrained plane"<<std::endl;
+        failed_ = true;
+        return;
+      }
+
+      const double inlier_ratio = static_cast<double>(inliers->indices.size())
+        / static_cast<double>(targetCloud_->points.size());
+      if (static_cast<int>(inliers->indices.size()) < plane_fit_min_inliers
+          || inlier_ratio < plane_fit_min_inlier_ratio) {
+        std::cout<<"[plane fit] FAIL: insufficient inliers="<<inliers->indices.size()
+                 <<" ratio="<<inlier_ratio
+                 <<" required="<<plane_fit_min_inliers<<"/"<<plane_fit_min_inlier_ratio
+                 <<std::endl;
+        failed_ = true;
+        return;
+      }
+
+      Eigen::Vector3f normal(
+        coefficients->values[0], coefficients->values[1], coefficients->values[2]);
+      float normal_length = normal.norm();
+      if (normal_length < 1e-6f) {
+        std::cout<<"[plane fit] FAIL: zero normal"<<std::endl;
+        failed_ = true;
+        return;
+      }
+      normal /= normal_length;
+      float plane_d = coefficients->values[3] / normal_length;
+      if (normal.dot(expected_normal) < 0.0f) {
+        normal = -normal;
+        plane_d = -plane_d;
+      }
+
+      const float normal_dot = std::max(-1.0f,
+        std::min(1.0f, normal.dot(expected_normal)));
+      const double normal_angle_deg =
+        std::acos(normal_dot) * 180.0 / 3.14159265358979323846;
+      if (!std::isfinite(normal_angle_deg)
+          || normal_angle_deg > plane_fit_max_normal_angle_deg) {
+        std::cout<<"[plane fit] FAIL: normal angle="<<normal_angle_deg
+                 <<"deg exceeds "<<plane_fit_max_normal_angle_deg<<"deg"<<std::endl;
+        failed_ = true;
+        return;
+      }
+
+      double squared_distance_sum = 0.0;
+      PointCloud::Ptr fitted_plane(new PointCloud);
+      fitted_plane->reserve(inliers->indices.size());
+      for (const int index : inliers->indices) {
+        if (index < 0 || static_cast<size_t>(index) >= targetCloud_->points.size()) {
+          continue;
+        }
+        const auto &point = targetCloud_->points[static_cast<size_t>(index)];
+        const double distance = normal.x() * point.x + normal.y() * point.y
+          + normal.z() * point.z + plane_d;
+        squared_distance_sum += distance * distance;
+        fitted_plane->push_back(point);
+      }
+      if (fitted_plane->empty()) {
+        std::cout<<"[plane fit] FAIL: all inlier indices invalid"<<std::endl;
+        failed_ = true;
+        return;
+      }
+      const double rms = std::sqrt(
+        squared_distance_sum / static_cast<double>(fitted_plane->size()));
+      if (!std::isfinite(rms) || rms > plane_fit_max_rms) {
+        std::cout<<"[plane fit] FAIL: RMS="<<rms
+                 <<"m exceeds "<<plane_fit_max_rms<<"m"<<std::endl;
+        failed_ = true;
+        return;
+      }
+
+      Eigen::Vector4f centroid4;
+      pcl::compute3DCentroid(*fitted_plane, centroid4);
+      // 沿用原 plane_point_o 的 x/y 作为轨迹局部原点锚点，再正交投影到拟合平面，
+      // 这样现有 curve_box 的局部坐标范围不会因为改用内点质心而整体漂移。
+      Eigen::Vector3f origin_guess(
+        static_cast<float>(plane_ox), static_cast<float>(plane_oy), centroid4.z());
+      Eigen::Vector3f origin = origin_guess
+        - (normal.dot(origin_guess) + plane_d) * normal;
+
+      Eigen::Vector3f plane_y = world_up_in_base;
+      plane_y.normalize();
+      plane_y -= plane_y.dot(normal) * normal;
+      if (plane_y.norm() < 1e-6f) {
+        std::cout<<"[plane fit] FAIL: world-up projection degenerates"<<std::endl;
+        failed_ = true;
+        return;
+      }
+      plane_y.normalize();
+      Eigen::Vector3f plane_x = plane_y.cross(normal);
+      plane_x.normalize();
+      plane_y = normal.cross(plane_x);
+      plane_y.normalize();
+
+      Eigen::Matrix3f rotation;
+      rotation.col(0) = plane_x;  // 单行扫掠方向，接近世界 Y
+      rotation.col(1) = plane_y;  // 换道方向，接近世界竖直向上
+      rotation.col(2) = normal;   // 工具 Z+/压入方向，指向工件内部
+      planeFrame_.setIdentity();
+      planeFrame_.topLeftCorner<3,3>() = rotation;
+      planeFrame_.block<3,1>(0,3) = origin;
+
+      pcl::io::savePCDFileBinary("plane_fit_inliers.pcd", *fitted_plane);
+      Eigen::Vector3f rpy = rotation.eulerAngles(2, 1, 0);
+      std::cout<<"[plane fit] OK: inliers="<<fitted_plane->size()
+               <<"/"<<targetCloud_->size()<<" ratio="<<inlier_ratio
+               <<" RMS="<<rms<<"m angle_to_world_x="<<normal_angle_deg<<"deg"<<std::endl;
+      std::cout<<"[plane fit] normal_base=("<<normal.x()<<","<<normal.y()<<","<<normal.z()
+               <<") origin_base=("<<origin.x()<<","<<origin.y()<<","<<origin.z()<<")"<<std::endl;
+      std::cout<<"[plane fit] frame RPY=("<<rpy[2]<<","<<rpy[1]<<","<<rpy[0]<<")"<<std::endl;
+    }
+
+    void getPlaneFrameThreePoint() {
       // 三测点在工件平面上拉开大三角，盒 x/y ±5mm、z 贯通。
       // 点序约定: X测点必须在"离机器人更远"的位置，使 法向=(X-O)×(Y-O) 指向工件内部！
       //origin

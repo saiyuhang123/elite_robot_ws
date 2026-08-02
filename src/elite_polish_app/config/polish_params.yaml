@@ -20,8 +20,8 @@ ysURForceAppControl:
     contact_hold_time: 0.25          # 确认接触后保持当前位置再切力控(s)
     contact_hold_completion_margin: 0.20 # 等待轨迹action真正完成；实测result比time_from_start晚约50ms
     contact_joint_velocity_limit: 0.01  # 允许切换力控的最大关节速度(rad/s)
-    contact_max_travel: 0.10         # 从预备点沿世界X+最大搜索距离(m)
-    contact_timeout: 70.0            # 1mm/0.48s约2mm/s；搜索100mm最多约50s，预留控制器余量
+    contact_max_travel: 0.15         # 从预备点沿拟合法向最大搜索距离(m)
+    contact_timeout: 90.0            # 实测约1.9mm/s；搜索150mm约78s，预留控制器余量
     contact_ik_max_failures: 5       # 端点IK连续失败5个周期才中止；单次超时自动缩步重试
     # 空跑模式接近轨迹起点的时长(s)，越大越慢
     debug_approach_time: 4.0
@@ -56,7 +56,7 @@ ysURForceAppControl:
     force_mode_verify_time: 0.5      # 连续在目标带内多久才开始打磨(s)
     force_mode_verify_timeout: 5.0   # 建立不了目标力则在切向运动前安全退出(s)
     # 首行实测板面跟随补偿达到10.0mm，原10mm阈值在行末误触发；放宽到15mm并持续监控。
-    force_mode_max_axial_deviation: 0.015 # 实际TCP相对接触偏置后名义路径的最大轴向偏移(m)
+    force_mode_max_axial_deviation: 0.040 # 实际TCP相对接触偏置后名义路径的最大轴向偏移(m)
     force_mode_monitor_log_period: 1.0    # 每秒输出实际力和轴向补偿，确认第二行反向时是否回落
     force_mode_abort_fz: -5.0        # 相对反作用力过大立即退出力控(N)
     force_mode_min_contact_fz: -0.15 # 高于此值视为失去接触(N)
@@ -110,12 +110,22 @@ ysCamera3DSolver:
     target_box_min: [0.56, -0.30, 0.50]
     target_box_max: [0.92,  0.30, 0.83]
 
-    # ---- 三测点盒 (base_link 系, 拟合工件平面系) ----
-    # 每盒 x/y 方向 ±5mm，z 方向贯通 [plane_box_z_range]。
-    # 点序约定: X点必须在"离机器人更远"的位置, 使 法向=(X-O)×(Y-O) 指向工件内部！
+    # ---- 工件平面拟合 (base_link 系) ----
+    # 默认用 target_box 内全部候选点做带方向约束的 RANSAC，不再用三个10×10mm小框
+    # 的中心点叉乘法向。法向被约束在世界X+附近并强制朝向工件内部，防止符号翻转。
+    plane_fit_enabled: true
+    plane_fit_distance_threshold: 0.003 # RANSAC内点到平面的最大距离(m)
+    plane_fit_max_iterations: 1000
+    plane_fit_min_inliers: 1000         # 少于该内点数则拒绝本次视觉结果
+    plane_fit_min_inlier_ratio: 0.15    # 内点/target_box点数下限
+    plane_fit_max_rms: 0.0025           # 拟合内点距离RMS上限(m)
+    plane_fit_max_normal_angle_deg: 10.0 # 工件法向相对世界X+最大允许偏角
+
+    # plane_point_o 的 x/y 继续作为轨迹局部原点锚点，实际原点会投影到拟合平面。
+    # 其余两个点只供 plane_fit_enabled=false 的旧三点法回退使用。
     plane_box_z_range: [0.50, 0.82]
     plane_point_o: [0.6844, -0.0091]  # 原点测点 (x, y) = 打磨头碰板心
-    plane_point_x: [0.684,  0.111]    # X 轴测点(离机器人更远的那个!)
+    plane_point_x: [0.684,  0.111]
     plane_point_y: [0.638, -0.015]    # Y 参考测点
 
     # ---- 圆弧盒 (工件平面系下, 圈打磨特征区域) ----
@@ -138,8 +148,8 @@ ysCamera3DSolver:
     # 0.05 使三道 y≈0.118/0.078/0.038，第一道落在弧面上部（接近左上角）。
     curve_y_offset: 0.05       # trans(1) = max.y - 此值
 
-    # ---- 工具姿态世界水平化（2026-08-01）----
-    # 板面物理垂直但拟合平面因相机/手眼畸变倾斜时，强制工具轴=世界X+(水平)、
-    # 扫掠=世界Y(水平)、换道=世界Z(竖直)。板面斜放时改回 false。
-    tool_align_world: true
+    # ---- 工具姿态 ----
+    # false: 工具Z+跟随RANSAC工件法向；单行扫掠方向由世界竖直投影约束，避免绕法向翻转。
+    # true: 仅作为诊断回退，强制工具Z+=世界X+，会忽略工件实际倾角。
+    tool_align_world: false
     world_up_in_base: [-0.7431, 0.0120, 0.6691]

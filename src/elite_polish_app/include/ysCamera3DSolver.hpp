@@ -72,7 +72,16 @@ namespace elite_robot {
             Eigen::Vector4f target_box_min_, target_box_max_, curve_box_min_, curve_box_max_;
             double plane_box_zmin_, plane_box_zmax_;
             double plane_ox_, plane_oy_, plane_xx_, plane_xy_, plane_yx_, plane_yy_;
+            bool plane_fit_enabled_ = true;
+            double plane_fit_distance_threshold_ = 0.003;
+            int plane_fit_max_iterations_ = 1000;
+            int plane_fit_min_inliers_ = 1000;
+            double plane_fit_min_inlier_ratio_ = 0.15;
+            double plane_fit_max_rms_ = 0.0025;
+            double plane_fit_max_normal_angle_deg_ = 10.0;
             double curve_radius_, curve_center_dz_, curve_tool_offset_, curve_y_offset_;
+            bool tool_align_world_ = false;
+            Eigen::Vector3f world_up_in_base_{-0.7431, 0.0120, 0.6691};
             int cloud_min_points_ = 100000;//点云最少点数门槛（低于则丢帧）
 
             //topic and service

@@ -54,13 +54,31 @@ namespace elite_robot {
         plane_xx_ = px[0];  plane_xy_ = px[1];
         auto py = getv3("plane_point_y", {0.590,  0.100});
         plane_yx_ = py[0];  plane_yy_ = py[1];
+        plane_fit_enabled_ = this->declare_parameter<bool>("plane_fit_enabled", true);
+        plane_fit_distance_threshold_ = getd("plane_fit_distance_threshold", 0.003);
+        plane_fit_max_iterations_ = this->declare_parameter<int>("plane_fit_max_iterations", 1000);
+        plane_fit_min_inliers_ = this->declare_parameter<int>("plane_fit_min_inliers", 1000);
+        plane_fit_min_inlier_ratio_ = getd("plane_fit_min_inlier_ratio", 0.15);
+        plane_fit_max_rms_ = getd("plane_fit_max_rms", 0.0025);
+        plane_fit_max_normal_angle_deg_ = getd("plane_fit_max_normal_angle_deg", 10.0);
         curve_box_min_ = v4(getv3("curve_box_min", {-0.08, -0.14, -0.02}));
         curve_box_max_ = v4(getv3("curve_box_max", { 0.28,  0.24,  0.02}));
         curve_radius_ = getd("curve_radius", 0.9306);
         curve_center_dz_ = getd("curve_center_dz", 1.89539);
         curve_tool_offset_ = getd("curve_tool_offset", 0.18);
         curve_y_offset_ = getd("curve_y_offset", 0.1);
+        tool_align_world_ = this->declare_parameter<bool>("tool_align_world", false);
+        auto world_up = getv3("world_up_in_base", {-0.7431, 0.0120, 0.6691});
+        world_up_in_base_ = Eigen::Vector3f(world_up[0], world_up[1], world_up[2]);
         cloud_min_points_ = this->declare_parameter<int>("cloud_min_points", 100000);
+
+        RCLCPP_INFO(this->get_logger(),
+          "plane fit: enabled=%d dist=%.4fm iterations=%d min_inliers=%d min_ratio=%.2f "
+          "max_rms=%.4fm max_angle=%.1fdeg tool_align_world=%d",
+          static_cast<int>(plane_fit_enabled_), plane_fit_distance_threshold_,
+          plane_fit_max_iterations_, plane_fit_min_inliers_, plane_fit_min_inlier_ratio_,
+          plane_fit_max_rms_, plane_fit_max_normal_angle_deg_,
+          static_cast<int>(tool_align_world_));
 
         //init app
           app_cmd_ = -1;
@@ -259,16 +277,21 @@ namespace elite_robot {
         calcFrame.plane_ox = plane_ox_;  calcFrame.plane_oy = plane_oy_;
         calcFrame.plane_xx = plane_xx_;  calcFrame.plane_xy = plane_xy_;
         calcFrame.plane_yx = plane_yx_;  calcFrame.plane_yy = plane_yy_;
+        calcFrame.plane_fit_enabled = plane_fit_enabled_;
+        calcFrame.plane_fit_distance_threshold = plane_fit_distance_threshold_;
+        calcFrame.plane_fit_max_iterations = plane_fit_max_iterations_;
+        calcFrame.plane_fit_min_inliers = plane_fit_min_inliers_;
+        calcFrame.plane_fit_min_inlier_ratio = plane_fit_min_inlier_ratio_;
+        calcFrame.plane_fit_max_rms = plane_fit_max_rms_;
+        calcFrame.plane_fit_max_normal_angle_deg = plane_fit_max_normal_angle_deg_;
         calcFrame.curve_box_min = curve_box_min_;
         calcFrame.curve_box_max = curve_box_max_;
         calcFrame.curve_radius = curve_radius_;
         calcFrame.curve_center_dz = curve_center_dz_;
         calcFrame.curve_tool_offset = curve_tool_offset_;
         calcFrame.curve_y_offset = curve_y_offset_;
-        // 2026-08-01: 工具姿态世界水平化（板面垂直但拟合平面倾斜时启用）
-        calcFrame.tool_align_world = this->declare_parameter<bool>("tool_align_world", false);
-        auto wup = this->declare_parameter<std::vector<double>>("world_up_in_base", {-0.7431, 0.0120, 0.6691});
-        calcFrame.world_up_in_base = Eigen::Vector3f(wup[0], wup[1], wup[2]);
+        calcFrame.tool_align_world = tool_align_world_;
+        calcFrame.world_up_in_base = world_up_in_base_;
         Eigen::Matrix4f result;
         if (!calcFrame.calc(base_cloud_, result)) {
           RCLCPP_ERROR(this->get_logger(),
@@ -389,4 +412,3 @@ namespace elite_robot {
 
     }
 }
-
