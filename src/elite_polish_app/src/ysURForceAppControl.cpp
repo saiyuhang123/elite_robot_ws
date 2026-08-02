@@ -44,7 +44,7 @@ namespace elite_robot {
           // 当前 FIX 参考系 z+ 与世界 x+ 重合，因此正值才会向工件逼近。
           force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", 3.0);
           // 力控 z 轴允许的最大调整速度(m/s)，防过冲。
-          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.002);
+          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.004);
           force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", -1.5);
           force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 0.6);
           force_mode_verify_time_ = this->declare_parameter<double>("force_mode_verify_time", 0.5);
@@ -66,6 +66,19 @@ namespace elite_robot {
           // A/B后默认关闭: 开启时实机出现随机位置-30N撞击尖峰(疑似无阻尼柔顺振荡啃边)。
           force_mode_rot_compliance_ = this->declare_parameter<bool>("force_mode_rot_compliance", false);
           force_mode_rot_vel_limit_ = this->declare_parameter<double>("force_mode_rot_vel_limit", 0.05);
+          // 2026-08-02: 应用层慢姿态环(替代SDK旋转柔顺)。404用20帧平均力矩慢积分
+          // 修正轨迹姿态, 增益小+死区+±2°限幅+0.5°/s限速, 只追准静态贴合误差。
+          orient_adapt_enabled_ = this->declare_parameter<bool>("orient_adapt_enabled", false);
+          orient_adapt_gain_ = this->declare_parameter<double>("orient_adapt_gain", 0.007);
+          orient_adapt_torque_deadband_ = this->declare_parameter<double>("orient_adapt_torque_deadband", 0.10);
+          orient_adapt_max_angle_ = this->declare_parameter<double>("orient_adapt_max_angle", 0.035);
+          orient_adapt_max_rate_ = this->declare_parameter<double>("orient_adapt_max_rate", 0.009);
+          // 2026-08-02: 进给门控。过载暂停推进轨迹索引, 消除尖峰后"压着走"的二次爬升。
+          feed_gate_enabled_ = this->declare_parameter<bool>("feed_gate_enabled", true);
+          feed_gate_fz_ = this->declare_parameter<double>("feed_gate_fz", -4.0);
+          feed_gate_timeout_ = this->declare_parameter<double>("feed_gate_timeout", 3.0);
+          // 2026-08-02: 405 退刀前等 endForceMode 响应并静置, 等驱动侧控制器完成切换。
+          retract_disable_settle_time_ = this->declare_parameter<double>("retract_disable_settle_time", 1.0);
           force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
           force_mode_contact_loss_timeout_ = this->declare_parameter<double>("force_mode_contact_loss_timeout", 2.0);
           polish_tool_spinup_time_ = this->declare_parameter<double>("polish_tool_spinup_time", 1.0);
@@ -980,6 +993,10 @@ namespace elite_robot {
         polishcurve_yindex_ = 0;
         frame_forceadjust_base_.p = KDL::Vector(0, 0, 0);
         frame_forceadjust_base_.M = KDL::Rotation::Identity();
+        orient_adapt_rx_ = 0.0;
+        orient_adapt_ry_ = 0.0;
+        feed_gate_hold_count_ = 0;
+        polish_end_disable_sent_ = false;
       }
 
       void ysURForceAppControl::publishCurrentPositionHold(double duration_sec) {
@@ -1139,11 +1156,18 @@ namespace elite_robot {
         force_mode_enable_pending_ = true;
         force_mode_enable_done_ = false;
         force_mode_enable_start_ = std::chrono::steady_clock::now();
+        // 新一轮力控开始, 清除上一轮 disable 的完成痕迹, 避免 405 误用陈旧 done 直接放行
+        force_mode_disable_pending_ = false;
+        force_mode_disable_done_ = false;
       }
 
       bool ysURForceAppControl::disableForceMode() {
         const bool command_may_be_active = force_mode_enabled_ || force_mode_enable_pending_ || force_mode_enable_ok_;
         if (!command_may_be_active) {
+          // 没有活动力控: 无可等待的切换, 直接置完成(405 的静置计时从当前起算)
+          force_mode_disable_pending_ = false;
+          force_mode_disable_done_ = true;
+          force_mode_disable_done_time_ = std::chrono::steady_clock::now();
           return true;
         }
         force_mode_enabled_ = false;
@@ -1152,12 +1176,32 @@ namespace elite_robot {
         force_mode_enable_ok_ = false;
         if (!force_mode_client_ || !force_mode_client_->service_is_ready()) {
           // 服务不可用(驱动重启等)时直接清状态，不阻塞退刀
+          force_mode_disable_pending_ = false;
+          force_mode_disable_done_ = true;
+          force_mode_disable_done_time_ = std::chrono::steady_clock::now();
           return false;
         }
         auto req = std::make_shared<eli_common_interface::srv::ForceMode::Request>();
         req->enable = false;
-        // 不等待响应(单线程 executor 会死锁), 命令发出即视为已处理
-        force_mode_client_->async_send_request(req);
+        // 不阻塞等待(单线程 executor 会死锁), 但跟踪响应: 405 退刀需等响应到达
+        // 并静置, 让驱动侧控制器完成 deactivate/activate 切换后再发轨迹。
+        force_mode_disable_pending_ = true;
+        force_mode_disable_done_ = false;
+        force_mode_client_->async_send_request(req,
+          [this](rclcpp::Client<eli_common_interface::srv::ForceMode>::SharedFuture future) {
+            if (!force_mode_disable_pending_) {
+              return;
+            }
+            try {
+              future.get();
+            } catch (const std::exception &e) {
+              RCLCPP_WARN(this->get_logger(), "force mode disable response error: %s", e.what());
+            }
+            force_mode_disable_pending_ = false;
+            force_mode_disable_done_ = true;
+            force_mode_disable_done_time_ = std::chrono::steady_clock::now();
+            RCLCPP_INFO(this->get_logger(), "force mode disable response received");
+          });
         RCLCPP_INFO(this->get_logger(), "force mode disable request sent");
         return true;
       }
@@ -1500,11 +1544,35 @@ namespace elite_robot {
       void ysURForceAppControl::polish_endPolishtool() {
         if (sub_step_ == 405
         ) {
-          ysPolishTool_Close();
-          // 退刀前关闭力控，406 抬刀回到纯位置控制
-          disableForceMode();
-          RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
+          const auto now = std::chrono::steady_clock::now();
+          if (!polish_end_disable_sent_) {
+            ysPolishTool_Close();
+            // 退刀前关闭力控，406 抬刀回到纯位置控制
+            disableForceMode();
+            polish_end_disable_sent_ = true;
+            polish_end_disable_start_ = now;
+            RCLCPP_INFO(this->get_logger(),
+              "sub step %d: waiting force-mode disable before retract", sub_step_);
+            return;
+          }
+          // 2026-08-02: endForceMode 触发驱动侧控制器 deactivate/activate 切换,
+          // 切换途中发到 scaled 控制器的轨迹 goal 会被取消(历次"收工不退刀"根因,
+          // 成功/失败仅差十几 ms 的时序竞争)。等 disable 响应到达后再静置
+          // retract_disable_settle_time_, 5s 超时兜底不阻塞产线。
+          const double settle = force_mode_disable_done_
+            ? std::chrono::duration<double>(now - force_mode_disable_done_time_).count()
+            : 0.0;
+          const double total = std::chrono::duration<double>(now - polish_end_disable_start_).count();
+          if ((force_mode_disable_done_ && settle >= retract_disable_settle_time_)
+              || total >= 5.0) {
+            if (!force_mode_disable_done_) {
+              RCLCPP_WARN(this->get_logger(),
+                "force-mode disable response timeout after %.1fs; retracting anyway", total);
+            }
+            polish_end_disable_sent_ = false;
+            RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
             sub_step_++;
+          }
         }
       }
       void ysURForceAppControl::polish_goBackHome() {
@@ -1771,9 +1839,15 @@ namespace elite_robot {
             >= force_mode_monitor_log_period_) {
           const double used_ratio = force_mode_max_axial_deviation_ > 1e-9
             ? std::fabs(axial_error) / force_mode_max_axial_deviation_ : 0.0;
+          const double lat_x = ys_average_wrench_.force.data[0] - contact_fx_zero_;
+          const double lat_y = ys_average_wrench_.force.data[1] - contact_fy_zero_;
           RCLCPP_INFO(this->get_logger(),
-            "force-mode monitor: relative_fz=%.3f lateral_avg=%.3f axial_comp=%.4fm limit=%.4fm (%.0f%%)",
-            relative_fz, lateral_f_avg, axial_error, force_mode_max_axial_deviation_, used_ratio * 100.0);
+            "force-mode monitor: relative_fz=%.3f lat=(%.2f,%.2f)|%.2f| tq=(%.3f,%.3f) "
+            "adapt=(%.2f,%.2f)deg axial_comp=%.4fm limit=%.4fm (%.0f%%)",
+            relative_fz, lat_x, lat_y, lateral_f_avg,
+            ys_average_wrench_.torque.data[0], ys_average_wrench_.torque.data[1],
+            orient_adapt_rx_ * 180.0 / M_PI, orient_adapt_ry_ * 180.0 / M_PI,
+            axial_error, force_mode_max_axial_deviation_, used_ratio * 100.0);
           force_mode_monitor_last_log_ = now;
         }
         if (std::fabs(axial_error) > force_mode_max_axial_deviation_) {
@@ -1840,6 +1914,27 @@ namespace elite_robot {
           offsetFrame.p = curFrame.M*KDL::Vector(0,0,dz);
           offsetFrame.M = KDL::Rotation::RPY(0, 0, 0);
           frame_forceadjust_base_ = offsetFrame * frame_forceadjust_base_;
+
+          // 2026-08-02 应用层慢姿态环: SDK旋转柔顺无阻尼、实机振荡啃边(-30N尖峰,已关闭),
+          // 改在本层用20帧平均力矩对轨迹姿态做慢积分修正(绕TCP原点旋转, 不动位置)。
+          // 只追砂盘安装角/贴合误差这类准静态偏差; 快扰动交给z向力控与watchdog。
+          // 增益小+死区+±2°限幅+0.5°/s限速, 应用层百ms级延迟对该时间尺度无影响。
+          // 符号约定: 接触点偏+x→My>0→需绕y负转抬起+x边, 故 d=-gain*M (Mx同理)。
+          if (orient_adapt_enabled_ && force_mode_enabled_) {
+            const double mx = ys_average_wrench_.torque.data[0];
+            const double my = ys_average_wrench_.torque.data[1];
+            const double dt = control_dt_count_ * 0.004;  // 控制周期(s)
+            double d_rx = 0.0, d_ry = 0.0;
+            if (std::fabs(mx) > orient_adapt_torque_deadband_) d_rx = -orient_adapt_gain_ * mx * dt;
+            if (std::fabs(my) > orient_adapt_torque_deadband_) d_ry = -orient_adapt_gain_ * my * dt;
+            const double max_step = orient_adapt_max_rate_ * dt;
+            d_rx = std::clamp(d_rx, -max_step, max_step);
+            d_ry = std::clamp(d_ry, -max_step, max_step);
+            orient_adapt_rx_ = std::clamp(orient_adapt_rx_ + d_rx,
+              -orient_adapt_max_angle_, orient_adapt_max_angle_);
+            orient_adapt_ry_ = std::clamp(orient_adapt_ry_ + d_ry,
+              -orient_adapt_max_angle_, orient_adapt_max_angle_);
+          }
         
           // trajectory
           trajectory_msgs::msg::JointTrajectory ys_goal;
@@ -1860,6 +1955,10 @@ namespace elite_robot {
           {
             //ys_ik
             tmpFrame = frame_forceadjust_base_ * frame_polishcloud_transform_* polishcurve_OriginFrames_[i];
+            if (orient_adapt_rx_ != 0.0 || orient_adapt_ry_ != 0.0) {
+              // 慢姿态环输出: 绕TCP原点叠加旋转修正(仅姿态, 位置不变)
+              tmpFrame.M = tmpFrame.M * KDL::Rotation::RPY(orient_adapt_rx_, orient_adapt_ry_, 0.0);
+            }
             // tmpFrame = frame_forceadjust_base_ * frame_polishcloud_transform_*frame_polishcloud_base_ * polishcurve_OriginFrames_[i];
             if (!forceModeWatchdog(tmpFrame)) {
               return;
@@ -1880,6 +1979,8 @@ namespace elite_robot {
                 //init
                 frame_forceadjust_base_.p = KDL::Vector(0,0,0);
                 frame_forceadjust_base_.M = KDL::Rotation::RPY(0, 0, 0);
+                orient_adapt_rx_ = 0.0;
+                orient_adapt_ry_ = 0.0;
                 sidepolish_step_index_=0;
                 polishcurve_step_index_=0;
                 polishcurve_yindex_=0;
@@ -1907,9 +2008,47 @@ namespace elite_robot {
           //pub
           ys_traj_publisher_->publish(ys_goal);   
 
+          // 2026-08-02 进给门控: 力控模式下轨迹索引原按控制周期无条件推进,
+          // 力突增(尖峰/爬坡)时切向照走, 把打磨头"压着走"造成二次爬升(历次停摆直接死因)。
+          // 现20帧平均力过载(feed_gate_fz)即暂停推进, 目标保持当前点, 等z向力控拉回带内;
+          // 卡死超 feed_gate_timeout 按正常流程退出, 避免产线停摆悬死。
+          bool feed_gated = false;
+          double fz_avg_gate = 0.0;
+          if (feed_gate_enabled_ && force_mode_enabled_) {
+            fz_avg_gate = ys_average_wrench_.force.data[2] - contact_fz_zero_;
+            feed_gated = fz_avg_gate <= feed_gate_fz_;
+          }
+          if (feed_gated) {
+            if (feed_gate_hold_count_ == 0) {
+              feed_gate_hold_start_ = std::chrono::steady_clock::now();
+            }
+            feed_gate_hold_count_++;
+            if (feed_gate_hold_count_ % 25 == 1) {  // 约1s一条
+              RCLCPP_WARN(this->get_logger(),
+                "feed gated: fz_avg=%.2f N <= %.2f N, holding at step %d (%.1fs)",
+                fz_avg_gate, feed_gate_fz_, last_polish_step_,
+                std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - feed_gate_hold_start_).count());
+            }
+            if (std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - feed_gate_hold_start_).count()
+                > feed_gate_timeout_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "force-mode watchdog: feed gate stuck for %.1fs (fz_avg=%.2f N); aborting",
+                feed_gate_timeout_, fz_avg_gate);
+              logForceDiagnostics("feed_gate_timeout");
+              disableForceMode();
+              publishCurrentPositionHold(contact_hold_time_);
+              sub_step_ = 405;
+              return;
+            }
+          } else {
+            feed_gate_hold_count_ = 0;
+          }
+
           // 力控模式下 z 由控制器闭环调整, 实际位姿与名义路径点可能有偏差,
-          // 不再用到位距离判断进度, 直接按控制周期推进。
-          if (force_mode_enabled_ || (tmpFrame.p-curFrame.p).Norm()<0.001) {
+          // 不再用到位距离判断进度, 直接按控制周期推进(过载时由上门控暂停)。
+          if (!feed_gated && (force_mode_enabled_ || (tmpFrame.p-curFrame.p).Norm()<0.001)) {
             //update index
             if (polishcurve_step_index_==polishcurve_step_count_){
               if (sidepolish_step_index_==sidepolish_step_count_){
@@ -1932,6 +2071,8 @@ namespace elite_robot {
                   //init
                   frame_forceadjust_base_.p = KDL::Vector(0,0,0);
                   frame_forceadjust_base_.M = KDL::Rotation::RPY(0, 0, 0);
+                  orient_adapt_rx_ = 0.0;
+                  orient_adapt_ry_ = 0.0;
                   sidepolish_step_index_=0;
                   polishcurve_step_index_=0;
                   polishcurve_yindex_=0;

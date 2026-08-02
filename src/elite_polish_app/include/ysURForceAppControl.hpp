@@ -149,7 +149,7 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point contact_hold_start_;
             bool use_force_mode_ = true;//控制器内建力控(startForceMode)开关
             double force_mode_wrench_z_ = 3.0;//SDK内部目标；+z=世界X+逼近
-            double force_mode_z_vel_limit_ = 0.002;//力控z轴最大调整速度(m/s)
+            double force_mode_z_vel_limit_ = 0.004;//力控z轴最大调整速度(m/s) 2→4mm/s配合进给门控
             double force_mode_sensor_target_fz_ = -1.5;//本应用补偿/去皮后的实际反作用力目标(N)
             double force_mode_verify_tolerance_ = 0.6;//启用后实测反作用力与目标的允许误差(N)
             double force_mode_verify_time_ = 0.5;//进入打磨前，目标力连续稳定时间(s)
@@ -175,6 +175,22 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point force_mode_lateral_overforce_start_;
             bool force_mode_rot_compliance_ = false;//力控开放Rx/Ry旋转柔顺(A/B后默认关闭: 疑无阻尼柔顺振荡啃边)
             double force_mode_rot_vel_limit_ = 0.05;//旋转柔顺轴最大角速度(rad/s)
+            // 2026-08-02 应用层慢姿态环(替代SDK旋转柔顺): 404每拍用20帧平均力矩
+            // 对轨迹姿态做慢积分修正, 消除砂盘安装角/贴合误差造成的边缘接触。
+            bool orient_adapt_enabled_ = false;//实机: 力矩含摩擦力杠杆项, 环发散致-42N撞击, 默认关闭
+            double orient_adapt_gain_ = 0.007;      // 积分增益 rad/(N·m·s)
+            double orient_adapt_torque_deadband_ = 0.10; // 力矩死区(N·m), 防噪声来回抖
+            double orient_adapt_max_angle_ = 0.035; // 修正限幅(rad)≈±2°, 逻辑出错也不会歪
+            double orient_adapt_max_rate_ = 0.009;  // 修正变化率上限(rad/s)≈0.5°/s
+            double orient_adapt_rx_ = 0.0;          // 累计姿态修正(rad), 绕工具x
+            double orient_adapt_ry_ = 0.0;          // 累计姿态修正(rad), 绕工具y
+            // 2026-08-02 进给门控: 过载(20帧平均力<=feed_gate_fz)暂停推进轨迹索引,
+            // 目标保持当前点等z向力控拉回, 消除尖峰后"压着走"的二次爬升。
+            bool feed_gate_enabled_ = true;
+            double feed_gate_fz_ = -4.0;            // 过载判定阈值(N), 需高于-5N平均退出线
+            double feed_gate_timeout_ = 3.0;        // 门控最长持续(s), 超时按正常流程退出
+            int feed_gate_hold_count_ = 0;
+            std::chrono::steady_clock::time_point feed_gate_hold_start_;
             int last_polish_step_ = 0;              // 当前打磨轨迹步数(0=切向未开始)，过力诊断用
             bool polish_tangential_started_ = false; // 404 切向轨迹是否已开始，过力诊断计时用
             std::chrono::steady_clock::time_point polish_tangential_start_;
@@ -190,6 +206,14 @@ namespace elite_robot {
             bool force_mode_enable_done_ = false;//响应已收到
             bool force_mode_enable_ok_ = false;//响应结果
             std::chrono::steady_clock::time_point force_mode_enable_start_;//等待超时看门狗
+            // 2026-08-02: disable 响应跟踪。endForceMode 触发驱动侧控制器切换,
+            // 405 退刀须等响应+静置, 否则轨迹 goal 在 deactivate 转换期被取消(收工不退刀)。
+            bool force_mode_disable_pending_ = false;
+            bool force_mode_disable_done_ = false;
+            std::chrono::steady_clock::time_point force_mode_disable_done_time_;
+            bool polish_end_disable_sent_ = false;
+            std::chrono::steady_clock::time_point polish_end_disable_start_;
+            double retract_disable_settle_time_ = 1.0;//disable 响应后静置多久才发退刀轨迹(s)
             bool debug_approach_started_ = false;//空跑平滑接近状态
             KDL::JntArray debug_approach_target_q_;//空跑接近目标关节角
             double debug_approach_time_ = 4.0;//空跑接近轨迹时长(s)

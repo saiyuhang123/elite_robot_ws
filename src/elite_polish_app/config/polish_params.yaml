@@ -49,9 +49,10 @@ ysURForceAppControl:
     # SDK内部力与应用补偿/去皮后的relative_fz实测相差约1.1~1.2N：
     # SDK 0.5N -> relative约0N；SDK 2N -> relative约-0.85N。因此二者分开配置。
     force_mode_wrench_z: 3.0         # SDK内部施力目标；预计应用侧实际反作用力约-1.5~-2N
-    force_mode_z_vel_limit: 0.002    # 力控z轴最大调整速度: 0.5→2mm/s。
+    force_mode_z_vel_limit: 0.004    # 力控z轴最大调整速度: 0.5→2→4mm/s。
                                      # 原0.5mm/s追不上打磨切向运动造成的法向扰动(实测0.2s内力涨25~40N/s)，
-                                     # 导致力控"来不及退让"、力涨到-10N触发保护。2mm/s起步，仍保留防过冲余量。
+                                     # 导致力控"来不及退让"、力涨到-10N触发保护。2mm/s仍出现尖峰后二次爬升，
+                                     # 2026-08-02提到4mm/s配合进给门控; 若出现力控振荡回退到0.002。
     # 2026-08-02: 开放 Rx/Ry 旋转柔顺(目标力矩0)。板法向与工具轴不对齐时砂轮边缘接触，
     # 产生Mx/My力矩和侧向拖曳(两次停摆实测侧向10~15N先于Fz失控)；零力矩目标让端面
     # 缓慢贴合板面卸掉侧向力。稳态转角≈板子倾角(几度)，false=退回纯Z力控。
@@ -59,6 +60,24 @@ ysURForceAppControl:
     # 疑似无阻尼旋转柔顺在扫掠中振荡啃边，先关闭验证；长期方案改走砂盘安装角一次性补偿。
     force_mode_rot_compliance: false
     force_mode_rot_vel_limit: 0.05   # 旋转柔顺轴最大角速度(rad/s)≈3°/s，姿态缓变防突变
+    # 2026-08-02: 应用层慢姿态环(替代SDK旋转柔顺)。404每控制拍用20帧平均力矩对轨迹
+    # 姿态做慢积分修正(绕TCP原点旋转)，消除砂盘安装角/贴合误差造成的边缘接触dig-in。
+    # 只追准静态偏差；快扰动交给z向力控和watchdog。符号: d=-gain*M，力矩增大说明符号反了。
+    # 2026-08-02 实机结论: 默认关闭。平静期力矩大头是侧向摩擦力×杠杆臂(实测与h≈0.12m
+    # 模型吻合)，转姿态消不掉，环持续积分到1.44°后砂盘边缘咬住撞出-42N尖峰——与SDK
+    # 旋转柔顺同一死法。力矩驱动的姿态自适应(任何层)均不可用，保留代码仅备摩擦力矩
+    # 补偿(h×F_lat)版本改造后复测。
+    orient_adapt_enabled: false
+    orient_adapt_gain: 0.007         # 积分增益 rad/(N·m·s)：1N·m力矩约0.4°/s修正速率
+    orient_adapt_torque_deadband: 0.10 # 力矩死区(N·m)，防传感器噪声来回抖
+    orient_adapt_max_angle: 0.035    # 修正限幅(rad)≈±2°，逻辑出错也歪不了多少
+    orient_adapt_max_rate: 0.009     # 修正变化率上限(rad/s)≈0.5°/s
+    # 2026-08-02: 进给门控。力控模式下轨迹索引原按时间无条件推进，力突增时切向照走，
+    # 把打磨头"压着走"造成二次爬升(历次 averaged_overforce 停摆的直接死因)。
+    # 过载即暂停推进、目标保持当前点，等z向力控拉回带内再走；超时按正常流程退出。
+    feed_gate_enabled: true
+    feed_gate_fz: -4.0               # 20帧平均力过载阈值(N)，需高于 force_mode_abort_fz(-5)
+    feed_gate_timeout: 3.0           # 门控最长持续(s)，防产线悬死
     # startForceMode返回只表示socket写入成功；实测力稳定到目标附近后才开始切向运动。
     force_mode_sensor_target_fz: -1.5 # 应用补偿/去皮后的实际反作用力目标(N)
     force_mode_verify_tolerance: 0.6 # 传感器反作用力目标为-applied_Fz，允许误差(N)
@@ -106,6 +125,9 @@ ysURForceAppControl:
     world_up_in_base: [-0.7431, 0.0120, 0.6691]
     retract_lift_height: 0.15       # 世界系竖直抬刀高度(m)
     retract_axial_distance: 0.03    # 先沿世界X-/工具轴反向离开工件，再竖直抬升(m)
+    # 2026-08-02: 退刀前等 endForceMode 响应后再静置这么久(s)。驱动侧控制器
+    # deactivate/activate 切换途中到达的轨迹 goal 会被取消(收工不退刀的根因)。
+    retract_disable_settle_time: 1.0
 
     # ---- 示教姿态 ----
     home_q_deg: [8.2, -93.6, -110.2, 57.4, 91.7, 91.6]              # Home(角度制)
