@@ -83,6 +83,10 @@ namespace elite_robot {
             void polish_waitBackHome();
             void sendEnableForceModeRequest();
             bool disableForceMode();
+            void resetForceContactState();
+            void publishCurrentPositionHold(double duration_sec);
+            double maxJointSpeed() const;
+            bool forceModeWatchdog(const KDL::Frame &nominal_frame);
 
             void goHome();
             void goHome_pubMoveHome();
@@ -109,9 +113,50 @@ namespace elite_robot {
             int control_dt_index_;
             bool debug_skip_force_contact_ = false;//调试空跑: 402免接触、404力控旁路
             double contact_fz_threshold_ = -16.0;//402接触判定阈值(N)
+            int contact_confirm_samples_ = 8;//连续超过阈值的传感器帧数
+            int contact_tare_samples_ = 25;//预备姿态局部力零点采样数
+            double contact_settle_time_ = 0.3;//预备姿态静置时间(s)
+            double contact_hold_time_ = 0.25;//接触后保持位置、等待轨迹停稳时间(s)
+            double contact_hold_completion_margin_ = 0.20;//等待action完成回调的额外余量(s)
+            double contact_joint_velocity_limit_ = 0.01;//切换力控前最大关节速度(rad/s)
+            double contact_max_travel_ = 0.10;//402 沿逼近轴最大行程(m)
+            double contact_timeout_ = 70.0;//402 最大逼近时间(s)，100mm@约2mm/s需约50s
+            int contact_ik_max_failures_ = 5;//连续端点IK失败多少周期后中止
+            int contact_ik_failure_count_ = 0;
+            bool contact_settle_started_ = false;
+            std::chrono::steady_clock::time_point contact_settle_start_;
+            bool contact_tare_collecting_ = false;
+            int contact_tare_count_ = 0;
+            double contact_tare_sum_ = 0.0;
+            double contact_fz_zero_ = 0.0;//预备姿态的局部力零点
+            bool contact_detection_enabled_ = false;
+            int contact_confirm_count_ = 0;
+            bool contact_confirmed_ = false;
+            bool contact_approach_started_ = false;
+            std::chrono::steady_clock::time_point contact_approach_start_;
+            KDL::Vector contact_approach_start_p_;
+            KDL::Vector contact_approach_axis_base_{0.0, 0.0, 1.0};
+            bool contact_hold_started_ = false;
+            std::chrono::steady_clock::time_point contact_hold_start_;
             bool use_force_mode_ = true;//控制器内建力控(startForceMode)开关
-            double force_mode_wrench_z_ = -3.0;//力控目标力z(N, 压入工件=负, 与传感器约定一致)
-            double force_mode_z_vel_limit_ = 0.005;//力控z轴最大调整速度(m/s)
+            double force_mode_wrench_z_ = 3.0;//SDK内部目标；+z=世界X+逼近
+            double force_mode_z_vel_limit_ = 0.0005;//力控z轴最大调整速度(m/s)
+            double force_mode_sensor_target_fz_ = -1.5;//本应用补偿/去皮后的实际反作用力目标(N)
+            double force_mode_verify_tolerance_ = 0.6;//启用后实测反作用力与目标的允许误差(N)
+            double force_mode_verify_time_ = 0.5;//进入打磨前，目标力连续稳定时间(s)
+            double force_mode_verify_timeout_ = 5.0;//启用后建立目标力的最长等待时间(s)
+            bool force_mode_verify_stable_ = false;
+            std::chrono::steady_clock::time_point force_mode_verify_start_;
+            std::chrono::steady_clock::time_point force_mode_verify_stable_start_;
+            std::chrono::steady_clock::time_point force_mode_verify_last_log_;
+            double force_mode_max_axial_deviation_ = 0.015;//相对名义轨迹最大轴向偏移(m)
+            double force_mode_monitor_log_period_ = 1.0;//404 力/轴向补偿监控日志周期(s)
+            std::chrono::steady_clock::time_point force_mode_monitor_last_log_;
+            double force_mode_abort_fz_ = -5.0;//相对力超过此负值立即退出力控(N)
+            double force_mode_min_contact_fz_ = -0.15;//小于此值视为仍有接触(N)
+            double force_mode_contact_loss_timeout_ = 2.0;//失去接触允许时间(s)
+            KDL::Vector force_mode_axis_base_{0.0, 0.0, 1.0};
+            std::chrono::steady_clock::time_point force_mode_last_contact_;
             bool force_mode_enabled_ = false;//当前力控是否已开启
             // 异步使能力控: 单线程 executor 内同步等 future 会死锁(响应处理不到),
             // 改为 async_send_request + 响应回调置 done, 主流程逐拍轮询。
@@ -124,6 +169,7 @@ namespace elite_robot {
             double debug_approach_time_ = 4.0;//空跑接近轨迹时长(s)
             KDL::Vector world_up_in_base_;//退刀: 世界系"上"在 base 系的方向(参数)
             double retract_lift_height_ = 0.15;//退刀: 世界系竖直抬刀高度(m)
+            double retract_axial_distance_ = 0.03;//退刀: 先沿接触轴反向离开工件(m)
             //polish data
             KDL::Frame frame_polishcloud_base_;
             KDL::Frame frame_polishcloud_transform_;

@@ -11,10 +11,18 @@ ysURForceAppControl:
     # true = 空跑模式: 402 免接触直接过、404 力控旁路。真打磨必须 false！
     # 2026-08-01: 首次接触试跑，关闭空跑，让 402/404 力控真实参与（打磨机不转）。
     debug_skip_force_contact: false
-    # 402 接触判定阈值(N, 负值)。压向工件时 force.z 小于它判定接触。软工件可调小(如 -6.0)
-    # 2026-08-01: -16 → -6，首次接触更温和，确认稳定后再回调
-    # 2026-08-01 实测: -6N 会触发示教器力报警停摆 → 降到 -2N
-    contact_fz_threshold: -2.0
+    # 402 使用“预备姿态局部归零后的相对反作用力”，连续多帧低于阈值才确认接触。
+    # 接触反作用力为负；-1N 配合连续帧确认可在碰撞报警前停止位置逼近。
+    contact_fz_threshold: -1.0
+    contact_confirm_samples: 8       # 125Hz 力数据连续 8 帧，拒绝单帧尖峰
+    contact_settle_time: 0.3         # 到预备点且关节静止后先等待(s)
+    contact_tare_samples: 25         # 在预备姿态采集局部力零点，约 0.2s
+    contact_hold_time: 0.25          # 确认接触后保持当前位置再切力控(s)
+    contact_hold_completion_margin: 0.20 # 等待轨迹action真正完成；实测result比time_from_start晚约50ms
+    contact_joint_velocity_limit: 0.01  # 允许切换力控的最大关节速度(rad/s)
+    contact_max_travel: 0.10         # 从预备点沿世界X+最大搜索距离(m)
+    contact_timeout: 70.0            # 1mm/0.48s约2mm/s；搜索100mm最多约50s，预留控制器余量
+    contact_ik_max_failures: 5       # 端点IK连续失败5个周期才中止；单次超时自动缩步重试
     # 空跑模式接近轨迹起点的时长(s)，越大越慢
     debug_approach_time: 4.0
 
@@ -26,9 +34,8 @@ ysURForceAppControl:
     adjust_dz: 0.0005        # 每控制周期力控调整步长(m)
     # 2026-08-01: 1.5→2.0。略放宽死区减少往复振荡，仍能保持贴合。
     force_deadband: 2.0
-    # 2026-08-01: 402 固定步长逼近(m)/周期。0.003 实际约 6mm/s，配合瞬时力判定
-    # (无平均滞后)最大限度减小接触力尖峰；接触后退刀同值。
-    contact_step: 0.003
+    # 402 每 40ms 更新一次、每条轨迹约 0.48s；1mm 目标增量约等于 2mm/s 逼近。
+    contact_step: 0.001
     # 2026-08-01: 接触力平均窗口。20≈0.16s(125Hz)，原 200 滞后~1.6s 过冲严重。
     wrench_average_count: 20
 
@@ -37,12 +44,23 @@ ysURForceAppControl:
     # 404 不再做 ±0.5mm bang-bang 位置修正（根治刚性板往复振荡）。
     # false=回退旧的 404 bang-bang 修正（仅调试用）。
     use_force_mode: true
-    # 力控目标力 z(N)。与传感器读数约定一致(压入工件=负)。
-    # wrench 与 get_tcp_force 同约定(施加给环境的力)，实测压入=force.z 负 → -3.0。
-    # 若真机表现是"越压越深/越退越轻"，再把符号反过来，只改这里。
-    force_mode_wrench_z: -3.0
-    # 力控 z 轴允许的最大调整速度(m/s)，防过冲；可先按接触逼近速度量级(0.005)试。
-    force_mode_z_vel_limit: 0.005
+    # SDK wrench 是“机器人施加给环境的力”，与传感器反作用力符号相反。
+    # 当前 FIX 参考系 z+ 已核对为世界 x+；正值实现力小向 x+、力大向 x-。
+    # SDK内部力与应用补偿/去皮后的relative_fz实测相差约1.1~1.2N：
+    # SDK 0.5N -> relative约0N；SDK 2N -> relative约-0.85N。因此二者分开配置。
+    force_mode_wrench_z: 3.0         # SDK内部施力目标；预计应用侧实际反作用力约-1.5~-2N
+    force_mode_z_vel_limit: 0.0005   # 仍限制为0.5mm/s，防止刚性板上快速过冲
+    # startForceMode返回只表示socket写入成功；实测力稳定到目标附近后才开始切向运动。
+    force_mode_sensor_target_fz: -1.5 # 应用补偿/去皮后的实际反作用力目标(N)
+    force_mode_verify_tolerance: 0.6 # 传感器反作用力目标为-applied_Fz，允许误差(N)
+    force_mode_verify_time: 0.5      # 连续在目标带内多久才开始打磨(s)
+    force_mode_verify_timeout: 5.0   # 建立不了目标力则在切向运动前安全退出(s)
+    # 首行实测板面跟随补偿达到10.0mm，原10mm阈值在行末误触发；放宽到15mm并持续监控。
+    force_mode_max_axial_deviation: 0.015 # 实际TCP相对接触偏置后名义路径的最大轴向偏移(m)
+    force_mode_monitor_log_period: 1.0    # 每秒输出实际力和轴向补偿，确认第二行反向时是否回落
+    force_mode_abort_fz: -5.0        # 相对反作用力过大立即退出力控(N)
+    force_mode_min_contact_fz: -0.15 # 高于此值视为失去接触(N)
+    force_mode_contact_loss_timeout: 2.0  # 连续失去接触多久后退出(s)
 
     # ---- 力传感器重力补偿（2026-08-01 起为参数，换负载只改这里）----
     # 实测驱动端负载识别只做当前姿态归零，非全姿态补偿；此处为真实工具重力模型：
@@ -68,6 +86,7 @@ ysURForceAppControl:
     # 世界系"上"在 base 系下的方向(45°倾斜安装实测, 与 biaoding/world_offset_calc.py 一致)
     world_up_in_base: [-0.7431, 0.0120, 0.6691]
     retract_lift_height: 0.15       # 世界系竖直抬刀高度(m)
+    retract_axial_distance: 0.03    # 先沿世界X-/工具轴反向离开工件，再竖直抬升(m)
 
     # ---- 示教姿态 ----
     home_q_deg: [8.2, -93.6, -110.2, 57.4, 91.7, 91.6]              # Home(角度制)

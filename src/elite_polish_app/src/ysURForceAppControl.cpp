@@ -5,6 +5,7 @@
 #include <urdf/model.h>
 #include <Eigen/Geometry>
 #include <kdl/chainfksolverpos_recursive.hpp>
+#include <algorithm>
 #include <list>
 #include <chrono>
 #include <future>
@@ -32,23 +33,44 @@ namespace elite_robot {
           // 2026-08-01: 力控死区(N)。原写死 3N，target -3N 时死区覆盖(-6,0)N，
           // 轻接触不修正导致"不贴合"；1.5N 让修正更主动。
           force_deadband_ = this->declare_parameter<double>("force_deadband", 1.5);
-          // 2026-08-01: 402 接触下压每控制周期步进(m)。原 0.01 在 40ms 周期下接近速度约 250mm/s，
-          // 接触冲击过大触发示教器报警；0.001 = 1mm/周期 ≈ 25mm/s 慢压。
+          // 2026-08-01: 402 接触下压每条轨迹的步进(m)。桥接端保证每个 0.48s
+          // 小步完整执行；0.001 对应约 2mm/s，避免接触冲击触发碰撞报警。
           contact_step_ = this->declare_parameter<double>("contact_step", 0.001);
           // 2026-08-02: 控制器内建力控(startForceMode)。true=404 不再自己做 ±0.5mm
           // bang-bang 修正，z 向恒力由机器人控制器内部闭环完成。
           use_force_mode_ = this->declare_parameter<bool>("use_force_mode", true);
-          // 力控目标力 z(N)。wrench 与 get_tcp_force 同约定(施加给环境的力)，
-          // 实测压入工件=force.z 负 → 默认取 target_fz_(负)；方向反了再改符号。
-          force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", target_fz_);
+          // SDK wrench 是机器人施加给环境的力，不是传感器读到的反作用力。
+          // 当前 FIX 参考系 z+ 与世界 x+ 重合，因此正值才会向工件逼近。
+          force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", 3.0);
           // 力控 z 轴允许的最大调整速度(m/s)，防过冲。
-          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.005);
+          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.0005);
+          force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", -1.5);
+          force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 0.6);
+          force_mode_verify_time_ = this->declare_parameter<double>("force_mode_verify_time", 0.5);
+          force_mode_verify_timeout_ = this->declare_parameter<double>("force_mode_verify_timeout", 5.0);
+          force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.015);
+          force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
+          force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -5.0);
+          force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
+          force_mode_contact_loss_timeout_ = this->declare_parameter<double>("force_mode_contact_loss_timeout", 2.0);
           control_dt_count_ = 10;//todo, n*4ms for timer
           // 调试/工艺参数（ROS 参数，可在 launch 中覆盖）:
           // debug_skip_force_contact=true 时空跑: 402 免接触直接过、404 力控旁路
           // contact_fz_threshold: 402 接触判定阈值(N)，负值，压向工件时 force.z 小于它判定接触
           debug_skip_force_contact_ = this->declare_parameter<bool>("debug_skip_force_contact", false);
           contact_fz_threshold_ = this->declare_parameter<double>("contact_fz_threshold", target_fz_*2);
+          contact_confirm_samples_ = std::max(
+            1, static_cast<int>(this->declare_parameter<int>("contact_confirm_samples", 8)));
+          contact_tare_samples_ = std::max(
+            1, static_cast<int>(this->declare_parameter<int>("contact_tare_samples", 25)));
+          contact_settle_time_ = this->declare_parameter<double>("contact_settle_time", 0.3);
+          contact_hold_time_ = this->declare_parameter<double>("contact_hold_time", 0.25);
+          contact_hold_completion_margin_ = this->declare_parameter<double>("contact_hold_completion_margin", 0.20);
+          contact_joint_velocity_limit_ = this->declare_parameter<double>("contact_joint_velocity_limit", 0.01);
+          contact_max_travel_ = this->declare_parameter<double>("contact_max_travel", 0.10);
+          contact_timeout_ = this->declare_parameter<double>("contact_timeout", 70.0);
+          contact_ik_max_failures_ = std::max(
+            1, static_cast<int>(this->declare_parameter<int>("contact_ik_max_failures", 5)));
           debug_approach_time_ = this->declare_parameter<double>("debug_approach_time", 4.0);//空跑接近轨迹时长(s)
           control_dt_index_ = 0;
           //polish data
@@ -74,6 +96,7 @@ namespace elite_robot {
           auto wup = this->declare_parameter<std::vector<double>>("world_up_in_base", {-0.7431, 0.0120, 0.6691});
           world_up_in_base_ = KDL::Vector(wup[0], wup[1], wup[2]);
           retract_lift_height_ = this->declare_parameter<double>("retract_lift_height", 0.15);
+          retract_axial_distance_ = this->declare_parameter<double>("retract_axial_distance", 0.03);
           calcCurvePolishPath();
 
           RCLCPP_INFO(this->get_logger(),"init robot data");
@@ -156,7 +179,7 @@ namespace elite_robot {
           }
           xml_string = parameters_client->get_parameter<std::string>(urdf_param);
           // RCLCPP_INFO(this->get_logger(),"xml_string: %s", xml_string.c_str());
-          
+
           if ( !xml_string.empty()) {
               robot_model.initString(xml_string);
 
@@ -288,6 +311,8 @@ namespace elite_robot {
           sub_step_ = app_cmd_*100;
           break;
         case 4:
+          disableForceMode();
+          resetForceContactState();
           app_cmd_ = AppCommand::DO_CURVE_POLISHING;
           sub_step_ = app_cmd_*100;
           break;
@@ -474,6 +499,34 @@ namespace elite_robot {
           //calc contact wrench data
           if (ys_first_wrench_==false) {
             ys_contact_wrench_sensor_ = ys_gravityRepairWrench(data) - ys_bias_wrench_;
+
+            // 预备姿态保持静止后重新取局部零点。这样可消除启动姿态到打磨姿态之间
+            // 的重力模型残差/零漂，避免尚未碰板时单帧约 -2N 被误判为接触。
+            if (contact_tare_collecting_ && maxJointSpeed() <= contact_joint_velocity_limit_) {
+              contact_tare_sum_ += ys_contact_wrench_sensor_.force.data[2];
+              contact_tare_count_++;
+              if (contact_tare_count_ >= contact_tare_samples_) {
+                contact_fz_zero_ = contact_tare_sum_ / static_cast<double>(contact_tare_count_);
+                contact_tare_collecting_ = false;
+                RCLCPP_INFO(this->get_logger(),
+                  "contact local tare ready: raw_fz_zero=%.3f N samples=%d",
+                  contact_fz_zero_, contact_tare_count_);
+              }
+            }
+
+            // 接触只在新的传感器帧上计数；连续若干帧超过阈值才确认，拒绝瞬时尖峰。
+            if (contact_detection_enabled_ && !contact_confirmed_) {
+              const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+              if (relative_fz < contact_fz_threshold_) {
+                contact_confirm_count_++;
+                if (contact_confirm_count_ >= contact_confirm_samples_) {
+                  contact_confirmed_ = true;
+                  contact_detection_enabled_ = false;
+                }
+              } else {
+                contact_confirm_count_ = 0;
+              }
+            }
             if (ys_ftsensor_fk_solver_) {
               ys_ftsensor_fk_solver_->JntToCart(ys_cur_q_, ys_curP_ftsensor_);
               ys_contact_wrench_base_.force = ys_curP_ftsensor_.M*ys_contact_wrench_sensor_.force;
@@ -854,29 +907,106 @@ namespace elite_robot {
           sub_step_++;
         }
       }
-      void ysURForceAppControl::polish_waitPolishBase() {
-        if (sub_step_ == 401
-        ) {
-          //start up point
-          KDL::Frame  startPos, upFrame;
-          // startPos = frame_polishcloud_transform_* frame_polishcloud_base_ * polishcurve_OriginFrames_[0];
-          startPos = frame_polishcloud_transform_*  polishcurve_OriginFrames_[0];
-          //ik
-          KDL::Frame moveFrame;
-          moveFrame.p = KDL::Vector(0,0,dz_polish_startup_tool_);//offset tool z 
-          moveFrame.M = KDL::Rotation::RPY(0,0,0);
-          upFrame = startPos * moveFrame;
-          KDL::JntArray ys_resultJnt(joint_size_);
-          int rc = ys_tcp_tracik_solver_->CartToJnt(ys_polishBase_q_, upFrame, ys_resultJnt);
-          if (rc != 1) {
-            RCLCPP_INFO(this->get_logger()," polish start up target, trac ik failed");
-          }
-          if (KDL::Equal(ys_cur_q_, ys_resultJnt, joint_eps_)
-          ) {
-            RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
-            sub_step_++;
-          }
+      double ysURForceAppControl::maxJointSpeed() const {
+        double max_speed = 0.0;
+        for (int i = 0; i < joint_size_; ++i) {
+          max_speed = std::max(max_speed, std::fabs(ys_cur_vel(i)));
         }
+        return max_speed;
+      }
+
+      void ysURForceAppControl::resetForceContactState() {
+        contact_settle_started_ = false;
+        contact_tare_collecting_ = false;
+        contact_tare_count_ = 0;
+        contact_tare_sum_ = 0.0;
+        contact_fz_zero_ = 0.0;
+        contact_detection_enabled_ = false;
+        contact_confirm_count_ = 0;
+        contact_confirmed_ = false;
+        contact_approach_started_ = false;
+        contact_hold_started_ = false;
+        contact_ik_failure_count_ = 0;
+        force_mode_verify_stable_ = false;
+        debug_approach_started_ = false;
+        control_dt_index_ = 0;
+        frame_forceadjust_base_.p = KDL::Vector(0, 0, 0);
+        frame_forceadjust_base_.M = KDL::Rotation::Identity();
+      }
+
+      void ysURForceAppControl::publishCurrentPositionHold(double duration_sec) {
+        trajectory_msgs::msg::JointTrajectory hold;
+        hold.header.stamp = this->now();
+        hold.header.frame_id = "force_contact_hold";
+        trajectory_msgs::msg::JointTrajectoryPoint point;
+        for (int i = 0; i < joint_size_; ++i) {
+          hold.joint_names.push_back(ys_prefix_ + joint_names_[i]);
+          point.positions.push_back(ys_cur_q_(i));
+          point.velocities.push_back(0.0);
+        }
+        point.time_from_start = rclcpp::Duration::from_seconds(std::max(0.05, duration_sec));
+        hold.points.push_back(point);
+        ys_traj_publisher_->publish(hold);
+      }
+
+      void ysURForceAppControl::polish_waitPolishBase() {
+        if (sub_step_ != 401) {
+          return;
+        }
+
+        KDL::Frame startPos = frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
+        KDL::Frame moveFrame;
+        moveFrame.p = KDL::Vector(0, 0, dz_polish_startup_tool_);
+        moveFrame.M = KDL::Rotation::Identity();
+        const KDL::Frame upFrame = startPos * moveFrame;
+        KDL::JntArray targetJnt(joint_size_);
+        const int rc = ys_tcp_tracik_solver_->CartToJnt(ys_polishBase_q_, upFrame, targetJnt);
+        if (rc != 1) {
+          RCLCPP_ERROR(this->get_logger(), "polish start-up IK failed while waiting; polish aborted");
+          app_cmd_ = AppCommand::NOTHING;
+          sub_step_ = 9999;
+          return;
+        }
+
+        const bool pose_reached = KDL::Equal(ys_cur_q_, targetJnt, joint_eps_);
+        const bool robot_still = maxJointSpeed() <= contact_joint_velocity_limit_;
+        if (!pose_reached || !robot_still) {
+          contact_settle_started_ = false;
+          contact_tare_collecting_ = false;
+          contact_tare_count_ = 0;
+          contact_tare_sum_ = 0.0;
+          return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!contact_settle_started_) {
+          contact_settle_started_ = true;
+          contact_settle_start_ = now;
+          RCLCPP_INFO(this->get_logger(),
+            "polish start-up reached; settling %.2fs before local force tare", contact_settle_time_);
+          return;
+        }
+        if (std::chrono::duration<double>(now - contact_settle_start_).count() < contact_settle_time_) {
+          return;
+        }
+
+        if (contact_tare_count_ == 0 && !contact_tare_collecting_) {
+          contact_tare_sum_ = 0.0;
+          contact_tare_collecting_ = true;
+          RCLCPP_INFO(this->get_logger(), "collecting %d local force-tare samples", contact_tare_samples_);
+          return;
+        }
+        if (contact_tare_collecting_) {
+          return;
+        }
+
+        contact_detection_enabled_ = true;
+        contact_confirm_count_ = 0;
+        contact_confirmed_ = false;
+        contact_approach_started_ = false;
+        RCLCPP_INFO(this->get_logger(), "sub step done: %d; local force tare=%.3f N",
+                    sub_step_, contact_fz_zero_);
+        sub_step_++;
       }
 
       void ysURForceAppControl::sendEnableForceModeRequest() {
@@ -911,16 +1041,28 @@ namespace elite_robot {
         req->wrench = {0, 0, force_mode_wrench_z_, 0, 0, 0};
         req->mode = 0;  // FIX: 力控坐标系 = 参考坐标系
         req->limits = {0, 0, force_mode_z_vel_limit_, 0, 0, 0};
+        force_mode_axis_base_ = ys_curP_tcp_.M * KDL::Vector(0, 0, 1);
+        const double axis_norm = force_mode_axis_base_.Norm();
+        if (axis_norm > 1e-9) {
+          force_mode_axis_base_ = force_mode_axis_base_ / axis_norm;
+        }
         RCLCPP_INFO(this->get_logger(),
-                    "force mode enable request sent: ref(x,y,z,rx,ry,rz)=(%.4f,%.4f,%.4f,%.3f,%.3f,%.3f) Fz=%.2f vlim=%.4f",
+                    "force mode command sent: ref(x,y,z,rx,ry,rz)=(%.4f,%.4f,%.4f,%.3f,%.3f,%.3f) "
+                    "axis_base=(%.4f,%.4f,%.4f) applied_Fz=%.2f vlim=%.4f",
                     req->reference_frame[0], req->reference_frame[1], req->reference_frame[2],
                     req->reference_frame[3], req->reference_frame[4], req->reference_frame[5],
+                    force_mode_axis_base_.x(), force_mode_axis_base_.y(), force_mode_axis_base_.z(),
                     force_mode_wrench_z_, force_mode_z_vel_limit_);
         // 异步发送: 单线程 executor 不能在这里同步等 future(会死锁)，
         // 响应由 executor 在回调间处理, 置 done 标志, 402 主流程逐拍轮询。
         force_mode_client_->async_send_request(
             req,
             [this](rclcpp::Client<eli_common_interface::srv::ForceMode>::SharedFuture future) {
+              // 已超时/退刀/切换命令时，迟到的 start 响应不得重新污染本地状态。
+              if (!force_mode_enable_pending_) {
+                RCLCPP_WARN(this->get_logger(), "ignoring stale force mode enable response");
+                return;
+              }
               try {
                 auto res = future.get();
                 force_mode_enable_ok_ = res->success;
@@ -941,11 +1083,14 @@ namespace elite_robot {
       }
 
       bool ysURForceAppControl::disableForceMode() {
-        if (!force_mode_enabled_) {
+        const bool command_may_be_active = force_mode_enabled_ || force_mode_enable_pending_ || force_mode_enable_ok_;
+        if (!command_may_be_active) {
           return true;
         }
         force_mode_enabled_ = false;
         force_mode_enable_pending_ = false;
+        force_mode_enable_done_ = false;
+        force_mode_enable_ok_ = false;
         if (!force_mode_client_ || !force_mode_client_->service_is_ready()) {
           // 服务不可用(驱动重启等)时直接清状态，不阻塞退刀
           return false;
@@ -959,8 +1104,7 @@ namespace elite_robot {
       }
 
       void ysURForceAppControl::polish_doForceContact() {
-        if (sub_step_ == 402 ) 
-        {
+        if (sub_step_ == 402 ) {
           // 调试空跑模式: 不做接触下压，但先发一条平滑轨迹慢速走到轨迹起点——
           // 直接跳进 404 会被 20ms 流式目标全速追点（2026-07-27 用户反馈接近速度过快）
           if (debug_skip_force_contact_) {
@@ -998,163 +1142,251 @@ namespace elite_robot {
             return;
           }
 
-          // 力控使能请求已发出: 等待响应(响应回调由 executor 处理, 不阻塞本回调)
+          // 力控命令已发出: 等待 SDK socket 写入结果(不是控制器闭环状态确认)。
           if (force_mode_enable_pending_) {
             if (!force_mode_enable_done_) {
               // 看门狗: 等待超过 3s 视为失败
               auto elapsed = std::chrono::steady_clock::now() - force_mode_enable_start_;
               if (elapsed > std::chrono::seconds(3)) {
-                force_mode_enable_pending_ = false;
                 RCLCPP_ERROR(this->get_logger(), "enable force mode: response timeout, polish aborted");
-                app_cmd_ = AppCommand::NOTHING;
-                sub_step_ = 9999;
+                disableForceMode();
+                sub_step_ = 405;
               }
               return;
             }
             force_mode_enable_pending_ = false;
             if (!force_mode_enable_ok_) {
               RCLCPP_ERROR(this->get_logger(), "enable force mode failed, polish aborted");
-              app_cmd_ = AppCommand::NOTHING;
-              sub_step_ = 9999;
+              sub_step_ = 405;
               return;
             }
             force_mode_enabled_ = true;
-            RCLCPP_INFO(this->get_logger(), "force mode ENABLED");
-            RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
+            force_mode_last_contact_ = std::chrono::steady_clock::now();
+            force_mode_verify_start_ = force_mode_last_contact_;
+            force_mode_verify_last_log_ = force_mode_last_contact_;
+            force_mode_verify_stable_ = false;
+            RCLCPP_INFO(this->get_logger(),
+              "force mode command accepted by SDK; verifying measured force before polishing");
+            return;
+          }
+
+          // SDK 返回值只代表命令已写入 socket。先保持当前位置，确认控制器确实建立了
+          // 目标法向力，再启动打磨机和切向轨迹；这样符号/参考系/目标过小等问题不会
+          // 等到机械臂已经在板面上移动后才暴露。
+          if (force_mode_enabled_) {
+            const auto now = std::chrono::steady_clock::now();
+            const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+            const double expected_reaction_fz = force_mode_sensor_target_fz_;
+            const double force_error = std::fabs(relative_fz - expected_reaction_fz);
+
+            if (std::chrono::duration<double>(now - force_mode_verify_last_log_).count() >= 0.5) {
+              RCLCPP_INFO(this->get_logger(),
+                "force-mode verification progress: relative_fz=%.3f sensor_target=%.3f "
+                "sdk_applied_Fz=%.3f error=%.3f",
+                relative_fz, expected_reaction_fz, force_mode_wrench_z_, force_error);
+              force_mode_verify_last_log_ = now;
+            }
+
+            if (relative_fz <= force_mode_abort_fz_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "force-mode verification: excessive force %.3f N; aborting before polish", relative_fz);
+              disableForceMode();
+              publishCurrentPositionHold(contact_hold_time_);
+              sub_step_ = 405;
+              return;
+            }
+
+            if (force_error <= force_mode_verify_tolerance_) {
+              if (!force_mode_verify_stable_) {
+                force_mode_verify_stable_ = true;
+                force_mode_verify_stable_start_ = now;
+                RCLCPP_INFO(this->get_logger(),
+                  "force-mode verification entered target band: relative_fz=%.3f target=%.3f tol=%.3f",
+                  relative_fz, expected_reaction_fz, force_mode_verify_tolerance_);
+              }
+              const double stable_for = std::chrono::duration<double>(
+                now - force_mode_verify_stable_start_).count();
+              if (stable_for >= force_mode_verify_time_) {
+                force_mode_last_contact_ = now;
+                force_mode_monitor_last_log_ = now;
+                force_mode_verify_stable_ = false;
+                RCLCPP_INFO(this->get_logger(),
+                  "force mode VERIFIED: relative_fz=%.3f stable_for=%.2fs; sub step done: %d",
+                  relative_fz, stable_for, sub_step_);
+                sub_step_++;
+              }
+            } else {
+              force_mode_verify_stable_ = false;
+            }
+
+            const double verify_elapsed = std::chrono::duration<double>(
+              now - force_mode_verify_start_).count();
+            if (verify_elapsed > force_mode_verify_timeout_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "force-mode verification timeout: relative_fz=%.3f expected=%.3f +/- %.3f; "
+                "aborting before tangential motion",
+                relative_fz, expected_reaction_fz, force_mode_verify_tolerance_);
+              disableForceMode();
+              publishCurrentPositionHold(contact_hold_time_);
+              sub_step_ = 405;
+            }
+            return;
+          }
+
+          const KDL::Frame startPos = frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
+          KDL::Frame curFrame = ys_curP_tcp_;
+          curFrame.M = startPos.M;
+          const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+
+          if (!contact_approach_started_) {
+            contact_approach_started_ = true;
+            contact_approach_start_ = std::chrono::steady_clock::now();
+            contact_approach_start_p_ = ys_curP_tcp_.p;
+            contact_approach_axis_base_ = startPos.M * KDL::Vector(0, 0, 1);
+            const double norm = contact_approach_axis_base_.Norm();
+            if (norm > 1e-9) {
+              contact_approach_axis_base_ = contact_approach_axis_base_ / norm;
+            }
+            RCLCPP_INFO(this->get_logger(),
+              "402 approach started: axis_base=(%.4f,%.4f,%.4f), max_travel=%.3fm timeout=%.1fs",
+              contact_approach_axis_base_.x(), contact_approach_axis_base_.y(),
+              contact_approach_axis_base_.z(), contact_max_travel_, contact_timeout_);
+          }
+
+          // 接触确认后立即用当前位置目标抢占逼近轨迹；不再反向发布 -3mm 轨迹。
+          // 等待保持轨迹和实际关节速度稳定后，才把同一轴交给 startForceMode。
+          if (contact_confirmed_) {
+            if (!contact_hold_started_) {
+              contact_hold_started_ = true;
+              contact_hold_start_ = std::chrono::steady_clock::now();
+              publishCurrentPositionHold(contact_hold_time_);
+
+              KDL::Frame offsetFrame;
+              offsetFrame.p = ys_curP_tcp_.p - startPos.p;
+              offsetFrame.M = KDL::Rotation::Identity();
+              frame_forceadjust_base_ = offsetFrame * frame_forceadjust_base_;
+              RCLCPP_INFO(this->get_logger(),
+                "contact confirmed (%d frames): relative_fz=%.3f raw_fz=%.3f; holding before force mode",
+                contact_confirm_count_, relative_fz, ys_contact_wrench_sensor_.force.data[2]);
+              RCLCPP_INFO(this->get_logger(), "contact offset base=(%.5f,%.5f,%.5f)",
+                offsetFrame.p.x(), offsetFrame.p.y(), offsetFrame.p.z());
+              return;
+            }
+
+            const double hold_elapsed = std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - contact_hold_start_).count();
+            // time_from_start 到时不等于 action 已经完成。实测 result 回调约晚 50ms；
+            // 在完成余量结束前调用 startForceMode，会被随后发生的控制流程切换覆盖。
+            if (hold_elapsed < contact_hold_time_ + contact_hold_completion_margin_
+                || maxJointSpeed() > contact_joint_velocity_limit_) {
+              return;
+            }
+
+            if (use_force_mode_) {
+              sendEnableForceModeRequest();
+              if (!force_mode_enable_pending_) {
+                RCLCPP_ERROR(this->get_logger(), "failed to send force mode command; polish aborted");
+                sub_step_ = 405;
+              }
+              return;
+            }
+
+            RCLCPP_INFO(this->get_logger(), "sub step done: %d (legacy position force adjustment)", sub_step_);
             sub_step_++;
             return;
           }
 
-          bool touch = false;
-
-          //start up point
-          KDL::Frame  startPos, upFrame;
-          startPos = frame_polishcloud_transform_ *  polishcurve_OriginFrames_[0];
-          // startPos = frame_polishcloud_transform_ * frame_polishcloud_base_ * polishcurve_OriginFrames_[0];
-          //ik
-          KDL::Frame  curFrame, tmpFrame, moveFrame;
-          moveFrame.p = KDL::Vector(0,0,dz_polish_startup_tool_);//offset tool z 
-          moveFrame.M = KDL::Rotation::RPY(0,0,0);
-          upFrame = startPos * moveFrame;
-          curFrame = ys_curP_tcp_;
-          curFrame.M = startPos.M;
-
-          // 2026-08-01: 恢复简单逻辑——固定步长沿 tool z 逼近，直到力阈值判定接触。
-          // 不做任何位置推算(covered/remain): 框架深度不准时会提前把步长算成 0，
-          // 导致停在板面前。此逻辑不管板面实际在哪，一直压到力触发为止。
-          double dcontact = contact_step_;
-          int trajCount = 30*speed_level_;
-          RCLCPP_INFO(this->get_logger(),
-            "402 approach: step=%.5f forcez_avg=%.3f forcez_inst=%.3f",
-            dcontact, ys_average_wrench_.force.data[2], ys_contact_wrench_sensor_.force.data[2]);
-          // 2026-08-01: 接触判定改用瞬时力(原平均窗口滞后 ~0.16s, 刚性板会多压 1~2mm
-          // 造成力尖峰触发示教器报警)；瞬时力噪声小(±0.1N), 阈值 2N 足够抗噪。
-          if ( ys_contact_wrench_sensor_.force.data[2] < contact_fz_threshold_)
-          // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
-          //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
-          //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
-          //     )>fabs(dz_polish_startup_tool_))
-          {
-            dcontact = -contact_step_;
-            touch = true;
-            RCLCPP_INFO(this->get_logger()," contact delta d %f ", dcontact);
+          const KDL::Vector approach_delta = ys_curP_tcp_.p - contact_approach_start_p_;
+          const double approach_travel =
+            approach_delta.x() * contact_approach_axis_base_.x() +
+            approach_delta.y() * contact_approach_axis_base_.y() +
+            approach_delta.z() * contact_approach_axis_base_.z();
+          const double approach_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - contact_approach_start_).count();
+          if (approach_travel > contact_max_travel_ || approach_elapsed > contact_timeout_) {
+            publishCurrentPositionHold(contact_hold_time_);
+            contact_detection_enabled_ = false;
+            RCLCPP_ERROR(this->get_logger(),
+              "contact search watchdog: travel=%.4fm (limit %.4f), time=%.2fs (limit %.2f); polish aborted",
+              approach_travel, contact_max_travel_, approach_elapsed, contact_timeout_);
+            app_cmd_ = AppCommand::NOTHING;
+            sub_step_ = 9999;
+            return;
           }
+
           control_dt_index_++;
-          if (control_dt_index_!=control_dt_count_&&touch==false)  return;
+          if (control_dt_index_ != control_dt_count_) {
+            return;
+          }
           control_dt_index_=0;
-          
-          // trajectory
-          trajectory_msgs::msg::JointTrajectory ys_goal;
-          ys_goal.header.stamp = this->now();
-          ys_goal.header.frame_id = "new";
-          for(int i=0;i<joint_size_;++i)      {
-              ys_goal.joint_names.push_back(ys_prefix_ + joint_names_[i]);
-          }
-          
-          //fk
-          KDL::JntArray ys_resultJnt(joint_size_);
-          KDL::JntArray lastQ(joint_size_);
-          lastQ = ys_cur_q_;
-          rclcpp::Duration deltaT(0, 1E9/125);
 
-          for (size_t i = 0; i < (size_t)trajCount; i++)
-          {
-            //ys_ik
-            moveFrame.p = KDL::Vector(0,0,dcontact)*(i+1)/trajCount;//offset tool z 
-            moveFrame.M = KDL::Rotation::RPY(0,0,0);
-            // RCLCPP_INFO(this->get_logger(), "moveFrame: x %f ; y %f ; z %f", moveFrame.p.data[0], moveFrame.p.data[1], moveFrame.p.data[2]);
-            tmpFrame = curFrame*moveFrame;
-            int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, tmpFrame, ys_resultJnt);
-            if (rc == 1) {
-              if (!KDL::Equal(lastQ, ys_resultJnt, M_PI/10)) {
-                RCLCPP_FATAL(this->get_logger()," ys_resultJnt  lastQ, %f, %f, %f, %f, %f, %f", 
-                  lastQ(0)*180/M_PI, lastQ(1)*180/M_PI, lastQ(2)*180/M_PI, lastQ(3)*180/M_PI, lastQ(4)*180/M_PI, lastQ(5)*180/M_PI);
-                RCLCPP_FATAL(this->get_logger()," ys_resultJnt  target, %f, %f, %f, %f, %f, %f", 
-                  ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
-                ys_resultJnt = lastQ;
-              }
-              lastQ = ys_resultJnt;
-            } else {
-              RCLCPP_INFO(this->get_logger()," contact target %d, trac ik failed", i+1);
+          RCLCPP_INFO(this->get_logger(),
+            "402 approach: step=%.5f travel=%.4f relative_fz=%.3f raw_fz=%.3f confirm=%d/%d",
+            contact_step_, approach_travel, relative_fz, ys_contact_wrench_sensor_.force.data[2],
+            contact_confirm_count_, contact_confirm_samples_);
+
+          // 这里只需求本周期的笛卡尔端点。原实现每周期求 60 次 IK，不仅会阻塞
+          // 约数百毫秒，任意一个 5ms TRAC-IK 超时还会让整个流程退出。
+          // 轨迹控制器会在当前位置和这个 1mm 端点之间自行平滑插值。
+          KDL::JntArray targetJnt(joint_size_);
+          int last_rc = -1;
+          int solved_attempt = -1;
+          double solved_step = contact_step_;
+          for (int attempt = 0; attempt < 3; ++attempt) {
+            const double step_scale = 1.0 / static_cast<double>(1 << attempt);
+            KDL::Frame moveFrame;
+            moveFrame.p = KDL::Vector(0, 0, contact_step_ * step_scale);
+            moveFrame.M = KDL::Rotation::Identity();
+            const KDL::Frame targetFrame = curFrame * moveFrame;
+            targetJnt = ys_cur_q_;
+            last_rc = ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, targetFrame, targetJnt);
+            if (last_rc == 1 && KDL::Equal(ys_cur_q_, targetJnt, M_PI / 10)) {
+              solved_attempt = attempt;
+              solved_step = contact_step_ * step_scale;
+              break;
             }
-            //traj point
-            trajectory_msgs::msg::JointTrajectoryPoint tmpPt;
-            for(int x=0;x<joint_size_;++x)
-            {
-                tmpPt.positions.push_back(ys_resultJnt(x));
-                tmpPt.velocities.push_back(0);
-            }
-            tmpPt.time_from_start = rclcpp::Duration::from_nanoseconds(deltaT.nanoseconds() * (i + 1));// 时间必须逐点递增，否则被控制器拒绝
-            ys_goal.points.push_back(tmpPt);
           }
 
-          //pub
-          // RCLCPP_INFO(this->get_logger(),"pub contact start polish trajectory");
-          ys_traj_publisher_->publish(ys_goal);   
-
-          if ( ys_contact_wrench_sensor_.force.data[2] < contact_fz_threshold_)
-          // if ( std::sqrt((curFrame.p.data[0]-upFrame.p.data[0])*(curFrame.p.data[0]-upFrame.p.data[0])
-          //       +(curFrame.p.data[1]-upFrame.p.data[1])*(curFrame.p.data[1]-upFrame.p.data[1])
-          //       +(curFrame.p.data[2]-upFrame.p.data[2])*(curFrame.p.data[2]-upFrame.p.data[2])
-          //     )>fabs(dz_polish_startup_tool_))
-          {
-            RCLCPP_INFO(this->get_logger()," contact  polish start point");
-            RCLCPP_FATAL(this->get_logger()," ys_resultJnt  lastQ, %f, %f, %f, %f, %f, %f", 
-            lastQ(0)*180/M_PI, lastQ(1)*180/M_PI, lastQ(2)*180/M_PI, lastQ(3)*180/M_PI, lastQ(4)*180/M_PI, lastQ(5)*180/M_PI);
-            RCLCPP_INFO(this->get_logger()," ys_resultJnt  curQ, %f, %f, %f, %f, %f, %f", 
-            ys_cur_q_(0)*180/M_PI, ys_cur_q_(1)*180/M_PI, ys_cur_q_(2)*180/M_PI, ys_cur_q_(3)*180/M_PI, ys_cur_q_(4)*180/M_PI, ys_cur_q_(5)*180/M_PI);
-            //todo calcOffsetFrame
-            KDL::Frame offsetFrame;
-            offsetFrame.p = curFrame.p - startPos.p;
-            offsetFrame.M = KDL::Rotation::RPY(0, 0, 0);
-            RCLCPP_INFO(this->get_logger()," ys offsetFrame, x: %f, y: %f, z: %f", 
-            offsetFrame.p.data[0], offsetFrame.p.data[1], offsetFrame.p.data[2]);
-            frame_forceadjust_base_ = offsetFrame * frame_forceadjust_base_;
-            // 2026-08-02: 接触后开启控制器内建力控，后续 z 向恒力交给控制器闭环
-            if (use_force_mode_) {
-              // 异步发送使能请求, 不阻塞; 响应到达后下一控制拍推进到 403
-              sendEnableForceModeRequest();
-              if (force_mode_enable_pending_) {
-                RCLCPP_INFO(this->get_logger(), "contact done, waiting for force mode enable response");
-                return;
-              }
-              // 发送失败(服务不可用等) 已在 sendEnableForceModeRequest 内置失败标志,
-              // 下一拍 pending 分支会中止, 这里也直接中止
-              RCLCPP_ERROR(this->get_logger(), "enable force mode request failed, polish aborted");
+          if (solved_attempt < 0) {
+            contact_ik_failure_count_++;
+            RCLCPP_WARN(this->get_logger(),
+              "contact endpoint IK transient failure: rc=%d consecutive=%d/%d; will retry",
+              last_rc, contact_ik_failure_count_, contact_ik_max_failures_);
+            if (contact_ik_failure_count_ >= contact_ik_max_failures_) {
+              publishCurrentPositionHold(contact_hold_time_);
+              contact_detection_enabled_ = false;
+              RCLCPP_ERROR(this->get_logger(),
+                "contact endpoint IK failed for %d consecutive cycles; polish aborted",
+                contact_ik_failure_count_);
               app_cmd_ = AppCommand::NOTHING;
               sub_step_ = 9999;
-              return;
-            } else {
-              RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
-              sub_step_++;
             }
+            return;
           }
+          contact_ik_failure_count_ = 0;
+          if (solved_attempt > 0) {
+            RCLCPP_WARN(this->get_logger(),
+              "contact endpoint IK used reduced step %.6fm after retry", solved_step);
+          }
+
+          trajectory_msgs::msg::JointTrajectory ys_goal;
+          ys_goal.header.stamp = this->now();
+          ys_goal.header.frame_id = "contact_approach";
+          trajectory_msgs::msg::JointTrajectoryPoint point;
+          for (int i = 0; i < joint_size_; ++i) {
+            ys_goal.joint_names.push_back(ys_prefix_ + joint_names_[i]);
+            point.positions.push_back(targetJnt(i));
+            point.velocities.push_back(0.0);
+          }
+          point.time_from_start = rclcpp::Duration::from_seconds(0.48);
+          ys_goal.points.push_back(point);
+          ys_traj_publisher_->publish(ys_goal);
         }
       }
       void ysURForceAppControl::polish_startPolishtool() {
         if (sub_step_ == 403
         ) {
-            ysPolishTool_Open();
+            // ysPolishTool_Open();
             RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
             sub_step_++;
         }
@@ -1189,12 +1421,22 @@ namespace elite_robot {
           KDL::Frame moveFrame;
           int trajCount=120*speed_level_;
           rclcpp::Duration deltaT(0, 1E9/50);
-          // 退刀: base y 侧移 + 世界系竖直抬刀（world_up_in_base_ / retract_lift_height_ 为 ROS 参数）
+          // 安全退刀分两段：先沿接触轴反向（世界 X-）离开工件，再竖直抬升。
+          // 原实现写死 base Y+ 侧移 100mm，异常退出时会表现为突兀的大幅横移。
+          const double axial_phase = 0.4;
           for (size_t i = 0; i < trajCount; i++)
           {
             //ys_ik
             lastQ = ys_resultJnt;
-            moveFrame.p = KDL::Vector(0,0.1*(i+1)/trajCount,0) + world_up_in_base_*(retract_lift_height_*(i+1)/trajCount);//base y侧移 + 世界系竖直抬刀
+            const double progress = static_cast<double>(i + 1) / static_cast<double>(trajCount);
+            if (progress <= axial_phase) {
+              moveFrame.p = -force_mode_axis_base_ *
+                (retract_axial_distance_ * progress / axial_phase);
+            } else {
+              const double lift_progress = (progress - axial_phase) / (1.0 - axial_phase);
+              moveFrame.p = -force_mode_axis_base_ * retract_axial_distance_
+                + world_up_in_base_ * (retract_lift_height_ * lift_progress);
+            }
             moveFrame.M = KDL::Rotation::RPY(0,0,0);
             upFrame = moveFrame * curFrame;
             int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, upFrame, ys_resultJnt);
@@ -1258,6 +1500,65 @@ namespace elite_robot {
         }
       }
 
+      bool ysURForceAppControl::forceModeWatchdog(const KDL::Frame &nominal_frame) {
+        if (!force_mode_enabled_) {
+          return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+        if (relative_fz <= force_mode_abort_fz_) {
+          RCLCPP_ERROR(this->get_logger(),
+            "force-mode watchdog: excessive contact force %.3f N (limit %.3f N)",
+            relative_fz, force_mode_abort_fz_);
+          disableForceMode();
+          publishCurrentPositionHold(contact_hold_time_);
+          sub_step_ = 405;
+          return false;
+        }
+
+        if (relative_fz <= force_mode_min_contact_fz_) {
+          force_mode_last_contact_ = now;
+        } else {
+          const double lost_for = std::chrono::duration<double>(now - force_mode_last_contact_).count();
+          if (lost_for > force_mode_contact_loss_timeout_) {
+            RCLCPP_ERROR(this->get_logger(),
+              "force-mode watchdog: contact lost for %.2fs (relative_fz=%.3f N)",
+              lost_for, relative_fz);
+            disableForceMode();
+            publishCurrentPositionHold(contact_hold_time_);
+            sub_step_ = 405;
+            return false;
+          }
+        }
+
+        const KDL::Vector pose_error = ys_curP_tcp_.p - nominal_frame.p;
+        const double axial_error =
+          pose_error.x() * force_mode_axis_base_.x() +
+          pose_error.y() * force_mode_axis_base_.y() +
+          pose_error.z() * force_mode_axis_base_.z();
+
+        if (std::chrono::duration<double>(now - force_mode_monitor_last_log_).count()
+            >= force_mode_monitor_log_period_) {
+          const double used_ratio = force_mode_max_axial_deviation_ > 1e-9
+            ? std::fabs(axial_error) / force_mode_max_axial_deviation_ : 0.0;
+          RCLCPP_INFO(this->get_logger(),
+            "force-mode monitor: relative_fz=%.3f axial_comp=%.4fm limit=%.4fm (%.0f%%)",
+            relative_fz, axial_error, force_mode_max_axial_deviation_, used_ratio * 100.0);
+          force_mode_monitor_last_log_ = now;
+        }
+        if (std::fabs(axial_error) > force_mode_max_axial_deviation_) {
+          RCLCPP_ERROR(this->get_logger(),
+            "force-mode watchdog: axial deviation %.4fm exceeds %.4fm (relative_fz=%.3f N)",
+            axial_error, force_mode_max_axial_deviation_, relative_fz);
+          disableForceMode();
+          publishCurrentPositionHold(contact_hold_time_);
+          sub_step_ = 405;
+          return false;
+        }
+        return true;
+      }
+
       void ysURForceAppControl::polish_doCurvePolishing() {
         if (sub_step_ == 404 ) 
         {
@@ -1269,12 +1570,13 @@ namespace elite_robot {
           KDL::Frame  curFrame, tmpFrame, moveFrame;
           curFrame = ys_curP_tcp_;
           double k=0,dz;
+          const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
           if (debug_skip_force_contact_ || (use_force_mode_ && force_mode_enabled_)) {
             k = 0;  // 调试空跑 / 控制器内建力控: 轨迹不叠加 z 力调整(z 由控制器闭环)
-          } else if (fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)<force_deadband_) {
+          } else if (fabs(relative_fz - target_fz_)<force_deadband_) {
             k=0;
           } else {
-            k=fabs(ys_contact_wrench_sensor_.force.data[2] - target_fz_)/(ys_contact_wrench_sensor_.force.data[2] - target_fz_);
+            k=fabs(relative_fz - target_fz_)/(relative_fz - target_fz_);
           }
           dz = k*adjust_dz_;
           if (dz>0) {
@@ -1304,6 +1606,9 @@ namespace elite_robot {
             //ys_ik
             tmpFrame = frame_forceadjust_base_ * frame_polishcloud_transform_* polishcurve_OriginFrames_[i];
             // tmpFrame = frame_forceadjust_base_ * frame_polishcloud_transform_*frame_polishcloud_base_ * polishcurve_OriginFrames_[i];
+            if (!forceModeWatchdog(tmpFrame)) {
+              return;
+            }
             int rc = ys_tcp_tracik_solver_->CartToJnt(lastQ, tmpFrame, ys_resultJnt);
             if (rc == 1) {
               if (!KDL::Equal(lastQ, ys_resultJnt, M_PI/10)) {
