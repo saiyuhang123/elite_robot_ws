@@ -13,6 +13,7 @@
 #include "std_srvs/srv/set_bool.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "eli_common_interface/srv/force_mode.hpp"
+#include "eli_common_interface/srv/set_io.hpp"
 
 #include <Eigen/Geometry>
 #include <kdl/chainfksolverpos_recursive.hpp>
@@ -244,6 +245,7 @@ namespace elite_robot {
             rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr vision_job_publisher_;  
             rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr vision_pose_sub_; 
             rclcpp::Client<eli_common_interface::srv::ForceMode>::SharedPtr force_mode_client_;
+            rclcpp::Client<eli_common_interface::srv::SetIO>::SharedPtr polish_tool_io_client_;
             //agv
             rclcpp::Publisher<std_msgs::msg::String>::SharedPtr agv_cmd_publisher_;  
             rclcpp::Subscription<std_msgs::msg::String>::SharedPtr agv_status_sub_;  

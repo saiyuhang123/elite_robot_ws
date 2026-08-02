@@ -258,8 +258,11 @@ namespace elite_robot {
             ys_contact_wrench_publisher_ = this->create_publisher<geometry_msgs::msg::WrenchStamped>("ys_contact_fts_broadcaster/wrench", 1); 
             // 控制器内建力控服务（驱动硬件接口暴露）
             force_mode_client_ = this->create_client<eli_common_interface::srv::ForceMode>("/force_mode_server/set_force_mode");
-            // //tool
-            // ys_polishtool_client_ = this->create_client<std_srvs::srv::SetBool>("ys_polishtool_setting"); //todo
+            // 打磨头控制：对应手动命令
+            // ros2 service call /io_and_status_controller/set_io
+            //   eli_common_interface/srv/SetIO "{fun: 2,pin: 7,state: true/false}"
+            polish_tool_io_client_ = this->create_client<eli_common_interface::srv::SetIO>(
+              "/io_and_status_controller/set_io");
             //timer
             motion_timer_ = this->create_wall_timer(
                 4ms, std::bind(&ysURForceAppControl::timer_callback, this));
@@ -1386,7 +1389,7 @@ namespace elite_robot {
       void ysURForceAppControl::polish_startPolishtool() {
         if (sub_step_ == 403
         ) {
-            // ysPolishTool_Open();
+            ysPolishTool_Open();
             RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
             sub_step_++;
         }
@@ -1755,35 +1758,53 @@ namespace elite_robot {
       }
 
       void ysURForceAppControl::ysPolishTool_Open() {
-        auto node = rclcpp::Node::make_shared("_polish_tool_client");
-        auto client = node->create_client<eli_common_interface::srv::SetIO>(
-          "/io_and_status_controller/set_io");
-        if (!client->wait_for_service(std::chrono::seconds(1))) {
+        if (!polish_tool_io_client_ || !polish_tool_io_client_->service_is_ready()) {
           RCLCPP_ERROR(this->get_logger(), "SetIO service not available for tool open");
           return;
         }
         auto req = std::make_shared<eli_common_interface::srv::SetIO::Request>();
-        req->fun = eli_common_interface::srv::SetIO::Request::FUN_SET_DIGITAL_OUT;
-        req->pin = 0;
-        req->state = 1.0;  // ON
-        client->async_send_request(req);
-        RCLCPP_INFO(this->get_logger(), "Polish tool open command sent");
+        req->fun = eli_common_interface::srv::SetIO::Request::FUN_SET_CONFIGURE_OUT;  // fun=2
+        req->pin = 7;
+        req->state = eli_common_interface::srv::SetIO::Request::STATE_ON;
+        polish_tool_io_client_->async_send_request(
+          req,
+          [this](rclcpp::Client<eli_common_interface::srv::SetIO>::SharedFuture future) {
+            try {
+              if (future.get()->success) {
+                RCLCPP_INFO(this->get_logger(), "Polish tool open confirmed: fun=2 pin=7 state=true");
+              } else {
+                RCLCPP_ERROR(this->get_logger(), "Polish tool open rejected by SetIO service");
+              }
+            } catch (const std::exception & e) {
+              RCLCPP_ERROR(this->get_logger(), "Polish tool open SetIO exception: %s", e.what());
+            }
+          });
+        RCLCPP_INFO(this->get_logger(), "Polish tool open command sent: fun=2 pin=7 state=true");
       }
 
       void ysURForceAppControl::ysPolishTool_Close() {
-        auto node = rclcpp::Node::make_shared("_polish_tool_client");
-        auto client = node->create_client<eli_common_interface::srv::SetIO>(
-          "/io_and_status_controller/set_io");
-        if (!client->wait_for_service(std::chrono::seconds(1))) {
+        if (!polish_tool_io_client_ || !polish_tool_io_client_->service_is_ready()) {
           RCLCPP_ERROR(this->get_logger(), "SetIO service not available for tool close");
           return;
         }
         auto req = std::make_shared<eli_common_interface::srv::SetIO::Request>();
-        req->fun = eli_common_interface::srv::SetIO::Request::FUN_SET_DIGITAL_OUT;
-        req->pin = 0;
-        req->state = 0.0;  // OFF
-        client->async_send_request(req);
-        RCLCPP_INFO(this->get_logger(), "Polish tool close command sent");
+        req->fun = eli_common_interface::srv::SetIO::Request::FUN_SET_CONFIGURE_OUT;  // fun=2
+        req->pin = 7;
+        req->state = eli_common_interface::srv::SetIO::Request::STATE_OFF;
+        polish_tool_io_client_->async_send_request(
+          req,
+          [this](rclcpp::Client<eli_common_interface::srv::SetIO>::SharedFuture future) {
+            try {
+              if (future.get()->success) {
+                RCLCPP_INFO(this->get_logger(), "Polish tool close confirmed: fun=2 pin=7 state=false");
+              } else {
+                RCLCPP_ERROR(this->get_logger(), "Polish tool close rejected by SetIO service");
+              }
+            } catch (const std::exception & e) {
+              RCLCPP_ERROR(this->get_logger(), "Polish tool close SetIO exception: %s", e.what());
+            }
+          });
+        RCLCPP_INFO(this->get_logger(), "Polish tool close command sent: fun=2 pin=7 state=false");
       }
 
     }
