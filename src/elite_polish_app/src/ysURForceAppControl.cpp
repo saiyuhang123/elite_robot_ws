@@ -42,16 +42,16 @@ namespace elite_robot {
           use_force_mode_ = this->declare_parameter<bool>("use_force_mode", true);
           // SDK wrench 是机器人施加给环境的力，不是传感器读到的反作用力。
           // 当前 FIX 参考系 z+ 与世界 x+ 重合，因此正值才会向工件逼近。
-          force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", 3.0);
+          force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", 0.9);
           // 力控 z 轴允许的最大调整速度(m/s)，防过冲。
           force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.004);
-          force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", -1.5);
+          force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", -0.3);
           force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 0.6);
           force_mode_verify_time_ = this->declare_parameter<double>("force_mode_verify_time", 0.5);
           force_mode_verify_timeout_ = this->declare_parameter<double>("force_mode_verify_timeout", 5.0);
           force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.040);
           force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
-          force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -5.0);
+          force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -7.0);
           force_mode_hard_abort_fz_ = this->declare_parameter<double>("force_mode_hard_abort_fz", -15.0);
           force_mode_hard_abort_confirm_time_ = this->declare_parameter<double>(
             "force_mode_hard_abort_confirm_time", 0.03);
@@ -59,7 +59,7 @@ namespace elite_robot {
             "force_mode_abort_confirm_time", 0.12);
           // 2026-08-02: 侧向力保护。两次停摆六维力显示侧向Fx/Fy(10~15N)先于Fz失控，
           // 平均侧向合力持续超阈值即按同一流程退出，比等Fz耦合超限更早、损伤更小。
-          force_mode_abort_lateral_f_ = this->declare_parameter<double>("force_mode_abort_lateral_f", 8.0);
+          force_mode_abort_lateral_f_ = this->declare_parameter<double>("force_mode_abort_lateral_f", 10.0);
           force_mode_lateral_abort_confirm_time_ = this->declare_parameter<double>(
             "force_mode_lateral_abort_confirm_time", 0.12);
           // 2026-08-02: 力控开放Rx/Ry旋转柔顺(目标力矩0)，端面贴合板面卸侧向拖曳力。
@@ -75,11 +75,11 @@ namespace elite_robot {
           orient_adapt_max_rate_ = this->declare_parameter<double>("orient_adapt_max_rate", 0.009);
           // 2026-08-02: 进给门控。过载暂停推进轨迹索引, 消除尖峰后"压着走"的二次爬升。
           feed_gate_enabled_ = this->declare_parameter<bool>("feed_gate_enabled", true);
-          feed_gate_fz_ = this->declare_parameter<double>("feed_gate_fz", -4.0);
+          feed_gate_fz_ = this->declare_parameter<double>("feed_gate_fz", -5.5);
           feed_gate_timeout_ = this->declare_parameter<double>("feed_gate_timeout", 3.0);
           // 2026-08-02: 405 退刀前等 endForceMode 响应并静置, 等驱动侧控制器完成切换。
           retract_disable_settle_time_ = this->declare_parameter<double>("retract_disable_settle_time", 1.0);
-          force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
+          force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.08);
           force_mode_contact_loss_timeout_ = this->declare_parameter<double>("force_mode_contact_loss_timeout", 2.0);
           polish_tool_spinup_time_ = this->declare_parameter<double>("polish_tool_spinup_time", 1.0);
           polish_tool_io_timeout_ = this->declare_parameter<double>("polish_tool_io_timeout", 2.0);
@@ -89,6 +89,9 @@ namespace elite_robot {
           // contact_fz_threshold: 402 接触判定阈值(N)，负值，压向工件时 force.z 小于它判定接触
           debug_skip_force_contact_ = this->declare_parameter<bool>("debug_skip_force_contact", false);
           contact_fz_threshold_ = this->declare_parameter<double>("contact_fz_threshold", target_fz_*2);
+          // 2026-08-02: 力符号约定。+1=压板读负(旧竖直板); 地面板法兰向下实测压板读正,
+          // 取-1翻回"压=负"(用户实测"向法兰内部压为正")。仅符号, 不影响阈值。
+          contact_force_sign_ = this->declare_parameter<double>("contact_force_sign", 1.0);
           contact_confirm_samples_ = std::max(
             1, static_cast<int>(this->declare_parameter<int>("contact_confirm_samples", 8)));
           contact_tare_samples_ = std::max(
@@ -534,7 +537,7 @@ namespace elite_robot {
             ys_contact_wrench_sensor_ = ys_gravityRepairWrench(data) - ys_bias_wrench_;
 
             // 保留最近 24 帧相对力，供过力退出时打印诊断序列，定位尖峰形态与触发时机。
-            force_history_.push_back(ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_);
+            force_history_.push_back(relFz());
             while (force_history_.size() > 24) {
               force_history_.pop_front();
             }
@@ -559,7 +562,7 @@ namespace elite_robot {
 
             // 接触只在新的传感器帧上计数；连续若干帧超过阈值才确认，拒绝瞬时尖峰。
             if (contact_detection_enabled_ && !contact_confirmed_) {
-              const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+              const double relative_fz = relFz();
               if (relative_fz < contact_fz_threshold_) {
                 contact_confirm_count_++;
                 if (contact_confirm_count_ >= contact_confirm_samples_) {
@@ -972,6 +975,10 @@ namespace elite_robot {
         contact_confirm_count_ = 0;
         contact_confirmed_ = false;
         contact_approach_started_ = false;
+        approach_retare_hold_started_ = false;
+        approach_retare_done_ = false;
+        approach_lateral_started_ = false;
+        approach_lateral_done_ = false;
         contact_hold_started_ = false;
         contact_ik_failure_count_ = 0;
         force_mode_verify_stable_ = false;
@@ -1012,6 +1019,29 @@ namespace elite_robot {
         point.time_from_start = rclcpp::Duration::from_seconds(std::max(0.05, duration_sec));
         hold.points.push_back(point);
         ys_traj_publisher_->publish(hold);
+      }
+
+      void ysURForceAppControl::publishOrientationHold(const KDL::Rotation &rot, double duration_sec) {
+        // 位置保持当前TCP点、姿态转到 rot: 402逼近前需把姿态从示教值转到视觉拟合值再重新去皮。
+        KDL::JntArray targetJnt(joint_size_);
+        const KDL::Frame target(rot, ys_curP_tcp_.p);
+        if (ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, target, targetJnt) != 1) {
+          RCLCPP_WARN(this->get_logger(), "orientation hold IK failed; holding current joints");
+          publishCurrentPositionHold(duration_sec);
+          return;
+        }
+        trajectory_msgs::msg::JointTrajectory traj;
+        traj.header.stamp = this->now();
+        traj.header.frame_id = "orientation_hold";
+        trajectory_msgs::msg::JointTrajectoryPoint point;
+        for (int i = 0; i < joint_size_; ++i) {
+          traj.joint_names.push_back(ys_prefix_ + joint_names_[i]);
+          point.positions.push_back(targetJnt(i));
+          point.velocities.push_back(0.0);
+        }
+        point.time_from_start = rclcpp::Duration::from_seconds(std::max(0.05, duration_sec));
+        traj.points.push_back(point);
+        ys_traj_publisher_->publish(traj);
       }
 
       void ysURForceAppControl::polish_waitPolishBase() {
@@ -1278,7 +1308,7 @@ namespace elite_robot {
           // 等到机械臂已经在板面上移动后才暴露。
           if (force_mode_enabled_) {
             const auto now = std::chrono::steady_clock::now();
-            const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+            const double relative_fz = relFz();
             const double expected_reaction_fz = force_mode_sensor_target_fz_;
             const double force_error = std::fabs(relative_fz - expected_reaction_fz);
 
@@ -1342,7 +1372,53 @@ namespace elite_robot {
           const KDL::Frame startPos = frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
           KDL::Frame curFrame = ys_curP_tcp_;
           curFrame.M = startPos.M;
-          const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+          const double relative_fz = relFz();
+
+          // 2026-08-02: 逼近姿态(startPos.M, 视觉拟合)与预打磨示教姿态可能相差很大,
+          // 401在示教姿态下的去皮重力残差会随手腕转动转进z轴形成虚力(实机+10N量级,
+          // 掩盖真实接触→检测不到→压到碰撞报警)。逼近开始前先在视觉姿态下重新去皮。
+          if (!approach_retare_done_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!approach_retare_hold_started_) {
+              approach_retare_hold_started_ = true;
+              approach_retare_hold_start_ = now;
+              // 必须清零计数: 否则401的旧计数会让下面的完成判断直接通过、跳过重新去皮
+              contact_tare_count_ = 0;
+              contact_tare_sum_ = 0.0;
+              contact_tare_sum_fx_ = 0.0;
+              contact_tare_sum_fy_ = 0.0;
+              publishOrientationHold(startPos.M, contact_settle_time_ + 0.5);
+              RCLCPP_INFO(this->get_logger(),
+                "402 pre-approach: rotating to vision orientation for re-tare");
+              return;
+            }
+            const double hold_elapsed = std::chrono::duration<double>(
+              now - approach_retare_hold_start_).count();
+            if (hold_elapsed > 15.0) {
+              RCLCPP_WARN(this->get_logger(),
+                "402 pre-approach re-tare: settle timeout; continuing with 401 tare");
+              approach_retare_done_ = true;
+              return;
+            }
+            if (contact_tare_collecting_) {
+              return;  // 采集中, 等回调凑满25帧并自动清collecting
+            }
+            if (contact_tare_count_ >= contact_tare_samples_) {
+              approach_retare_done_ = true;
+              RCLCPP_INFO(this->get_logger(),
+                "402 pre-approach re-tare done: zero=(%.3f,%.3f,%.3f)",
+                contact_fx_zero_, contact_fy_zero_, contact_fz_zero_);
+              return;
+            }
+            if (hold_elapsed >= contact_settle_time_
+                && maxJointSpeed() <= contact_joint_velocity_limit_) {
+              contact_tare_collecting_ = true;
+              RCLCPP_INFO(this->get_logger(),
+                "402 pre-approach: collecting %d re-tare samples at vision orientation",
+                contact_tare_samples_);
+            }
+            return;
+          }
 
           if (!contact_approach_started_) {
             contact_approach_started_ = true;
@@ -1430,6 +1506,63 @@ namespace elite_robot {
             "402 approach: step=%.5f travel=%.4f relative_fz=%.3f raw_fz=%.3f confirm=%d/%d",
             contact_step_, approach_travel, relative_fz, ys_contact_wrench_sensor_.force.data[2],
             contact_confirm_count_, contact_confirm_samples_);
+
+          // 2026-08-02 侧向对中(独立平移段): 一次性开环平移到名义起点正上方(保持轴向高度),
+          // 到位后再进入纯轴向下压。取代此前的每拍反馈斜插——跟踪延迟使步进方向在目标线
+          // 两侧反复翻转, 实机表现为板上方原地扭摆不下降(用户两轮实机复现)。
+          if (!approach_lateral_done_) {
+            const KDL::Vector to_start = startPos.p - ys_curP_tcp_.p;
+            const double axial_rem = to_start.x() * contact_approach_axis_base_.x()
+              + to_start.y() * contact_approach_axis_base_.y()
+              + to_start.z() * contact_approach_axis_base_.z();
+            const KDL::Vector lateral(
+              to_start.x() - axial_rem * contact_approach_axis_base_.x(),
+              to_start.y() - axial_rem * contact_approach_axis_base_.y(),
+              to_start.z() - axial_rem * contact_approach_axis_base_.z());
+            const double lateral_norm = lateral.Norm();
+            if (lateral_norm <= 0.005) {
+              approach_lateral_done_ = true;
+              return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (!approach_lateral_started_) {
+              approach_lateral_started_ = true;
+              approach_lateral_start_ = now;
+              KDL::JntArray latJnt(joint_size_);
+              const KDL::Frame latTarget(curFrame.M, ys_curP_tcp_.p + lateral);
+              if (ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, latTarget, latJnt) != 1) {
+                RCLCPP_WARN(this->get_logger(),
+                  "402 lateral align IK failed; descending without lateral correction");
+                approach_lateral_done_ = true;
+                return;
+              }
+              trajectory_msgs::msg::JointTrajectory lat_goal;
+              lat_goal.header.stamp = this->now();
+              lat_goal.header.frame_id = "new";
+              trajectory_msgs::msg::JointTrajectoryPoint lat_pt;
+              for (int i = 0; i < joint_size_; ++i) {
+                lat_goal.joint_names.push_back(ys_prefix_ + joint_names_[i]);
+                lat_pt.positions.push_back(latJnt(i));
+                lat_pt.velocities.push_back(0.0);
+              }
+              // 10mm/s 平移, 限时1~6s
+              const double move_t = std::min(6.0, std::max(1.0, lateral_norm / 0.01));
+              lat_pt.time_from_start = rclcpp::Duration::from_seconds(move_t);
+              lat_goal.points.push_back(lat_pt);
+              ys_traj_publisher_->publish(lat_goal);
+              RCLCPP_INFO(this->get_logger(),
+                "402 lateral align: offset=%.1fmm, moving above nominal start (%.1fs)",
+                lateral_norm * 1000.0, move_t);
+              return;
+            }
+            if (std::chrono::duration<double>(now - approach_lateral_start_).count() > 15.0) {
+              RCLCPP_WARN(this->get_logger(),
+                "402 lateral align timeout (offset=%.1fmm); descending anyway",
+                lateral_norm * 1000.0);
+              approach_lateral_done_ = true;
+            }
+            return;
+          }
 
           // 这里只需求本周期的笛卡尔端点。原实现每周期求 60 次 IK，不仅会阻塞
           // 约数百毫秒，任意一个 5ms TRAC-IK 超时还会让整个流程退出。
@@ -1716,8 +1849,8 @@ namespace elite_robot {
         }
 
         const auto now = std::chrono::steady_clock::now();
-        const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
-        const double relative_fz_avg = ys_average_wrench_.force.data[2] - contact_fz_zero_;
+        const double relative_fz = relFz();
+        const double relative_fz_avg = relFzAvg();
 
         // 硬保护：真实冲击会持续若干帧，单帧噪声尖峰（125Hz 力数据约 8ms）不触发。
         // 用真实时间持续确认而不是"连续 N 次检查"，因为 403/404 阶段 watchdog
@@ -1898,7 +2031,7 @@ namespace elite_robot {
           KDL::Frame  curFrame, tmpFrame, moveFrame;
           curFrame = ys_curP_tcp_;
           double k=0,dz;
-          const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
+          const double relative_fz = relFz();
           if (debug_skip_force_contact_ || (use_force_mode_ && force_mode_enabled_)) {
             k = 0;  // 调试空跑 / 控制器内建力控: 轨迹不叠加 z 力调整(z 由控制器闭环)
           } else if (fabs(relative_fz - target_fz_)<force_deadband_) {
@@ -2015,7 +2148,7 @@ namespace elite_robot {
           bool feed_gated = false;
           double fz_avg_gate = 0.0;
           if (feed_gate_enabled_ && force_mode_enabled_) {
-            fz_avg_gate = ys_average_wrench_.force.data[2] - contact_fz_zero_;
+            fz_avg_gate = relFzAvg();
             feed_gated = fz_avg_gate <= feed_gate_fz_;
           }
           if (feed_gated) {

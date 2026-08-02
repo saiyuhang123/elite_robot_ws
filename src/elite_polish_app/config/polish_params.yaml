@@ -14,6 +14,9 @@ ysURForceAppControl:
     # 402 使用“预备姿态局部归零后的相对反作用力”，连续多帧低于阈值才确认接触。
     # 接触反作用力为负；-1N 配合连续帧确认可在碰撞报警前停止位置逼近。
     contact_fz_threshold: -1.0
+    # 2026-08-02: 力符号约定(用户实测"向法兰内部压为正")。地面板法兰向下后压板力读数为正,
+    # 取-1翻回旧约定"压=负", 接触检测/力验证/过力保护/进给门控全部阈值保持不变。
+    contact_force_sign: -1.0
     contact_confirm_samples: 8       # 125Hz 力数据连续 8 帧，拒绝单帧尖峰
     contact_settle_time: 0.3         # 到预备点且关节静止后先等待(s)
     contact_tare_samples: 25         # 在预备姿态采集局部力零点，约 0.2s
@@ -48,7 +51,7 @@ ysURForceAppControl:
     # 当前 FIX 参考系 z+ 已核对为世界 x+；正值实现力小向 x+、力大向 x-。
     # SDK内部力与应用补偿/去皮后的relative_fz实测相差约1.1~1.2N：
     # SDK 0.5N -> relative约0N；SDK 2N -> relative约-0.85N。因此二者分开配置。
-    force_mode_wrench_z: 3.0         # SDK内部施力目标；预计应用侧实际反作用力约-1.5~-2N
+    force_mode_wrench_z: 0.9         # SDK内部施力目标; 2026-08-02 1.2→0.9 再减压(治标): 实测反作用力约-0.2~-0.3N
     force_mode_z_vel_limit: 0.004    # 力控z轴最大调整速度: 0.5→2→4mm/s。
                                      # 原0.5mm/s追不上打磨切向运动造成的法向扰动(实测0.2s内力涨25~40N/s)，
                                      # 导致力控"来不及退让"、力涨到-10N触发保护。2mm/s仍出现尖峰后二次爬升，
@@ -76,26 +79,29 @@ ysURForceAppControl:
     # 把打磨头"压着走"造成二次爬升(历次 averaged_overforce 停摆的直接死因)。
     # 过载即暂停推进、目标保持当前点，等z向力控拉回带内再走；超时按正常流程退出。
     feed_gate_enabled: true
-    feed_gate_fz: -4.0               # 20帧平均力过载阈值(N)，需高于 force_mode_abort_fz(-5)
+    feed_gate_fz: -5.5               # 20帧平均力过载阈值(N)，需高于 force_mode_abort_fz(-7)的绝对值低侧
+                                     # 2026-08-02 -4→-5.5: 配合过力放宽, 门控仍先于退出线介入
     feed_gate_timeout: 3.0           # 门控最长持续(s)，防产线悬死
     # startForceMode返回只表示socket写入成功；实测力稳定到目标附近后才开始切向运动。
-    force_mode_sensor_target_fz: -1.5 # 应用补偿/去皮后的实际反作用力目标(N)
+    force_mode_sensor_target_fz: -0.3 # 应用补偿/去皮后的实际反作用力目标(N); 2026-08-02随SDK 0.9N降至-0.3
     force_mode_verify_tolerance: 0.6 # 传感器反作用力目标为-applied_Fz，允许误差(N)
     force_mode_verify_time: 0.5      # 连续在目标带内多久才开始打磨(s)
     force_mode_verify_timeout: 5.0   # 建立不了目标力则在切向运动前安全退出(s)
     # 当前实机接触点与视觉名义路径存在约27mm差异，临时放宽至40mm继续验证。
     force_mode_max_axial_deviation: 0.040 # 实际TCP相对接触偏置后名义路径的最大轴向偏移(m)
     force_mode_monitor_log_period: 1.0    # 每秒输出实际力和轴向补偿，确认第二行反向时是否回落
-    force_mode_abort_fz: -5.0        # 20帧平均反作用力的持续过力阈值(N)
+    force_mode_abort_fz: -7.0        # 20帧平均反作用力的持续过力阈值(N); 2026-08-02 -5→-7:
+                                     # 盘有安装倾角时力偏高, 力控模式下机器人碰撞阈值远高于此(实测-15N瞬时不报警)
     force_mode_hard_abort_fz: -15.0  # 单帧瞬时硬保护阈值(N)
     force_mode_hard_abort_confirm_time: 0.03 # 硬过力需持续多久才退出(s)；拒绝打磨振动/噪声的单帧尖峰
     force_mode_abort_confirm_time: 0.12 # 平均力越过-5N需要持续的时间(s)
     # 2026-08-02: 侧向力保护通道。侧向拖曳(法向不对齐/刮边)的Fx/Fy通常先于Fz失控，
     # 等Fz耦合超-5N时打磨头已别得很紧；平均侧向合力超阈值即提前按同一流程退出。
     # 判定用预备姿态去皮后的相对值(与fz同源采样)：重力模型残差实测5~10N，绝对值会误触发。
-    force_mode_abort_lateral_f: 8.0  # 20帧平均侧向合力相对值sqrt((fx-fx0)^2+(fy-fy0)^2)的阈值(N)
+    force_mode_abort_lateral_f: 10.0 # 20帧平均侧向合力相对值sqrt((fx-fx0)^2+(fy-fy0)^2)的阈值(N);
+                                     # 2026-08-02 8→10: 盘有倾角时侧向摩擦力 baseline 偏高
     force_mode_lateral_abort_confirm_time: 0.12 # 侧向过力需持续多久才退出(s)
-    force_mode_min_contact_fz: -0.15 # 高于此值视为失去接触(N)
+    force_mode_min_contact_fz: -0.08 # 高于此值视为失去接触(N); 2026-08-02 -0.15→-0.08: 工作压力降至-0.3N附近, 原值会误判脱接触
     force_mode_contact_loss_timeout: 2.0  # 连续失去接触多久后退出(s)
     polish_tool_spinup_time: 1.0     # IO开启确认后原地稳压，期间不走切向轨迹(s)
     polish_tool_io_timeout: 2.0      # 等待打磨头SetIO开启响应的超时(s)
@@ -117,7 +123,7 @@ ysURForceAppControl:
     polishproduct_width: 0.15        # 打磨宽度(m) = 工件宽 15cm
     polishcurve_ycount: 1            # 单行打磨；目标行位于工件宽度中心
     dz_polish_startup_tool: -0.08   # 打磨预备点沿 tool z 抬高(m, 负值=远离工件)
-    speed_level: 3                  # 速度等级(影响轨迹点数/时长)。2→3: 扫掠时长40s→60s，
+    speed_level: 4                  # 速度等级(影响轨迹点数/时长)。2→3: 扫掠时长40s→60s，
                                     # 切向速度7.5mm/s→5mm/s，降低法向扰动注入速率，配合力控提速吸收。
 
     # ---- 退刀 ----
@@ -185,15 +191,10 @@ ysCamera3DSolver:
     plane_point_y: [0.638, -0.015]    # Y 参考测点
 
     # ---- 圆弧盒 (工件平面系下, 圈打磨特征区域) ----
-    # 2026-07-27 v2: 放大到罩住盒面四边(+2cm 余量)，使包围盒=盒的真实边缘，
-    # 盒子面内移动(上下左右)时 trans 跟随——实现面内跟踪。
-    # 2026-07-31: z 下限从 -0.02 抬到 -0.010（排除工件下方桌面的点），
-    # z 上限从 +0.02 扩到 +0.042（弧面顶部 z≈0.038，原值会切掉顶部）。
-    # 2026-08-01: y 下限从 -0.13 抬到 +0.015（排除地面：地面在平面系 y<0.015，
-    # 弧面 y 从 0.015 开始且其 min.z 在 y≈0.125 高端，裁底边不影响 trans(2)）；
-    # z 上限 +0.042 → +0.046 罩住弧面顶部。两个支撑块在圆弧盒外（平面系 x≈±0.24），不影响。
-    curve_box_min: [-0.18, 0.015, -0.010]
-    curve_box_max: [ 0.21,  0.13,  0.046]
+    # 2026-08-02 地面板标定(基于19:26留底云): 板在平面系 x(扫掠,长边)±0.17、y(换道,短边)
+    # [-0.107,0.043]; z 只取板面薄层(法向穿进板内为正, 地面在z≈+0.02以下, 必须排除)。
+    curve_box_min: [-0.17, -0.11, -0.008]
+    curve_box_max: [ 0.17,  0.05,  0.005]
 
     # ---- 圆弧坐标系常数 ----
     curve_radius: 0.9306       # 与状态机 polishcurve_radius 一致
@@ -202,7 +203,7 @@ ysCamera3DSolver:
     # 2026-08-01: 0.1 → 0.05。旧值按旧工件弧面 y 范围(-0.04~0.13)调，
     # 新工件弧面 y 范围 [0.018, 0.128]，旧值导致打磨带整体偏低、第一道从弧面中间开始。
     # 0.05 使三道 y≈0.118/0.078/0.038，第一道落在弧面上部（接近左上角）。
-    curve_y_offset: 0.05       # trans(1) = max.y - 此值
+    curve_y_offset: 0.075      # trans(1) = max.y - 此值; 地面板单行居中=板短边一半(0.15/2)
 
     # ---- 工具姿态 ----
     # false: 工具Z+跟随RANSAC工件法向；单行扫掠方向由世界竖直投影约束，避免绕法向翻转。
