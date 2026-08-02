@@ -20,8 +20,8 @@ ysURForceAppControl:
     contact_hold_time: 0.25          # 确认接触后保持当前位置再切力控(s)
     contact_hold_completion_margin: 0.20 # 等待轨迹action真正完成；实测result比time_from_start晚约50ms
     contact_joint_velocity_limit: 0.01  # 允许切换力控的最大关节速度(rad/s)
-    contact_max_travel: 0.15         # 从预备点沿拟合法向最大搜索距离(m)
-    contact_timeout: 90.0            # 实测约1.9mm/s；搜索150mm约78s，预留控制器余量
+    contact_max_travel: 0.25         # 从预备点沿拟合法向最大搜索距离(m)；2026-08-02 地面板预备点距板20cm
+    contact_timeout: 180.0           # 实测约1.9mm/s；搜索250mm约130s，预留控制器余量
     contact_ik_max_failures: 5       # 端点IK连续失败5个周期才中止；单次超时自动缩步重试
     # 空跑模式接近轨迹起点的时长(s)，越大越慢
     debug_approach_time: 4.0
@@ -130,9 +130,10 @@ ysURForceAppControl:
     retract_disable_settle_time: 1.0
 
     # ---- 示教姿态 ----
-    home_q_deg: [8.2, -93.6, -110.2, 57.4, 91.7, 91.6]              # Home(角度制)
-    camera_capture_q_rad: [0.1204, -0.9960, -2.4689, 0.4922, 1.6232, 1.6037]  # 拍照位(弧度制)
-    polish_base_q_rad: [0.4555, -1.3985, -1.6755, 0.5356, 1.3404, 1.4224]     # 打磨基准位(弧度制)
+    # 2026-08-02 改: 地面平放板+法兰向下打磨布置。home/拍照位=用户示教值。
+    home_q_deg: [-1.2, -57.4, -95.2, -68.4, 90.0, 96.0]              # Home(角度制)
+    camera_capture_q_rad: [-0.020944, -1.001819, -1.661553, -1.193805, 1.570796, 1.675516]  # 拍照位(弧度制)
+    polish_base_q_rad: [0.050615, -1.385791, -1.876229, -0.523599, 1.642355, 0.174533]     # 打磨基准位(弧度制, 2026-08-02 地面板正上方20cm示教)
 
 # ---------------- 视觉节点 ----------------
 ysCamera3DSolver:
@@ -148,9 +149,10 @@ ysCamera3DSolver:
     handeye_translation: [-0.127097, 0.046615, 0.083001]    # m (t_cam2tool)
 
     # ---- 大盒 (cs66_base_link 系, 工件整体包围盒) ----
-    # 2026-08-01 手动单帧法重标(碰板心+点云探针)。工件/治具变动后需重标。
-    target_box_min: [0.56, -0.30, 0.50]
-    target_box_max: [0.92,  0.30, 0.83]
+    # 2026-08-02 地面板标定(biaoding/analyze_ground_board.py 基于留底云): 盒内板面占99.4%,
+    # 地面(沿法向板下2~3cm)基本被z下限切掉。板面在base系为斜面, z下限按最低板面角-8mm。
+    target_box_min: [0.724, -0.316, 0.321]
+    target_box_max: [0.848,  0.052, 0.567]
 
     # ---- 工件平面拟合 (base_link 系) ----
     # 默认用 target_box 内全部候选点做带方向约束的 RANSAC，不再用三个10×10mm小框
@@ -167,11 +169,18 @@ ysCamera3DSolver:
     plane_fit_refit_enabled: true       # 首遍拟合后再在内点上重拟合一遍
     plane_fit_min_extent_x: 0.12        # 内点平面局部x(扫掠向)最小覆盖(m)
     plane_fit_min_extent_y: 0.10        # 内点平面局部y(竖直向)最小覆盖(m)
+    # 2026-08-02: 地面平放板+法兰向下打磨布置。期望法向=世界向下(=-world_up_in_base)。
+    # 平面参考=世界X(base系[0.669,0,0.743]): 使扫掠方向=世界Y=板长边(34cm, 容纳±0.149m行程),
+    # 换道方向=板短边(15cm)。删除/置空即回旧逻辑(竖直板)。
+    # 注意: 此布置下地面是与板面同族的水平面, target_box 的 z 下限必须切在地面与板面之间！
+    plane_expected_normal_in_base: [0.7431, -0.0120, -0.6691]
+    plane_up_reference_in_base: [0.669, 0.0, 0.743]
 
     # plane_point_o 的 x/y 继续作为轨迹局部原点锚点，实际原点会投影到拟合平面。
     # 其余两个点只供 plane_fit_enabled=false 的旧三点法回退使用。
+    # 2026-08-02: 地面板标定(grinder_tip.py 实测板心, 与点云质心偏差约2mm)。
     plane_box_z_range: [0.50, 0.82]
-    plane_point_o: [0.6844, -0.0091]  # 原点测点 (x, y) = 打磨头碰板心
+    plane_point_o: [0.8073, -0.1318]  # 原点测点 (x, y) = 打磨头碰板心
     plane_point_x: [0.684,  0.111]
     plane_point_y: [0.638, -0.015]    # Y 参考测点
 

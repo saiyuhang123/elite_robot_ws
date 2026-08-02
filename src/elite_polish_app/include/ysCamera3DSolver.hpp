@@ -82,6 +82,10 @@ namespace elite_robot {
             bool plane_fit_refit_enabled_ = true;
             double plane_fit_min_extent_x_ = 0.12;
             double plane_fit_min_extent_y_ = 0.10;
+            // 2026-08-02: 地面平放板/法兰向下打磨等非常规布置时覆盖期望法向与平面参考。
+            // 空向量=旧逻辑(竖直板: 世界X+ / world_up_in_base)。
+            Eigen::Vector3f plane_expected_normal_override_{0.0f, 0.0f, 0.0f};
+            Eigen::Vector3f plane_up_reference_override_{0.0f, 0.0f, 0.0f};
             double curve_radius_, curve_center_dz_, curve_tool_offset_, curve_y_offset_;
             bool tool_align_world_ = false;
             Eigen::Vector3f world_up_in_base_{-0.7431, 0.0120, 0.6691};

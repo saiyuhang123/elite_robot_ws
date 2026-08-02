@@ -64,6 +64,18 @@ namespace elite_robot {
         plane_fit_refit_enabled_ = this->declare_parameter<bool>("plane_fit_refit_enabled", true);
         plane_fit_min_extent_x_ = getd("plane_fit_min_extent_x", 0.12);
         plane_fit_min_extent_y_ = getd("plane_fit_min_extent_y", 0.10);
+        // 2026-08-02: 地面平放板/法兰向下打磨。空数组=旧逻辑(竖直板)。
+        // 地面板: expected=世界向下=-world_up_in_base=(0.7431,-0.0120,-0.6691), up_ref=世界Y=(0,1,0)。
+        {
+          auto en = getv3("plane_expected_normal_in_base", {});
+          if (en.size() == 3) {
+            plane_expected_normal_override_ = Eigen::Vector3f(en[0], en[1], en[2]);
+          }
+          auto ur = getv3("plane_up_reference_in_base", {});
+          if (ur.size() == 3) {
+            plane_up_reference_override_ = Eigen::Vector3f(ur[0], ur[1], ur[2]);
+          }
+        }
         curve_box_min_ = v4(getv3("curve_box_min", {-0.08, -0.14, -0.02}));
         curve_box_max_ = v4(getv3("curve_box_max", { 0.28,  0.24,  0.02}));
         curve_radius_ = getd("curve_radius", 0.9306);
@@ -291,6 +303,8 @@ namespace elite_robot {
         calcFrame.plane_fit_refit_enabled = plane_fit_refit_enabled_;
         calcFrame.plane_fit_min_extent_x = plane_fit_min_extent_x_;
         calcFrame.plane_fit_min_extent_y = plane_fit_min_extent_y_;
+        calcFrame.plane_expected_normal_override = plane_expected_normal_override_;
+        calcFrame.plane_up_reference_override = plane_up_reference_override_;
         calcFrame.curve_box_min = curve_box_min_;
         calcFrame.curve_box_max = curve_box_max_;
         calcFrame.curve_radius = curve_radius_;

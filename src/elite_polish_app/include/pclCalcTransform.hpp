@@ -84,6 +84,11 @@ class YsPCLCalcTransform
     bool plane_fit_refit_enabled = true;
     double plane_fit_min_extent_x = 0.12;  // 内点平面局部x(扫掠向)最小覆盖(m)
     double plane_fit_min_extent_y = 0.10;  // 内点平面局部y(竖直向)最小覆盖(m)
+    // 2026-08-02: 板子平放在地、法兰向下打磨的布置。期望法向/平面参考默认按旧逻辑
+    // (竖直板: 期望法向=世界X+, 平面参考=world_up_in_base); 模长>0.5 时覆盖。
+    // 地面板配置: expected=(0.7431,-0.0120,-0.6691)(世界向下), up_ref=(0,1,0)(世界Y)。
+    Eigen::Vector3f plane_expected_normal_override{0.0f, 0.0f, 0.0f};
+    Eigen::Vector3f plane_up_reference_override{0.0f, 0.0f, 0.0f};
     // 圆弧盒 (平面系)
     Eigen::Vector4f curve_box_min{-0.08, -0.14, -0.02, 1.0};
     Eigen::Vector4f curve_box_max{ 0.28,  0.24,  0.02, 1.0};
@@ -227,12 +232,22 @@ class YsPCLCalcTransform
         return;
       }
 
-      const Eigen::Vector3f expected_normal = expectedWorldX();
+      // 期望法向: 默认旧逻辑(竖直板=世界X+); 地面板等布置用 override 注入(如世界向下)。
+      const Eigen::Vector3f expected_normal =
+        (plane_expected_normal_override.norm() > 0.5f)
+          ? plane_expected_normal_override.normalized()
+          : expectedWorldX();
       if (expected_normal.norm() < 1e-6f) {
-        std::cout<<"[plane fit] FAIL: invalid world_up_in_base"<<std::endl;
+        std::cout<<"[plane fit] FAIL: invalid expected normal / world_up_in_base"<<std::endl;
         failed_ = true;
         return;
       }
+      // 平面参考向(决定扫掠/换道方向): 默认 world_up_in_base; 法向竖直时它会退化,
+      // 地面板必须用 override 注入水平参考(如世界Y)。
+      const Eigen::Vector3f up_reference =
+        (plane_up_reference_override.norm() > 0.5f)
+          ? plane_up_reference_override
+          : world_up_in_base;
 
       // 第一遍: 在固定裁剪框点云上拟合
       Eigen::Vector3f normal;
@@ -266,7 +281,7 @@ class YsPCLCalcTransform
       }
 
       // 平面局部坐标轴(与下方建系同一套): x=扫掠向, y=换道/竖直向, z=法向
-      Eigen::Vector3f plane_y = world_up_in_base;
+      Eigen::Vector3f plane_y = up_reference;
       plane_y.normalize();
       plane_y -= plane_y.dot(normal) * normal;
       if (plane_y.norm() < 1e-6f) {
