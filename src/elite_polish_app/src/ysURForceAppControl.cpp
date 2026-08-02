@@ -23,7 +23,7 @@ namespace elite_robot {
           app_cmd_ = -1;
           sub_step_ = -1;
           joint_size_ = 6;
-          speed_level_ = this->declare_parameter<int>("speed_level", 2);
+          speed_level_ = this->declare_parameter<int>("speed_level", 3);
           initDataQ();
 
           RCLCPP_INFO(this->get_logger(),"init force data");
@@ -43,7 +43,7 @@ namespace elite_robot {
           // 当前 FIX 参考系 z+ 与世界 x+ 重合，因此正值才会向工件逼近。
           force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", 3.0);
           // 力控 z 轴允许的最大调整速度(m/s)，防过冲。
-          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.0005);
+          force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.002);
           force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", -1.5);
           force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 0.6);
           force_mode_verify_time_ = this->declare_parameter<double>("force_mode_verify_time", 0.5);
@@ -510,6 +510,12 @@ namespace elite_robot {
           if (ys_first_wrench_==false) {
             ys_contact_wrench_sensor_ = ys_gravityRepairWrench(data) - ys_bias_wrench_;
 
+            // 保留最近 24 帧相对力，供过力退出时打印诊断序列，定位尖峰形态与触发时机。
+            force_history_.push_back(ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_);
+            while (force_history_.size() > 24) {
+              force_history_.pop_front();
+            }
+
             // 预备姿态保持静止后重新取局部零点。这样可消除启动姿态到打磨姿态之间
             // 的重力模型残差/零漂，避免尚未碰板时单帧约 -2N 被误判为接触。
             if (contact_tare_collecting_ && maxJointSpeed() <= contact_joint_velocity_limit_) {
@@ -940,6 +946,9 @@ namespace elite_robot {
         force_mode_verify_stable_ = false;
         force_mode_overforce_active_ = false;
         force_mode_hard_overforce_active_ = false;
+        last_polish_step_ = 0;
+        polish_tangential_started_ = false;
+        force_history_.clear();
         polish_tool_open_pending_ = false;
         polish_tool_open_done_ = false;
         polish_tool_open_ok_ = false;
@@ -1566,6 +1575,27 @@ namespace elite_robot {
         }
       }
 
+      void ysURForceAppControl::logForceDiagnostics(const std::string &reason) {
+        std::string seq;
+        seq.reserve(force_history_.size() * 8);
+        for (double f : force_history_) {
+          char buf[32];
+          snprintf(buf, sizeof(buf), "%.2f,", f);
+          seq += buf;
+        }
+        if (!seq.empty()) {
+          seq.pop_back();  // 去掉末尾逗号
+        }
+        double elapsed = 0.0;
+        if (polish_tangential_started_) {
+          elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - polish_tangential_start_).count();
+        }
+        RCLCPP_ERROR(this->get_logger(),
+          "force-mode diag: reason=%s step=%d elapsed=%.2fs recent_fz=[%s]",
+          reason.c_str(), last_polish_step_, elapsed, seq.c_str());
+      }
+
       bool ysURForceAppControl::forceModeWatchdog(const KDL::Frame &nominal_frame) {
         if (!force_mode_enabled_) {
           return true;
@@ -1595,6 +1625,7 @@ namespace elite_robot {
                 "force-mode watchdog: sustained hard overforce %.3f N for %.2fs "
                 "(limit %.3f N, avg=%.3f N)",
                 relative_fz, hard_for, force_mode_hard_abort_fz_, relative_fz_avg);
+              logForceDiagnostics("hard_overforce");
               disableForceMode();
               publishCurrentPositionHold(contact_hold_time_);
               sub_step_ = 405;
@@ -1622,6 +1653,7 @@ namespace elite_robot {
                 "force-mode watchdog: sustained averaged overforce %.3f N for %.2fs "
                 "(limit %.3f N, inst=%.3f N)",
                 relative_fz_avg, overforce_for, force_mode_abort_fz_, relative_fz);
+              logForceDiagnostics("averaged_overforce");
               disableForceMode();
               publishCurrentPositionHold(contact_hold_time_);
               sub_step_ = 405;
@@ -1640,6 +1672,7 @@ namespace elite_robot {
             RCLCPP_ERROR(this->get_logger(),
               "force-mode watchdog: contact lost for %.2fs (relative_fz=%.3f N)",
               lost_for, relative_fz);
+            logForceDiagnostics("contact_lost");
             disableForceMode();
             publishCurrentPositionHold(contact_hold_time_);
             sub_step_ = 405;
@@ -1666,6 +1699,7 @@ namespace elite_robot {
           RCLCPP_ERROR(this->get_logger(),
             "force-mode watchdog: axial deviation %.4fm exceeds %.4fm (relative_fz=%.3f N)",
             axial_error, force_mode_max_axial_deviation_, relative_fz);
+          logForceDiagnostics("axial_deviation");
           disableForceMode();
           publishCurrentPositionHold(contact_hold_time_);
           sub_step_ = 405;
@@ -1680,6 +1714,12 @@ namespace elite_robot {
           control_dt_index_++;
           if (control_dt_index_!=control_dt_count_)  return;
           control_dt_index_=0;
+
+          // 切向打磨开始计时，供过力退出诊断使用(每次打磨从起点开始时重置)。
+          if (!polish_tangential_started_) {
+            polish_tangential_started_ = true;
+            polish_tangential_start_ = std::chrono::steady_clock::now();
+          }
           
           //force adjust
           KDL::Frame  curFrame, tmpFrame, moveFrame;
@@ -1716,6 +1756,7 @@ namespace elite_robot {
           rclcpp::Duration deltaT(0, 1E9/50);
           size_t i = (polishcurve_step_count_+sidepolish_step_count_)*polishcurve_yindex_
               +polishcurve_step_index_+sidepolish_step_index_;
+          last_polish_step_ = static_cast<int>(i) + 1;
           // for (; i < polishcurve_OriginFrames_.size(); i++)
           {
             //ys_ik

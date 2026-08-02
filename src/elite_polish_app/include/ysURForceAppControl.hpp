@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/wrench_stamped.hpp"
@@ -88,6 +89,7 @@ namespace elite_robot {
             void publishCurrentPositionHold(double duration_sec);
             double maxJointSpeed() const;
             bool forceModeWatchdog(const KDL::Frame &nominal_frame);
+            void logForceDiagnostics(const std::string &reason);
 
             void goHome();
             void goHome_pubMoveHome();
@@ -141,7 +143,7 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point contact_hold_start_;
             bool use_force_mode_ = true;//控制器内建力控(startForceMode)开关
             double force_mode_wrench_z_ = 3.0;//SDK内部目标；+z=世界X+逼近
-            double force_mode_z_vel_limit_ = 0.0005;//力控z轴最大调整速度(m/s)
+            double force_mode_z_vel_limit_ = 0.002;//力控z轴最大调整速度(m/s)
             double force_mode_sensor_target_fz_ = -1.5;//本应用补偿/去皮后的实际反作用力目标(N)
             double force_mode_verify_tolerance_ = 0.6;//启用后实测反作用力与目标的允许误差(N)
             double force_mode_verify_time_ = 0.5;//进入打磨前，目标力连续稳定时间(s)
@@ -161,6 +163,10 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point force_mode_overforce_start_;
             bool force_mode_hard_overforce_active_ = false;
             std::chrono::steady_clock::time_point force_mode_hard_overforce_start_;
+            int last_polish_step_ = 0;              // 当前打磨轨迹步数(0=切向未开始)，过力诊断用
+            bool polish_tangential_started_ = false; // 404 切向轨迹是否已开始，过力诊断计时用
+            std::chrono::steady_clock::time_point polish_tangential_start_;
+            std::deque<double> force_history_;       // 最近 24 帧相对力(Hz*0.2s)，过力退出时打印
             double force_mode_min_contact_fz_ = -0.15;//小于此值视为仍有接触(N)
             double force_mode_contact_loss_timeout_ = 2.0;//失去接触允许时间(s)
             KDL::Vector force_mode_axis_base_{0.0, 0.0, 1.0};
