@@ -6,6 +6,7 @@
 #include <Eigen/Geometry>
 #include <kdl/chainfksolverpos_recursive.hpp>
 #include <algorithm>
+#include <cmath>
 #include <list>
 #include <chrono>
 #include <future>
@@ -56,6 +57,15 @@ namespace elite_robot {
             "force_mode_hard_abort_confirm_time", 0.03);
           force_mode_abort_confirm_time_ = this->declare_parameter<double>(
             "force_mode_abort_confirm_time", 0.12);
+          // 2026-08-02: 侧向力保护。两次停摆六维力显示侧向Fx/Fy(10~15N)先于Fz失控，
+          // 平均侧向合力持续超阈值即按同一流程退出，比等Fz耦合超限更早、损伤更小。
+          force_mode_abort_lateral_f_ = this->declare_parameter<double>("force_mode_abort_lateral_f", 8.0);
+          force_mode_lateral_abort_confirm_time_ = this->declare_parameter<double>(
+            "force_mode_lateral_abort_confirm_time", 0.12);
+          // 2026-08-02: 力控开放Rx/Ry旋转柔顺(目标力矩0)，端面贴合板面卸侧向拖曳力。
+          // A/B后默认关闭: 开启时实机出现随机位置-30N撞击尖峰(疑似无阻尼柔顺振荡啃边)。
+          force_mode_rot_compliance_ = this->declare_parameter<bool>("force_mode_rot_compliance", false);
+          force_mode_rot_vel_limit_ = this->declare_parameter<double>("force_mode_rot_vel_limit", 0.05);
           force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
           force_mode_contact_loss_timeout_ = this->declare_parameter<double>("force_mode_contact_loss_timeout", 2.0);
           polish_tool_spinup_time_ = this->declare_parameter<double>("polish_tool_spinup_time", 1.0);
@@ -520,13 +530,17 @@ namespace elite_robot {
             // 的重力模型残差/零漂，避免尚未碰板时单帧约 -2N 被误判为接触。
             if (contact_tare_collecting_ && maxJointSpeed() <= contact_joint_velocity_limit_) {
               contact_tare_sum_ += ys_contact_wrench_sensor_.force.data[2];
+              contact_tare_sum_fx_ += ys_contact_wrench_sensor_.force.data[0];
+              contact_tare_sum_fy_ += ys_contact_wrench_sensor_.force.data[1];
               contact_tare_count_++;
               if (contact_tare_count_ >= contact_tare_samples_) {
                 contact_fz_zero_ = contact_tare_sum_ / static_cast<double>(contact_tare_count_);
+                contact_fx_zero_ = contact_tare_sum_fx_ / static_cast<double>(contact_tare_count_);
+                contact_fy_zero_ = contact_tare_sum_fy_ / static_cast<double>(contact_tare_count_);
                 contact_tare_collecting_ = false;
                 RCLCPP_INFO(this->get_logger(),
-                  "contact local tare ready: raw_fz_zero=%.3f N samples=%d",
-                  contact_fz_zero_, contact_tare_count_);
+                  "contact local tare ready: raw_fz_zero=%.3f N raw_fx_zero=%.3f N raw_fy_zero=%.3f N samples=%d",
+                  contact_fz_zero_, contact_fx_zero_, contact_fy_zero_, contact_tare_count_);
               }
             }
 
@@ -936,7 +950,11 @@ namespace elite_robot {
         contact_tare_collecting_ = false;
         contact_tare_count_ = 0;
         contact_tare_sum_ = 0.0;
+        contact_tare_sum_fx_ = 0.0;
+        contact_tare_sum_fy_ = 0.0;
         contact_fz_zero_ = 0.0;
+        contact_fx_zero_ = 0.0;
+        contact_fy_zero_ = 0.0;
         contact_detection_enabled_ = false;
         contact_confirm_count_ = 0;
         contact_confirmed_ = false;
@@ -946,6 +964,7 @@ namespace elite_robot {
         force_mode_verify_stable_ = false;
         force_mode_overforce_active_ = false;
         force_mode_hard_overforce_active_ = false;
+        force_mode_lateral_overforce_active_ = false;
         last_polish_step_ = 0;
         polish_tangential_started_ = false;
         force_history_.clear();
@@ -1004,6 +1023,8 @@ namespace elite_robot {
           contact_tare_collecting_ = false;
           contact_tare_count_ = 0;
           contact_tare_sum_ = 0.0;
+          contact_tare_sum_fx_ = 0.0;
+          contact_tare_sum_fy_ = 0.0;
           return;
         }
 
@@ -1021,6 +1042,8 @@ namespace elite_robot {
 
         if (contact_tare_count_ == 0 && !contact_tare_collecting_) {
           contact_tare_sum_ = 0.0;
+          contact_tare_sum_fx_ = 0.0;
+          contact_tare_sum_fy_ = 0.0;
           contact_tare_collecting_ = true;
           RCLCPP_INFO(this->get_logger(), "collecting %d local force-tare samples", contact_tare_samples_);
           return;
@@ -1066,10 +1089,16 @@ namespace elite_robot {
         double rx = 0.0, ry = 0.0, rz = 0.0;
         ys_curP_tcp_.M.GetRPY(rx, ry, rz);
         req->reference_frame = {ys_curP_tcp_.p.x(), ys_curP_tcp_.p.y(), ys_curP_tcp_.p.z(), rx, ry, rz};
-        req->selection_vector = {0, 0, 1, 0, 0, 0};  // 仅 z 轴(打磨头轴线)力控
+        // 2026-08-02: 可选开放 Rx/Ry 旋转柔顺(目标力矩0)。板法向与工具轴不对齐时
+        // 砂轮边缘接触产生 Mx/My 与侧向拖曳；零力矩目标让端面缓慢贴合板面卸力。
+        // 角速度受 limits 限制(默认0.05rad/s≈3°/s)，稳态转角≈板子倾角，无突变。
+        // Rz 保持位置模式，扫掠方向不受影响。
+        const int rot_sel = force_mode_rot_compliance_ ? 1 : 0;
+        req->selection_vector = {0, 0, 1, rot_sel, rot_sel, 0};  // z 轴力控 + 可选 Rx/Ry 柔顺
         req->wrench = {0, 0, force_mode_wrench_z_, 0, 0, 0};
         req->mode = 0;  // FIX: 力控坐标系 = 参考坐标系
-        req->limits = {0, 0, force_mode_z_vel_limit_, 0, 0, 0};
+        req->limits = {0, 0, force_mode_z_vel_limit_,
+                       rot_sel * force_mode_rot_vel_limit_, rot_sel * force_mode_rot_vel_limit_, 0};
         force_mode_axis_base_ = ys_curP_tcp_.M * KDL::Vector(0, 0, 1);
         const double axis_norm = force_mode_axis_base_.Norm();
         if (axis_norm > 1e-9) {
@@ -1077,11 +1106,12 @@ namespace elite_robot {
         }
         RCLCPP_INFO(this->get_logger(),
                     "force mode command sent: ref(x,y,z,rx,ry,rz)=(%.4f,%.4f,%.4f,%.3f,%.3f,%.3f) "
-                    "axis_base=(%.4f,%.4f,%.4f) applied_Fz=%.2f vlim=%.4f",
+                    "axis_base=(%.4f,%.4f,%.4f) applied_Fz=%.2f vlim=%.4f rot_comp=%d wlim=%.4f",
                     req->reference_frame[0], req->reference_frame[1], req->reference_frame[2],
                     req->reference_frame[3], req->reference_frame[4], req->reference_frame[5],
                     force_mode_axis_base_.x(), force_mode_axis_base_.y(), force_mode_axis_base_.z(),
-                    force_mode_wrench_z_, force_mode_z_vel_limit_);
+                    force_mode_wrench_z_, force_mode_z_vel_limit_,
+                    force_mode_rot_compliance_ ? 1 : 0, force_mode_rot_vel_limit_);
         // 异步发送: 单线程 executor 不能在这里同步等 future(会死锁)，
         // 响应由 executor 在回调间处理, 置 done 标志, 402 主流程逐拍轮询。
         force_mode_client_->async_send_request(
@@ -1241,6 +1271,7 @@ namespace elite_robot {
                 force_mode_verify_stable_ = false;
                 force_mode_overforce_active_ = false;
                 force_mode_hard_overforce_active_ = false;
+                force_mode_lateral_overforce_active_ = false;
                 RCLCPP_INFO(this->get_logger(),
                   "force mode VERIFIED: relative_fz=%.3f stable_for=%.2fs; sub step done: %d",
                   relative_fz, stable_for, sub_step_);
@@ -1679,6 +1710,41 @@ namespace elite_robot {
           force_mode_overforce_active_ = false;
         }
 
+        // 2026-08-02 侧向力保护: 侧向拖曳(法向不对齐/刮边)的 Fx/Fy 通常先于 Fz 失控，
+        // 等 Fz 耦合超 -5N 时打磨头已别得很紧。20帧平均侧向合力持续超阈值即按同一流程退出。
+        // 必须用预备姿态去皮后的相对值: 重力模型残差实测达 5~10N，绝对值在接触状态下即误触发。
+        const double lateral_f_avg = std::hypot(
+          ys_average_wrench_.force.data[0] - contact_fx_zero_,
+          ys_average_wrench_.force.data[1] - contact_fy_zero_);
+        const double lateral_f_inst = std::hypot(
+          ys_contact_wrench_sensor_.force.data[0] - contact_fx_zero_,
+          ys_contact_wrench_sensor_.force.data[1] - contact_fy_zero_);
+        if (lateral_f_avg >= force_mode_abort_lateral_f_) {
+          if (!force_mode_lateral_overforce_active_) {
+            force_mode_lateral_overforce_active_ = true;
+            force_mode_lateral_overforce_start_ = now;
+            RCLCPP_WARN(this->get_logger(),
+              "force-mode watchdog: lateral overforce candidate avg=%.3f N inst=%.3f N; confirming %.2fs",
+              lateral_f_avg, lateral_f_inst, force_mode_lateral_abort_confirm_time_);
+          } else {
+            const double overforce_for = std::chrono::duration<double>(
+              now - force_mode_lateral_overforce_start_).count();
+            if (overforce_for >= force_mode_lateral_abort_confirm_time_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "force-mode watchdog: sustained lateral overforce %.3f N for %.2fs "
+                "(limit %.3f N, inst=%.3f N)",
+                lateral_f_avg, overforce_for, force_mode_abort_lateral_f_, lateral_f_inst);
+              logForceDiagnostics("lateral_overforce");
+              disableForceMode();
+              publishCurrentPositionHold(contact_hold_time_);
+              sub_step_ = 405;
+              return false;
+            }
+          }
+        } else {
+          force_mode_lateral_overforce_active_ = false;
+        }
+
         if (relative_fz <= force_mode_min_contact_fz_) {
           force_mode_last_contact_ = now;
         } else {
@@ -1706,8 +1772,8 @@ namespace elite_robot {
           const double used_ratio = force_mode_max_axial_deviation_ > 1e-9
             ? std::fabs(axial_error) / force_mode_max_axial_deviation_ : 0.0;
           RCLCPP_INFO(this->get_logger(),
-            "force-mode monitor: relative_fz=%.3f axial_comp=%.4fm limit=%.4fm (%.0f%%)",
-            relative_fz, axial_error, force_mode_max_axial_deviation_, used_ratio * 100.0);
+            "force-mode monitor: relative_fz=%.3f lateral_avg=%.3f axial_comp=%.4fm limit=%.4fm (%.0f%%)",
+            relative_fz, lateral_f_avg, axial_error, force_mode_max_axial_deviation_, used_ratio * 100.0);
           force_mode_monitor_last_log_ = now;
         }
         if (std::fabs(axial_error) > force_mode_max_axial_deviation_) {

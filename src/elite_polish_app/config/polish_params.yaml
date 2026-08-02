@@ -52,6 +52,13 @@ ysURForceAppControl:
     force_mode_z_vel_limit: 0.002    # 力控z轴最大调整速度: 0.5→2mm/s。
                                      # 原0.5mm/s追不上打磨切向运动造成的法向扰动(实测0.2s内力涨25~40N/s)，
                                      # 导致力控"来不及退让"、力涨到-10N触发保护。2mm/s起步，仍保留防过冲余量。
+    # 2026-08-02: 开放 Rx/Ry 旋转柔顺(目标力矩0)。板法向与工具轴不对齐时砂轮边缘接触，
+    # 产生Mx/My力矩和侧向拖曳(两次停摆实测侧向10~15N先于Fz失控)；零力矩目标让端面
+    # 缓慢贴合板面卸掉侧向力。稳态转角≈板子倾角(几度)，false=退回纯Z力控。
+    # 2026-08-02 A/B: 开启后两次实机均在随机位置出现-30N级撞击尖峰后停摆(改前无此形态)，
+    # 疑似无阻尼旋转柔顺在扫掠中振荡啃边，先关闭验证；长期方案改走砂盘安装角一次性补偿。
+    force_mode_rot_compliance: false
+    force_mode_rot_vel_limit: 0.05   # 旋转柔顺轴最大角速度(rad/s)≈3°/s，姿态缓变防突变
     # startForceMode返回只表示socket写入成功；实测力稳定到目标附近后才开始切向运动。
     force_mode_sensor_target_fz: -1.5 # 应用补偿/去皮后的实际反作用力目标(N)
     force_mode_verify_tolerance: 0.6 # 传感器反作用力目标为-applied_Fz，允许误差(N)
@@ -64,6 +71,11 @@ ysURForceAppControl:
     force_mode_hard_abort_fz: -15.0  # 单帧瞬时硬保护阈值(N)
     force_mode_hard_abort_confirm_time: 0.03 # 硬过力需持续多久才退出(s)；拒绝打磨振动/噪声的单帧尖峰
     force_mode_abort_confirm_time: 0.12 # 平均力越过-5N需要持续的时间(s)
+    # 2026-08-02: 侧向力保护通道。侧向拖曳(法向不对齐/刮边)的Fx/Fy通常先于Fz失控，
+    # 等Fz耦合超-5N时打磨头已别得很紧；平均侧向合力超阈值即提前按同一流程退出。
+    # 判定用预备姿态去皮后的相对值(与fz同源采样)：重力模型残差实测5~10N，绝对值会误触发。
+    force_mode_abort_lateral_f: 8.0  # 20帧平均侧向合力相对值sqrt((fx-fx0)^2+(fy-fy0)^2)的阈值(N)
+    force_mode_lateral_abort_confirm_time: 0.12 # 侧向过力需持续多久才退出(s)
     force_mode_min_contact_fz: -0.15 # 高于此值视为失去接触(N)
     force_mode_contact_loss_timeout: 2.0  # 连续失去接触多久后退出(s)
     polish_tool_spinup_time: 1.0     # IO开启确认后原地稳压，期间不走切向轨迹(s)

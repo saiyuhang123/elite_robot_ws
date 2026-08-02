@@ -131,7 +131,13 @@ namespace elite_robot {
             bool contact_tare_collecting_ = false;
             int contact_tare_count_ = 0;
             double contact_tare_sum_ = 0.0;
+            double contact_tare_sum_fx_ = 0.0;
+            double contact_tare_sum_fy_ = 0.0;
             double contact_fz_zero_ = 0.0;//预备姿态的局部力零点
+            // 侧向去皮与 fz 同源（预备姿态悬空采样）。重力模型残差实测达 5~10N 量级，
+            // 侧向 watchdog 必须用相对值，否则接触状态下静态偏置即误触发。
+            double contact_fx_zero_ = 0.0;
+            double contact_fy_zero_ = 0.0;
             bool contact_detection_enabled_ = false;
             int contact_confirm_count_ = 0;
             bool contact_confirmed_ = false;
@@ -163,6 +169,12 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point force_mode_overforce_start_;
             bool force_mode_hard_overforce_active_ = false;
             std::chrono::steady_clock::time_point force_mode_hard_overforce_start_;
+            double force_mode_abort_lateral_f_ = 8.0;//20帧平均侧向合力sqrt(fx^2+fy^2)过力阈值(N)
+            double force_mode_lateral_abort_confirm_time_ = 0.12;//侧向过力持续确认时间(s)
+            bool force_mode_lateral_overforce_active_ = false;
+            std::chrono::steady_clock::time_point force_mode_lateral_overforce_start_;
+            bool force_mode_rot_compliance_ = false;//力控开放Rx/Ry旋转柔顺(A/B后默认关闭: 疑无阻尼柔顺振荡啃边)
+            double force_mode_rot_vel_limit_ = 0.05;//旋转柔顺轴最大角速度(rad/s)
             int last_polish_step_ = 0;              // 当前打磨轨迹步数(0=切向未开始)，过力诊断用
             bool polish_tangential_started_ = false; // 404 切向轨迹是否已开始，过力诊断计时用
             std::chrono::steady_clock::time_point polish_tangential_start_;
