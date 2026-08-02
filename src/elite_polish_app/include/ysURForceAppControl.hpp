@@ -155,9 +155,12 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point force_mode_monitor_last_log_;
             double force_mode_abort_fz_ = -5.0;//平均相对力超过此负值持续确认后退出(N)
             double force_mode_hard_abort_fz_ = -15.0;//单帧相对力硬保护阈值(N)
+            double force_mode_hard_abort_confirm_time_ = 0.03;//硬过力需持续多久才退出(s)，拒绝单帧尖峰
             double force_mode_abort_confirm_time_ = 0.12;//平均过力持续确认时间(s)
             bool force_mode_overforce_active_ = false;
             std::chrono::steady_clock::time_point force_mode_overforce_start_;
+            bool force_mode_hard_overforce_active_ = false;
+            std::chrono::steady_clock::time_point force_mode_hard_overforce_start_;
             double force_mode_min_contact_fz_ = -0.15;//小于此值视为仍有接触(N)
             double force_mode_contact_loss_timeout_ = 2.0;//失去接触允许时间(s)
             KDL::Vector force_mode_axis_base_{0.0, 0.0, 1.0};

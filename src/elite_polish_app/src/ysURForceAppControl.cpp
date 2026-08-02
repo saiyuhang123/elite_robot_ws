@@ -52,6 +52,8 @@ namespace elite_robot {
           force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
           force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -5.0);
           force_mode_hard_abort_fz_ = this->declare_parameter<double>("force_mode_hard_abort_fz", -15.0);
+          force_mode_hard_abort_confirm_time_ = this->declare_parameter<double>(
+            "force_mode_hard_abort_confirm_time", 0.03);
           force_mode_abort_confirm_time_ = this->declare_parameter<double>(
             "force_mode_abort_confirm_time", 0.12);
           force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.15);
@@ -937,11 +939,17 @@ namespace elite_robot {
         contact_ik_failure_count_ = 0;
         force_mode_verify_stable_ = false;
         force_mode_overforce_active_ = false;
+        force_mode_hard_overforce_active_ = false;
         polish_tool_open_pending_ = false;
         polish_tool_open_done_ = false;
         polish_tool_open_ok_ = false;
         debug_approach_started_ = false;
         control_dt_index_ = 0;
+        // 每次新打磨命令必须从轨迹起点开始，否则上次中断残留的步进索引
+        // 会让 404 直接从轨迹中段"续跑"，导致 IK 解与当前姿态跳变而中止。
+        polishcurve_step_index_ = 0;
+        sidepolish_step_index_ = 0;
+        polishcurve_yindex_ = 0;
         frame_forceadjust_base_.p = KDL::Vector(0, 0, 0);
         frame_forceadjust_base_.M = KDL::Rotation::Identity();
       }
@@ -1223,6 +1231,7 @@ namespace elite_robot {
                 force_mode_monitor_last_log_ = now;
                 force_mode_verify_stable_ = false;
                 force_mode_overforce_active_ = false;
+                force_mode_hard_overforce_active_ = false;
                 RCLCPP_INFO(this->get_logger(),
                   "force mode VERIFIED: relative_fz=%.3f stable_for=%.2fs; sub step done: %d",
                   relative_fz, stable_for, sub_step_);
@@ -1566,15 +1575,34 @@ namespace elite_robot {
         const double relative_fz = ys_contact_wrench_sensor_.force.data[2] - contact_fz_zero_;
         const double relative_fz_avg = ys_average_wrench_.force.data[2] - contact_fz_zero_;
 
-        // 硬保护仍使用单帧力，真实冲击不等待滤波。
+        // 硬保护：真实冲击会持续若干帧，单帧噪声尖峰（125Hz 力数据约 8ms）不触发。
+        // 用真实时间持续确认而不是"连续 N 次检查"，因为 403/404 阶段 watchdog
+        // 调用频率不同（4ms vs 40ms），按检查次数计数会对同一尖峰产生不同结果。
         if (relative_fz <= force_mode_hard_abort_fz_) {
-          RCLCPP_ERROR(this->get_logger(),
-            "force-mode watchdog: instantaneous hard overforce %.3f N (limit %.3f N, avg=%.3f N)",
-            relative_fz, force_mode_hard_abort_fz_, relative_fz_avg);
-          disableForceMode();
-          publishCurrentPositionHold(contact_hold_time_);
-          sub_step_ = 405;
-          return false;
+          if (!force_mode_hard_overforce_active_) {
+            force_mode_hard_overforce_active_ = true;
+            force_mode_hard_overforce_start_ = now;
+            RCLCPP_WARN(this->get_logger(),
+              "force-mode watchdog: hard overforce candidate inst=%.3f N "
+              "(limit %.3f N, avg=%.3f N); confirming %.2fs",
+              relative_fz, force_mode_hard_abort_fz_, relative_fz_avg,
+              force_mode_hard_abort_confirm_time_);
+          } else {
+            const double hard_for = std::chrono::duration<double>(
+              now - force_mode_hard_overforce_start_).count();
+            if (hard_for >= force_mode_hard_abort_confirm_time_) {
+              RCLCPP_ERROR(this->get_logger(),
+                "force-mode watchdog: sustained hard overforce %.3f N for %.2fs "
+                "(limit %.3f N, avg=%.3f N)",
+                relative_fz, hard_for, force_mode_hard_abort_fz_, relative_fz_avg);
+              disableForceMode();
+              publishCurrentPositionHold(contact_hold_time_);
+              sub_step_ = 405;
+              return false;
+            }
+          }
+        } else {
+          force_mode_hard_overforce_active_ = false;
         }
 
         // 普通 -5N 阈值使用20帧滑动平均，并要求持续一小段时间，

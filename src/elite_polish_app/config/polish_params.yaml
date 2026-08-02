@@ -60,6 +60,7 @@ ysURForceAppControl:
     force_mode_monitor_log_period: 1.0    # 每秒输出实际力和轴向补偿，确认第二行反向时是否回落
     force_mode_abort_fz: -5.0        # 20帧平均反作用力的持续过力阈值(N)
     force_mode_hard_abort_fz: -15.0  # 单帧瞬时硬保护阈值(N)
+    force_mode_hard_abort_confirm_time: 0.03 # 硬过力需持续多久才退出(s)；拒绝打磨振动/噪声的单帧尖峰
     force_mode_abort_confirm_time: 0.12 # 平均力越过-5N需要持续的时间(s)
     force_mode_min_contact_fz: -0.15 # 高于此值视为失去接触(N)
     force_mode_contact_loss_timeout: 2.0  # 连续失去接触多久后退出(s)
