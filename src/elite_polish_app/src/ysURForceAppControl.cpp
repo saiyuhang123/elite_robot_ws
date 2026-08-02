@@ -1719,6 +1719,24 @@ namespace elite_robot {
           if (!polish_tangential_started_) {
             polish_tangential_started_ = true;
             polish_tangential_start_ = std::chrono::steady_clock::now();
+
+            // 404 启动自检：确认接触偏移补偿是否生效。
+            // start_axial_err 一开始就接近 0.03m → offset 没吃到名义轨迹；
+            // 接近 0 且打磨中渐增 → 名义轨迹与板面存在角度偏差。
+            const KDL::Frame nominal_start =
+              frame_forceadjust_base_ * frame_polishcloud_transform_ * polishcurve_OriginFrames_[0];
+            const KDL::Vector start_err = ys_curP_tcp_.p - nominal_start.p;
+            const double start_axial_err =
+              start_err.x() * force_mode_axis_base_.x() +
+              start_err.y() * force_mode_axis_base_.y() +
+              start_err.z() * force_mode_axis_base_.z();
+            RCLCPP_INFO(this->get_logger(),
+              "404 start self-check: force_adj_p=(%.4f,%.4f,%.4f) nominal_start=(%.4f,%.4f,%.4f) "
+              "tcp=(%.4f,%.4f,%.4f) start_axial_err=%.4fm",
+              frame_forceadjust_base_.p.x(), frame_forceadjust_base_.p.y(), frame_forceadjust_base_.p.z(),
+              nominal_start.p.x(), nominal_start.p.y(), nominal_start.p.z(),
+              ys_curP_tcp_.p.x(), ys_curP_tcp_.p.y(), ys_curP_tcp_.p.z(),
+              start_axial_err);
           }
           
           //force adjust
