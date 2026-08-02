@@ -18,9 +18,8 @@ YOLO 视觉抓取一体化 Launch 文件（LinkerHand O6 机械手版）。
   source ~/Documents/linker_hand_ros2_sdk/install/setup.bash
   ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp.launch.py
 
-  然后在另一个终端手动启动抓取主程序（交互式）：
-  cd ~/Documents/elite_robot_ws/biaoding
-  python3 yolo_grasp.py
+  YOLO 感知启动后会自动在一个新终端窗口中启动抓取主程序（交互式）：
+  cd ~/Documents/elite_robot_ws/biaoding && python3 yolo_grasp.py
 
   可选：查看 YOLO 调试图像
   cd ~/Documents/elite_robot_ws/YOLO
@@ -52,6 +51,7 @@ YOLO 视觉抓取一体化 Launch 文件（LinkerHand O6 机械手版）。
   run_perception   启动 YOLO 感知节点（默认 true）
   run_linker_hand  启动 LinkerHand SDK（默认 true）
   run_camera       启动 Percipio 相机（默认 true）
+  run_grasp_main   在新窗口自动启动抓取主程序 yolo_grasp.py（默认 true）
 """
 
 import os
@@ -100,6 +100,11 @@ def generate_launch_description():
             default_value="true",
             description="是否启动 Percipio 相机",
         ),
+        DeclareLaunchArgument(
+            "run_grasp_main",
+            default_value="true",
+            description="是否在新终端窗口中自动启动抓取主程序 yolo_grasp.py",
+        ),
     ]
 
     headless_mode = LaunchConfiguration("headless_mode")
@@ -107,6 +112,7 @@ def generate_launch_description():
     run_perception = LaunchConfiguration("run_perception")
     run_linker_hand = LaunchConfiguration("run_linker_hand")
     run_camera = LaunchConfiguration("run_camera")
+    run_grasp_main = LaunchConfiguration("run_grasp_main")
 
     # ============================================================
     # 1. 机械臂驱动（无头模式）
@@ -177,19 +183,39 @@ def generate_launch_description():
     )
 
     # ============================================================
+    # 5. 抓取主程序（交互式）
+    #    在独立的新终端窗口中启动，便于键盘交互（g/o/c/p/h/q）
+    # ============================================================
+    grasp_main_dir = os.path.expanduser("~/Documents/elite_robot_ws/biaoding")
+    grasp_main_script = os.path.join(grasp_main_dir, "yolo_grasp.py")
+
+    grasp_main = ExecuteProcess(
+        cmd=[
+            "gnome-terminal",
+            "--",
+            "bash", "-c",
+            f"cd {grasp_main_dir} && python3 {grasp_main_script}; exec bash",
+        ],
+        output="screen",
+        name="yolo_grasp_main",
+        condition=IfCondition(run_grasp_main),
+    )
+
+    # ============================================================
     # 组装 LaunchDescription（按依赖顺序，带延时启动）
     #
     # 启动顺序：
     #   T+0s:  机械臂驱动 + LinkerHand SDK（并行，互不依赖）
     #   T+3s:  Percipio 相机（需要在驱动之后以确保 TF 树完整）
     #   T+6s:  YOLO 感知节点（需要相机话题 + 驱动 TF 都就绪）
+    #   T+9s:  抓取主程序（新终端窗口，等感知节点就绪）
     # ============================================================
 
     actions = [
         LogInfo(msg="=" * 60),
         LogInfo(msg="YOLO 抓取 Launch 启动中..."),
         LogInfo(msg="  机械臂驱动 + 相机 + LinkerHand SDK + YOLO 感知"),
-        LogInfo(msg="  抓取主程序请在另一个终端手动启动: python3 yolo_grasp.py"),
+        LogInfo(msg="  抓取主程序将在新终端窗口自动启动"),
         LogInfo(msg="=" * 60),
         # 机械臂驱动 + LinkerHand 并行启动
         robot_driver,
@@ -198,16 +224,17 @@ def generate_launch_description():
         TimerAction(period=3.0, actions=[percipio_camera]),
         # YOLO 感知在相机后 3s 启动（总延时 6s）
         TimerAction(period=6.0, actions=[yolo_perception]),
-        # 启动完成提示
+        # 抓取主程序在感知后 3s 启动（总延时 9s，新终端窗口）
+        TimerAction(period=9.0, actions=[grasp_main]),
+        # 启动完成提示（等主程序窗口也弹出后再提示）
         TimerAction(
-            period=8.0,
+            period=10.0,
             actions=[
                 LogInfo(msg=""),
                 LogInfo(msg="=" * 60),
                 LogInfo(msg="全部节点已启动！"),
-                LogInfo(msg="  在另一个终端启动抓取主程序："),
-                LogInfo(msg="  cd ~/Documents/elite_robot_ws/biaoding"),
-                LogInfo(msg="  python3 yolo_grasp.py"),
+                LogInfo(msg="  抓取主程序已在新终端窗口自动启动"),
+                LogInfo(msg="  （如需手动启动: python3 yolo_grasp.py）"),
                 LogInfo(msg=""),
                 LogInfo(msg="  按键: g=抓取  o=张开手  c=闭合手"),
                 LogInfo(msg="        p=打印目标  h=回零  q=退出"),
