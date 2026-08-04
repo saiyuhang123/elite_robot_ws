@@ -17,6 +17,14 @@ ip link show can2   # 应显示 <UP,LOWER_UP>
 ```
 
 ---
+# 切到单个类别（以 cup 为例）
+ros2 topic pub --once /yolo/target_class std_msgs/msg/String "data: 'cup'"
+
+# 同时检测多个类别（取深度最近的一个）
+ros2 topic pub --once /yolo/target_class std_msgs/msg/String "data: 'apple,cup'"
+
+# 恢复检测所有类别
+ros2 topic pub --once /yolo/target_class std_msgs/msg/String "data: 'all'"
 
 ## 方式一：Launch 文件一键启动（推荐）
 

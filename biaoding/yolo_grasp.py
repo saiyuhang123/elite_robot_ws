@@ -133,7 +133,7 @@ HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，
 OBSERVE_POSES = [
     [-0.038397, 0.308923, -1.619919, -1.680604, 1.712094, 1.504874],
 ]
-OBSERVE_WAIT = 3.0         # 观察位姿等待检测的时间（秒）
+OBSERVE_WAIT = 5.0         # 观察位姿等待检测的时间（秒）
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
@@ -655,7 +655,8 @@ class YoloGrasp:
 
     def grasp(self):
         """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 开启按需识别
-        → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2。
+        → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2；
+        抓取成功归位后自动松开机械手。
         返回 (成功与否, 结果描述)。"""
         # 0. 先到抓取预备位姿，此位姿下相机视野最好
         print("0. movej 到抓取预备位姿...")
@@ -674,7 +675,7 @@ class YoloGrasp:
         try:
             # 2. 默认（预备）位姿等 5s 检测；检测不到则遍历观察位姿，
             #    哪个位姿检测到就在哪个位姿继续抓取
-            if not self._wait_target(5.0):
+            if not self._wait_target(8.0):
                 self._search_observe_poses()
             if self.latest_target is None:
                 ok, msg = False, "所有位姿均未检测到目标"
@@ -686,6 +687,12 @@ class YoloGrasp:
 
         # 无论成败，收拢到 Home2，保证底盘导航期间机械臂处于安全姿态
         self.home2()
+
+        # 抓取成功且已归位后，松开机械手（放下物体）
+        if ok:
+            print("   [归位] 抓取成功，松开机械手...")
+            self.gripper.open()
+
         return ok, msg
 
     def _grasp_impl(self):

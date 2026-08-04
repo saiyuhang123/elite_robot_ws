@@ -14,8 +14,10 @@ from scipy.spatial.transform import Rotation as R
 
 import json
 import os
+import time
 import numpy as np
 import cv2
+from collections import deque
 from ultralytics import YOLO
 
 # 基座/法兰坐标系（驱动以 tf_prefix=cs66_ 启动，必须用带前缀的名字）
@@ -32,6 +34,23 @@ HAND_EYE_JSON = os.path.expanduser(
 DEFAULT_TARGET_CLASSES = {'apple'}
 # 置信度阈值：低于此值的检测框直接忽略
 CONF_THRESHOLD = 0.25
+
+# 深度帧新鲜度保护：识别开启后只接受"晚于开启时刻"的深度帧，且 color/depth
+# 时间戳差需与已观测的固定偏差一致（防止深度流丢帧/滞后时，把运动途中拍的
+# 旧深度和当前彩色帧拼在一起算出错误 3D 点）。
+# 注意放宽：深度帧率低于彩色（如 10fps vs 30fps）时正常时间戳差就能到 0.1s 量级，
+# 校验太严会把正常帧全弃掉导致"识别不到"，所以绝对界限放宽到 0.5s。
+DEPTH_COLOR_TOL_S = 0.15    # 与基线偏差超过该值（秒）即弃帧，等下一帧
+DEPTH_HARD_MAX_DT_S = 0.5   # 无基线时的绝对界限（秒），color/depth 差太大弃帧
+
+# 帧间一致性：同一类别连续 CONSISTENT_FRAMES 帧位置差不超过 CONSISTENT_TOL_M
+# 才发布位姿；连续 CONSISTENT_MAX_TRIES 帧或超 CONSISTENT_MAX_SECONDS 仍不一致时，
+# 按最新帧兜底发布（不做跨帧平均：多目标时平均会把不同目标的位置混在一起）。
+# 兜底必须够快：识别超时只有几秒，等太久会直接"识别不到目标"。
+CONSISTENT_FRAMES = 3
+CONSISTENT_TOL_M = 0.015
+CONSISTENT_MAX_TRIES = 4
+CONSISTENT_MAX_SECONDS = 2.0
 
 
 def load_hand_eye_matrix(path):
@@ -91,6 +110,17 @@ class YoloGraspPerceptionNode(Node):
         self.latest_color = None
         self.latest_depth = None
         self.latest_info = None
+        # 深度新鲜度/帧间一致性状态
+        self._depth_stamp_at_enable = None  # 开启识别时刻缓存的深度帧时间戳
+        self._dt_offsets = deque(maxlen=12)  # 最近接受帧的 color/depth 时间戳差
+        self._dt_baseline = None             # 时间戳差的固定偏差基线（秒）
+        self._pose_window = deque(maxlen=5)  # 最近几帧同一类别目标位置
+        self._pose_cls = None                # 一致性窗口当前类别
+        self._pose_tries = 0                 # 当前类别累计处理帧数
+        self._pose_start = None              # 当前类别第一帧时间（限时兜底用）
+        self._depth_rejects_old = 0          # 因"识别开启前旧深度"弃帧计数
+        self._depth_rejects_dt = 0           # 因"时间戳差异常"弃帧计数
+        self._last_reject_log = 0.0
         self.create_subscription(
             Image, '/camera/color/image_raw', self._color_cb, 10)
         self.create_subscription(
@@ -125,9 +155,10 @@ class YoloGraspPerceptionNode(Node):
     def _color_cb(self, msg):
         self._mark('color')
         self.latest_color = msg
-        # 彩色图到达时驱动一次感知（仅在按需识别开启时；深度和内参需已就绪）
+        # 彩色图到达时驱动一次感知（仅在按需识别开启时；深度需已就绪且新鲜）
         if (self.enabled and self.latest_depth is not None
-                and self.latest_info is not None):
+                and self.latest_info is not None
+                and self._depth_is_fresh(self.latest_depth, msg)):
             try:
                 self.perception_callback(msg, self.latest_depth, self.latest_info)
             except Exception as e:
@@ -142,9 +173,84 @@ class YoloGraspPerceptionNode(Node):
         self._mark('info')
         self.latest_info = msg
 
+    def _depth_is_fresh(self, depth_msg, color_msg):
+        """深度帧新鲜度校验：识别开启前缓存（可能是停稳前/运动途中）的深度
+        帧一律不用；color/depth 时间戳差偏离已观测固定偏差（深度流滞后、
+        丢帧）也弃帧，等下一帧。"""
+        depth_t = rclpy.time.Time.from_msg(depth_msg.header.stamp)
+        # 1) 必须是识别开启之后新到的深度帧
+        if self._depth_stamp_at_enable is not None:
+            if depth_t <= self._depth_stamp_at_enable:
+                self._depth_rejects_old += 1
+                self._log_depth_rejects()
+                return False
+        # 2) color/depth 时间戳差：先绝对界限，再与已观测固定偏差比对
+        dt = (depth_t - rclpy.time.Time.from_msg(
+            color_msg.header.stamp)).nanoseconds / 1e9
+        if abs(dt) > DEPTH_HARD_MAX_DT_S:
+            self._depth_rejects_dt += 1
+            self._log_depth_rejects()
+            return False
+        if (self._dt_baseline is not None
+                and abs(dt - self._dt_baseline) > DEPTH_COLOR_TOL_S):
+            self._depth_rejects_dt += 1
+            self._log_depth_rejects()
+            return False
+        self._dt_offsets.append(dt)
+        if len(self._dt_offsets) >= 5:
+            self._dt_baseline = float(np.median(self._dt_offsets))
+        return True
+
+    def _log_depth_rejects(self):
+        """定期打印深度弃帧计数，方便判断是不是校验把正常帧挡掉了。"""
+        if time.time() - self._last_reject_log < 5.0:
+            return
+        self._last_reject_log = time.time()
+        self.get_logger().warn(
+            f'[诊断] 深度帧被弃用: 旧帧×{self._depth_rejects_old}, '
+            f'时间戳差×{self._depth_rejects_dt} '
+            f'(基线={getattr(self, "_dt_baseline", None)})')
+
+    def _consistency_gate(self, P_base, cls_name):
+        """帧间一致性：同一类别连续 CONSISTENT_FRAMES 帧位置一致才返回该位置；
+        连续 CONSISTENT_MAX_TRIES 帧或超 CONSISTENT_MAX_SECONDS 仍不一致时按
+        最新帧兜底（避免流程卡死，但不做跨帧平均）。未达成一致返回 None。"""
+        if self._pose_cls != cls_name:
+            self._pose_cls = cls_name
+            self._pose_window.clear()
+            self._pose_tries = 0
+            self._pose_start = time.time()
+        self._pose_tries += 1
+        self._pose_window.append(P_base[:3])
+
+        if len(self._pose_window) >= CONSISTENT_FRAMES:
+            arr = np.array(self._pose_window)
+            spread = float(np.max(arr.max(axis=0) - arr.min(axis=0)))
+            if spread <= CONSISTENT_TOL_M:
+                return P_base[:3]
+            elapsed = time.time() - (self._pose_start or time.time())
+            if (self._pose_tries >= CONSISTENT_MAX_TRIES
+                    or elapsed >= CONSISTENT_MAX_SECONDS):
+                self.get_logger().warn(
+                    f'[诊断] {self._pose_tries}帧/'
+                    f'{elapsed:.1f}s 位置不一致(跨度{spread*1000:.1f}mm)，'
+                    f'按最新帧发布')
+                return P_base[:3]
+        return None
+
     # ---- 按需识别开关服务 ----
     def _set_enabled_cb(self, request, response):
         self.enabled = bool(request.data)
+        if self.enabled:
+            # 记录开启时刻已缓存的深度帧；更早的一律视为停稳前旧帧
+            self._depth_stamp_at_enable = (
+                rclpy.time.Time.from_msg(self.latest_depth.header.stamp)
+                if self.latest_depth is not None else None)
+            # 一致性窗口清零，防止沿用上一次识别会话的旧帧
+            self._pose_window.clear()
+            self._pose_cls = None
+            self._pose_tries = 0
+            self._pose_start = None
         response.success = True
         response.message = '识别已开启' if self.enabled else '识别已关闭'
         self.get_logger().info(
@@ -381,6 +487,32 @@ class YoloGraspPerceptionNode(Node):
             f'基座系: [{X_b:.3f}, {Y_b:.3f}, {Z_b:.3f}]m'
         )
 
+        # ---------------- 帧间一致性校验 ----------------
+        # 连续几帧位置一致才发布位姿，防止某一帧深度异常直接决定抓取点
+        gate_pos = self._consistency_gate(P_base, cls_name)
+
+        # ---------------- 图像上绘制调试信息 ----------------
+        cv2.rectangle(color_img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
+        cv2.circle(color_img, (u_center, v_center), 5, (0, 0, 255), -1)
+        if gate_pos is not None:
+            label = (f'{cls_name}: Base[{gate_pos[0]:.2f}, '
+                     f'{gate_pos[1]:.2f}, {gate_pos[2]:.2f}]m')
+        else:
+            # 只显示 ASCII（cv2.putText 不支持中文，会画成 ??????）。
+            # 等待期间也显示原始 3D 点，方便确认深度信息已经算出来。
+            label = (f'{cls_name}: raw[{X_b:.3f},{Y_b:.3f},{Z_b:.3f}] '
+                     f'n={self._pose_tries}/{CONSISTENT_MAX_TRIES} wait')
+        cv2.putText(color_img, label, (xyxy[0], xyxy[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # 发布画框调试后的图像
+        self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+
+        # 未达成一致时不发布位姿，等下一帧
+        if gate_pos is None:
+            return
+
+        X_b, Y_b, Z_b = gate_pos
         # ---------------- 发布 PoseStamped 消息与 TF 广播 ----------------
         now = self.get_clock().now().to_msg()
 
@@ -404,16 +536,6 @@ class YoloGraspPerceptionNode(Node):
         t_tf.transform.translation.z = Z_b
         t_tf.transform.rotation.w = 1.0
         self.tf_broadcaster.sendTransform(t_tf)
-
-        # ---------------- 图像上绘制调试信息 ----------------
-        cv2.rectangle(color_img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
-        cv2.circle(color_img, (u_center, v_center), 5, (0, 0, 255), -1)
-        label = f'{cls_name}: Base[{X_b:.2f}, {Y_b:.2f}, {Z_b:.2f}]m'
-        cv2.putText(color_img, label, (xyxy[0], xyxy[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # 发布画框调试后的图像
-        self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
 
 
 def main(args=None):
