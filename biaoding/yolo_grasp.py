@@ -110,6 +110,10 @@ FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
 FORCE_DIVE_OVERSHOOT = 0.03   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
 FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
 FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
+FORCE_APPROACH_THRESHOLD = 20.0   # 快速接近段力保护阈值（N）：movej 加减速惯性
+                                  # 实测可达 12~13N，10N 会误报；真碰撞通常几十牛
+FORCE_APPROACH_HITS = 3           # 连续几帧超阈值才算触发（滤掉瞬时惯性尖峰）
+FORCE_APPROACH_RETRIES = 2        # 快速接近触力后最多收回重拍重试次数
 LIFT_BEFORE_CLOSE = 0.0120    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
 # 闭合卸力：闭合过程中挤压力超阈值就自动上抬一点（防收拢时力控报警）
 FORCE_RELIEF_THRESHOLD = 2.0  # 闭合挤压力阈值（N，力变化模长）
@@ -232,6 +236,9 @@ class YoloGrasp:
         # ---- ROS 服务 ----
         self.robot.create_service(Trigger, '/yolo_grasp/grasp', self._srv_grasp,
                                   callback_group=self.cb_group)
+        self.robot.create_service(
+            Trigger, '/yolo_grasp/grasp_hold', self._srv_grasp_hold,
+            callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/open', self._srv_open,
                                   callback_group=self.cb_group)
         self.robot.create_service(Trigger, '/yolo_grasp/close', self._srv_close,
@@ -278,6 +285,14 @@ class YoloGrasp:
     def _srv_grasp(self, request, response):
         self.robot.get_logger().info('[服务] 收到抓取指令')
         ok, msg = self.grasp()
+        response.success = ok
+        response.message = msg
+        return response
+
+    def _srv_grasp_hold(self, request, response):
+        """抓取后保持夹持，不自动松手（供 mission_executor 抓完再 place）。"""
+        self.robot.get_logger().info('[服务] 收到抓取保持指令 (grasp_hold)')
+        ok, msg = self.grasp(release_after=False)
         response.success = ok
         response.message = msg
         return response
@@ -579,6 +594,51 @@ class YoloGrasp:
             time.sleep(0.05)
         return False
 
+    def wait_motion_done_force_guarded(self, base, threshold,
+                                       hits=FORCE_APPROACH_HITS,
+                                       timeout=15.0, settle_eps=0.0008):
+        """等运动到位（位置稳定）并同时监控力。
+
+        返回：
+          'done'      位置已稳定到位
+          'triggered' 力变化超过 threshold，已发 stopj
+          'timeout'   超时未稳定
+        必须等位置真正稳定，否则后续用 get_tcp_pose() 算下一点会拿到
+        旧位姿，导致关节大幅摆回（跑偏）。
+        """
+        start = time.time()
+        last, stable = None, 0
+        force_hits = 0
+        while time.time() - start < timeout:
+            self.spin(5, 0.02)
+            if self.latest_force is not None:
+                dvec = self.latest_force - base
+                df = float(np.linalg.norm(dvec))
+                if df > threshold:
+                    force_hits += 1
+                    if force_hits >= hits:
+                        print(f"   [力控] 运动中途触发 {df:.1f}N > "
+                              f"{threshold:.0f}N（连续 {hits} 帧）")
+                        self.send_stopj()
+                        time.sleep(0.3)
+                        return 'triggered'
+                else:
+                    force_hits = 0
+            tcp = self.robot.get_tcp_pose()
+            if tcp is None:
+                continue
+            pos = np.array(tcp[0])
+            if (last is not None and time.time() - start > 1.0
+                    and np.linalg.norm(pos - last) < settle_eps):
+                stable += 1
+                if stable >= 5:
+                    return 'done'
+            else:
+                stable = 0
+            last = pos
+            time.sleep(0.05)
+        return 'timeout'
+
     # ---------------- 抓取流程 ----------------
     def _check_fresh_target(self):
         """取最后一帧感知结果：有新鲜目标（龄期 < TARGET_MAX_AGE）就返回
@@ -804,10 +864,12 @@ class YoloGrasp:
                 return
         print("   [观察] 所有观察位姿均未检测到目标")
 
-    def grasp(self):
+    def grasp(self, release_after=True):
         """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 开启按需识别
         → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2；
-        抓取成功归位后自动松开机械手。
+        release_after=True 时抓取成功归位后自动松开机械手（单机调试用）；
+        release_after=False（/yolo_grasp/grasp_hold）保持夹持，
+        等调度方调 /yolo_grasp/place 再放下。
         返回 (成功与否, 结果描述)。"""
         backend = self._get_backend()
         print(f"   当前识别后端: {backend}")
@@ -851,10 +913,12 @@ class YoloGrasp:
         # 无论成败，收拢到 Home2，保证底盘导航期间机械臂处于安全姿态
         self.home2()
 
-        # 抓取成功且已归位后，松开机械手（放下物体）
-        if ok:
+        # 抓取成功且已归位后，按调用方式决定是否松开机械手
+        if ok and release_after:
             print("   [归位] 抓取成功，松开机械手...")
             self.gripper.open()
+        elif ok:
+            print("   [归位] 抓取成功，保持夹持（等待 place 放下）")
 
         return ok, msg
 
@@ -894,115 +958,187 @@ class YoloGrasp:
         if GRASP_MODE == 'hanging':
             return self._grasp_hanging(obj)
 
-        # 1. 抓取点 = 目标点 + 夹爪定义的偏移
-        g_off = gripper.grasp_offset_world
-        offset_base = (g_off[0] * WORLD_X_IN_BASE +
-                       g_off[1] * WORLD_Y_IN_BASE +
-                       g_off[2] * V_UP_IN_BASE)
-        grasp_tip = obj + offset_base - GRASP_DOWN_OFFSET * V_UP_IN_BASE
-        print(f"2. 抓取点(TCP): [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
-              f"{grasp_tip[2]:.4f}]（偏移 {g_off}）")
+        # 二指：快速接近段带 10N 力保护——从拍照结束下探开始监控，
+        # 超过阈值说明位置不对，立即停止→收回预抓取点→重拍→重试（最多2次）。
+        # 其余夹爪保持原逻辑；慢速力控下探段不变。
+        approach_retries = FORCE_APPROACH_RETRIES
+        while True:
+            # 1. 抓取点 = 目标点 + 夹爪定义的偏移
+            g_off = gripper.grasp_offset_world
+            offset_base = (g_off[0] * WORLD_X_IN_BASE +
+                           g_off[1] * WORLD_Y_IN_BASE +
+                           g_off[2] * V_UP_IN_BASE)
+            grasp_tip = obj + offset_base - GRASP_DOWN_OFFSET * V_UP_IN_BASE
+            print(f"2. 抓取点(TCP): [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
+                  f"{grasp_tip[2]:.4f}]（偏移 {g_off}）")
 
-        # 2. 预抓取点
-        pre_offset = (PRE_GRASP_OFFSET_WORLD[0] * WORLD_X_IN_BASE +
-                      PRE_GRASP_OFFSET_WORLD[1] * WORLD_Y_IN_BASE +
-                      PRE_GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
-        pre_tip = obj + pre_offset
+            # 2. 预抓取点
+            pre_offset = (PRE_GRASP_OFFSET_WORLD[0] * WORLD_X_IN_BASE +
+                          PRE_GRASP_OFFSET_WORLD[1] * WORLD_Y_IN_BASE +
+                          PRE_GRASP_OFFSET_WORLD[2] * V_UP_IN_BASE)
+            pre_tip = obj + pre_offset
 
-        # 抓取姿态由夹爪定义：直装夹爪法兰 Z 朝下竖直抓；
-        # 灵巧手法兰面朝世界 X+、手水平伸出、手心朝下
-        grasp_rot = gripper.grasp_rotation(WORLD_X_IN_BASE, V_UP_IN_BASE)
-        tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 工具伸出方向
-        L = gripper.tool_length
-        print(f"   [诊断] 法兰Z轴: {np.round(tool_dir, 3)}  "
-              f"法兰Y轴: {np.round(grasp_rot[:, 1], 3)}  "
-              f"长度: {L:.3f}m")
+            # 抓取姿态由夹爪定义：直装夹爪法兰 Z 朝下竖直抓；
+            # 灵巧手法兰面朝世界 X+、手水平伸出、手心朝下
+            grasp_rot = gripper.grasp_rotation(WORLD_X_IN_BASE, V_UP_IN_BASE)
+            # 二指地面抓取：拍照位姿的法兰已经竖直朝下，且 yaw 与默认抓取姿态
+            # 相差约 94°。直接沿用当前朝向（拍照→预抓取全程不再转 90°），
+            # 仅当当前法兰 Z 接近世界下时才沿用，否则回退默认姿态。
+            if gripper.name == 'two_finger':
+                q_now = self.robot.get_joint_positions()
+                if q_now is not None:
+                    _, R_now = cs66_forward_kinematics(q_now)
+                    down = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
+                    z_angle = math.degrees(math.acos(np.clip(
+                        R_now[:, 2] @ down, -1.0, 1.0)))
+                    if z_angle < 20.0:
+                        print(f"   [诊断] 沿用拍照位姿朝向（法兰Z与竖直差 "
+                              f"{z_angle:.1f}°），不再转 yaw")
+                        grasp_rot = R_now
+                    else:
+                        print(f"   [诊断] 当前法兰Z与竖直差 {z_angle:.1f}°，"
+                              f"回退默认朝下姿态")
+            tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 工具伸出方向
+            L = gripper.tool_length
+            print(f"   [诊断] 法兰Z轴: {np.round(tool_dir, 3)}  "
+                  f"法兰Y轴: {np.round(grasp_rot[:, 1], 3)}  "
+                  f"长度: {L:.3f}m")
 
-        pre_flange = pre_tip - L * tool_dir
-        print(f"3. 预抓取点(法兰): [{pre_flange[0]:.4f}, {pre_flange[1]:.4f}, "
-              f"{pre_flange[2]:.4f}]")
+            pre_flange = pre_tip - L * tool_dir
+            print(f"3. 预抓取点(法兰): [{pre_flange[0]:.4f}, {pre_flange[1]:.4f}, "
+                  f"{pre_flange[2]:.4f}]")
 
-        dist = float(np.linalg.norm(pre_flange - np.array([0, 0, SHOULDER_Z])))
-        if dist > ARM_REACH:
-            print(f"   !! 距肩关节 {dist:.2f}m 超臂展，放弃")
-            return False, f"目标不可达（距肩关节 {dist:.2f}m）"
+            dist = float(np.linalg.norm(
+                pre_flange - np.array([0, 0, SHOULDER_Z])))
+            if dist > ARM_REACH:
+                print(f"   !! 距肩关节 {dist:.2f}m 超臂展，放弃")
+                return False, f"目标不可达（距肩关节 {dist:.2f}m）"
 
-        self.spin(10)
-        q_guess = self.robot.get_joint_positions()
-        if q_guess is None:
-            print("   !! 无法获取当前关节角，放弃")
-            return False, "无法获取当前关节角"
+            self.spin(10)
+            q_guess = self.robot.get_joint_positions()
+            if q_guess is None:
+                print("   !! 无法获取当前关节角，放弃")
+                return False, "无法获取当前关节角"
 
-        # 根据夹爪类型选择 IK
-        ik_func = (cs66_inverse_kinematics_5dof if gripper.ik_mode == "5dof"
-                   else cs66_inverse_kinematics)
-        if gripper.ik_mode == "5dof":
-            joint_target = ik_func(pre_flange, tool_dir, q_guess)
-        else:
-            joint_target = ik_func(pre_flange, grasp_rot, q_guess)
+            # 根据夹爪类型选择 IK
+            ik_func = (cs66_inverse_kinematics_5dof
+                       if gripper.ik_mode == "5dof"
+                       else cs66_inverse_kinematics)
+            if gripper.ik_mode == "5dof":
+                joint_target = ik_func(pre_flange, tool_dir, q_guess)
+            else:
+                joint_target = ik_func(pre_flange, grasp_rot, q_guess)
 
-        if joint_target is None:
-            print("   !! IK 解算失败，放弃")
-            return False, "IK 解算失败"
-        fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
-        pos_err = float(np.linalg.norm(fk_pos - pre_flange))
-        if gripper.ik_mode == "6dof":
-            rot_err = math.degrees(float(
-                Rot.from_matrix(fk_rot.T @ grasp_rot).magnitude()))
-        else:
-            rot_err = math.degrees(math.acos(float(
-                np.clip(fk_rot[:, 2] @ tool_dir, -1.0, 1.0))))
-        print(f"   IK({gripper.ik_mode}): 位置误差 {pos_err*1000:.1f}mm,  "
-              f"方向误差 {rot_err:.2f}°")
-        if pos_err > 0.02 or rot_err > 5.0:
-            print("   !! IK 误差过大，放弃")
-            return False, f"IK 误差过大（位置 {pos_err*1000:.1f}mm，方向 {rot_err:.2f}°）"
+            if joint_target is None:
+                print("   !! IK 解算失败，放弃")
+                return False, "IK 解算失败"
+            fk_pos, fk_rot = cs66_forward_kinematics(joint_target)
+            pos_err = float(np.linalg.norm(fk_pos - pre_flange))
+            if gripper.ik_mode == "6dof":
+                rot_err = math.degrees(float(
+                    Rot.from_matrix(fk_rot.T @ grasp_rot).magnitude()))
+            else:
+                rot_err = math.degrees(math.acos(float(
+                    np.clip(fk_rot[:, 2] @ tool_dir, -1.0, 1.0))))
+            print(f"   IK({gripper.ik_mode}): 位置误差 {pos_err*1000:.1f}mm,  "
+                  f"方向误差 {rot_err:.2f}°")
+            if pos_err > 0.02 or rot_err > 5.0:
+                print("   !! IK 误差过大，放弃")
+                return False, (f"IK 误差过大（位置 {pos_err*1000:.1f}mm，"
+                               f"方向 {rot_err:.2f}°）")
 
-        # 3. 张开，movej 到预抓取点
-        print(f"4. 张开 [{gripper.name}]，movej 到预抓取点...")
-        gripper.open()
-        time.sleep(0.5)
-        self.send_movej(joint_target)
-        if not self.wait_motion_done():
-            print("   !! 运动超时，放弃")
-            return False, "movej 运动超时"
-        # 二指地面抓取：控制器 movel 在这个低位姿会出现笛卡尔 IK 翻转，
-        # 下降/上抬/退回全部改走 IK+movej 关节空间小步（旧版全程 movej 正常）。
-        joint_space = (gripper.name == 'two_finger')
+            # 3. 张开，movej 到预抓取点
+            print(f"4. 张开 [{gripper.name}]，movej 到预抓取点...")
+            gripper.open()
+            time.sleep(0.5)
+            self.send_movej(joint_target)
+            if not self.wait_motion_done():
+                print("   !! 运动超时，放弃")
+                return False, "movej 运动超时"
+            # 二指地面抓取：控制器 movel 在这个低位姿会出现笛卡尔 IK 翻转，
+            # 下降/上抬/退回全部改走 IK+movej 关节空间小步（旧版全程 movej 正常）。
+            joint_space = (gripper.name == 'two_finger')
 
-        self.spin(5)
-        actual_tcp = self.robot.get_tcp_pose()
-        if actual_tcp is not None:
-            tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - pre_flange)
-            print(f"   [诊断] movej 后偏差: {tcp_err*1000:.1f}mm")
+            self.spin(5)
+            actual_tcp = self.robot.get_tcp_pose()
+            if actual_tcp is not None:
+                tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - pre_flange)
+                print(f"   [诊断] movej 后偏差: {tcp_err*1000:.1f}mm")
 
-        # 4. 下降：先快速接近到抓取点上方，再慢速力控下探（触力即停）。
-        #    two_finger 走 IK+movej 关节空间；其余夹爪保持原 movel。
-        reach_flange = grasp_tip - L * tool_dir
-        approach_tip = grasp_tip + FORCE_APPROACH_H * V_UP_IN_BASE
-        approach_flange = approach_tip - L * tool_dir
-        print(f"   抓取TCP: [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
-              f"{grasp_tip[2]:.4f}]")
-        move_kind = "movej" if joint_space else "movel"
-        print(f"5. {move_kind} 快速接近（抓取点上方 "
-              f"{FORCE_APPROACH_H*100:.0f}cm）...")
-        if joint_space:
-            ok = self.send_movej_to_pose(approach_flange, grasp_rot,
-                                         a=0.5, v=0.12,
-                                         label="快速接近")
-        else:
-            ok = self.send_movel_keep_orientation(approach_flange)
-        if not ok:
-            print("   !! 无法读取当前位姿，放弃")
-            return False, "无法读取当前位姿"
-        if not self.wait_motion_done():
-            print(f"   !! {move_kind} 接近超时，放弃")
-            return False, f"{move_kind} 接近超时"
+            # 4. 下降：先快速接近到抓取点上方，再慢速力控下探（触力即停）。
+            #    two_finger 走 IK+movej 关节空间；其余夹爪保持原 movel。
+            reach_flange = grasp_tip - L * tool_dir
+            approach_tip = grasp_tip + FORCE_APPROACH_H * V_UP_IN_BASE
+            approach_flange = approach_tip - L * tool_dir
+            print(f"   抓取TCP: [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
+                  f"{grasp_tip[2]:.4f}]")
+            move_kind = "movej" if joint_space else "movel"
+            print(f"5. {move_kind} 快速接近（抓取点上方 "
+                  f"{FORCE_APPROACH_H*100:.0f}cm）...")
+
+            if joint_space:
+                # 二指：快速接近带力监控（10N），期间触力即停
+                base = self._force_baseline()
+                if base is None:
+                    return False, "力传感器无数据"
+                ok = self.send_movej_to_pose(approach_flange, grasp_rot,
+                                             a=0.5, v=0.12,
+                                             label="快速接近")
+                if not ok:
+                    return False, "无法读取当前位姿"
+                status = self.wait_motion_done_force_guarded(
+                    base, FORCE_APPROACH_THRESHOLD)
+                if status == 'timeout':
+                    print("   !! 快速接近超时，放弃")
+                    return False, "快速接近超时"
+                if status == 'triggered':
+                    if approach_retries <= 0:
+                        print("   !! 快速接近反复触发力保护，放弃")
+                        return False, "快速接近反复触力"
+                    approach_retries -= 1
+                    print(f"   [快速接近] 收回预抓取点并重拍"
+                          f"（剩余重试 {approach_retries} 次）...")
+                    self.move_keep_orientation(pre_flange, a=0.5, v=0.12,
+                                               joint_space=True,
+                                               rot=grasp_rot)
+                    if not self.wait_motion_done():
+                        return False, "快速接近收回超时"
+                    # 重拍：清空旧目标，等感知节点发来新检测帧
+                    self.latest_target = None
+                    self.latest_target_time = 0.0
+                    if not self._wait_target(3.0):
+                        return False, "重拍未检测到目标"
+                    obj = self._check_fresh_target()
+                    if obj is None:
+                        return False, "重拍未检测到目标"
+                    print(f"   [重拍] 新目标: [{obj[0]:.4f}, {obj[1]:.4f}, "
+                          f"{obj[2]:.4f}]")
+                    continue
+                # done：确认真正到位，避免旧位姿导致下探点算错
+                tcp = self.robot.get_tcp_pose()
+                if tcp is not None:
+                    arrive_err = float(np.linalg.norm(
+                        np.array(tcp[0]) - approach_flange))
+                    if arrive_err > 0.03:
+                        print(f"   !! 快速接近未到位"
+                              f"（偏差 {arrive_err*1000:.0f}mm），放弃")
+                        return False, "快速接近未到位"
+            else:
+                ok = self.send_movel_keep_orientation(approach_flange)
+                if not ok:
+                    print("   !! 无法读取当前位姿，放弃")
+                    return False, "无法读取当前位姿"
+                if not self.wait_motion_done():
+                    print("   !! movel 接近超时，放弃")
+                    return False, "movel 接近超时"
+            break
 
         print("6. 慢速力控下探（触力即停）...")
         # 接触力方向（世界上）转到法兰系，用于软接触投影判据
         contact_dir_flange = grasp_rot.T @ V_UP_IN_BASE
         contact_dir_flange /= np.linalg.norm(contact_dir_flange)
+
+        # 慢速力控下探：只下探一次，触力即进入闭合流程
         contact = self.force_guided_descend(
             -V_UP_IN_BASE, FORCE_APPROACH_H + FORCE_DIVE_OVERSHOOT,
             contact_dir_flange=contact_dir_flange,
@@ -1202,6 +1338,10 @@ def main():
                         help="夹爪类型（默认 linkerhand）")
     parser.add_argument("--headless", action="store_true",
                         help="无人值守模式：跳过键盘交互，仅 ROS 服务驱动")
+    parser.add_argument("--target-class", default="apple",
+                        help="检测类别（逗号分隔），如 bottle；"
+                             "默认 apple（兼容旧抓果流程）。"
+                             "会发布到 /yolo/target_class 同步给感知节点")
     args = parser.parse_args()
 
     rclpy.init()
@@ -1223,13 +1363,17 @@ def main():
     g.gripper.setup()
     g.gripper.validate()
 
+    # 同步检测类别给臂上 YOLO 感知（默认 apple；二指抓瓶用 bottle）
+    g.set_target_class(args.target_class)
+    print(f"已设置检测类别: {args.target_class}")
+
     print("=" * 60)
     print(f"YOLO 抓取主程序（夹爪: {g.gripper.name}）")
     print(f"  IK: {g.gripper.ik_mode}  偏移: {g.gripper.grasp_offset_world}")
     print(f"  工具长度: {g.gripper.tool_length:.3f}m")
     print("  键盘: g=抓取  o=张开  c=闭合  p=打印目标  f=打印力  h=回零  2=Home2  r=预备位姿")
     print("        j=示教放置位姿  l=放置  e=开关持续识别(调试)  t=切换目标类别  q=退出")
-    print("  ROS服务: /yolo_grasp/grasp /open /close /home /home2 /ready /place /status")
+    print("  ROS服务: /yolo_grasp/grasp /grasp_hold /open /close /home /home2 /ready /place /status")
     print("  注意: 识别默认关闭（按需识别），抓取时自动临时开启；"
           "调试看图像/目标请先按 e 开启")
     print("=" * 60)

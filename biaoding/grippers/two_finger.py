@@ -42,7 +42,7 @@ class TwoFingerGripper(GripperBase):
                  gripper_id: int = 1,
                  open_speed: int = 400,
                  close_speed: int = 500,
-                 close_force: int = 200,
+                 close_force: int = 600,
                  tip_length: float = 0.12):
         self._node = robot_node
         self._id = gripper_id
@@ -88,6 +88,7 @@ class TwoFingerGripper(GripperBase):
             self._node.get_logger().warn(f"[{self.name}] 张开命令可能失败")
 
     def close(self):
+        # 闭到最小位置（力度 600，范围 50~1000；原来 200 偏小，瓶子容易滑）
         ok = _call_service("/Setmovemin",
                            "service_interfaces/srv/Setmovemin",
                            f"{{speed: {self._close_speed}, "
@@ -95,6 +96,15 @@ class TwoFingerGripper(GripperBase):
                            f"gripper_id: {self._id}, status: 'set_movemin'}}")
         if not ok:
             self._node.get_logger().warn(f"[{self.name}] 闭合命令可能失败")
+        # 闭合后持续保持抓取力，防止搬运/放置过程中回退松手
+        time.sleep(0.1)
+        ok = _call_service("/Setmoveminhold",
+                           "service_interfaces/srv/Setmoveminhold",
+                           f"{{speed: {self._close_speed}, "
+                           f"power: {self._close_force}, "
+                           f"gripper_id: {self._id}, status: 'set_moveminhold'}}")
+        if not ok:
+            self._node.get_logger().warn(f"[{self.name}] 保持力命令可能失败")
 
     def validate(self) -> bool:
         """检查夹爪服务是否在线。"""

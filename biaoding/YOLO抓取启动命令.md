@@ -31,10 +31,18 @@ ros2 topic pub --once /yolo/target_class std_msgs/msg/String "data: 'all'"
 一个终端启动全部后台节点（驱动 + 相机 + 机械手 + YOLO 感知）：
 
 ```bash
+# 灵巧手版（LinkerHand O6）
 ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp.launch.py
+
+# 二指版（Inspire 4B4C，含夹爪节点 + 自动带 --gripper two_finger 启动主程序）
+ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp_two_finger.launch.py
+
+# 全程调度（导航中断抓瓶）建议加 headless，只留 ROS 服务
+ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp_two_finger.launch.py \
+    grasp_headless:=true
 ```
 
-第二个终端启动抓取主程序（根据夹爪选择）：
+如果用一键启动，抓取主程序会自动在独立终端窗口启动；手动启动时（根据夹爪选择）：
 
 ```bash
 cd ~/Documents/elite_robot_ws/biaoding
@@ -168,6 +176,9 @@ ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'all'"
 # 触发一次完整抓取
 ros2 service call /yolo_grasp/grasp std_srvs/srv/Trigger
 
+# 抓取并保持夹持（不自动松手，等 /yolo_grasp/place 放下；全程调度用这个）
+ros2 service call /yolo_grasp/grasp_hold std_srvs/srv/Trigger
+
 # 张开机械手
 ros2 service call /yolo_grasp/open std_srvs/srv/Trigger
 
@@ -199,11 +210,11 @@ ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'cup'"
 # 2. 确认检测到目标
 ros2 service call /yolo_grasp/status std_srvs/srv/Trigger
 
-# 3. 抓取
+# 3. 抓取（全程/需放置时用 grasp_hold，单机测试用 grasp 也行）
 ros2 service call /yolo_grasp/grasp std_srvs/srv/Trigger
 
-# 4. 回零
-ros2 service call /yolo_grasp/home std_srvs/srv/Trigger
+# 4. 放置（需先按 j 示教 place_pose.json）
+ros2 service call /yolo_grasp/place std_srvs/srv/Trigger
 ```
 
 ---

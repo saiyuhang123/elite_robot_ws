@@ -776,7 +776,7 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     //rclcpp::WallRate loop_rate(10.0);
-    ros_ser.setPort("/dev/ttyUSB0");
+    ros_ser.setPort("/dev/ttyCH341USB1");
     ros_ser.setBaudrate(115200);
     serial::Timeout to =serial::Timeout::simpleTimeout(100);
     ros_ser.setTimeout(to);
