@@ -27,11 +27,14 @@
 调度集成：
   调 /yolo_grasp/grasp（Trigger）触发抓取：先到预备位姿（相机视野
   最佳）→ 开启按需识别（/yolo_perception/set_enabled）→ 只用停稳后
-  的新帧锁存目标 → 关闭识别 → 抓取，结束后无论成败都收拢到 Home2。
+  的新帧锁存目标 → 关闭识别 → 抓取；失败时收拢到 Home2。
+  调 /yolo_grasp/grasp_hold：抓取成功夹住后直接去示教放置位
+  （跳过 Home2），等 /yolo_grasp/place 张开放下。
   response.success/message 为真实结果。
   调 /yolo_grasp/place（Trigger）执行放置：movej 到示教放置位姿
   （按 j 示教，存 place_pose.json）→ 张手放下 → 退回 Home2。
-  底盘导航期间机械臂必须处于 Home2 收拢位姿（/yolo_grasp/home2）。
+  底盘导航期间机械臂必须处于 Home2 收拢位姿（/yolo_grasp/home2）；
+  任务开始时 mission_executor 会先调 /yolo_grasp/home2 收拢。
 """
 
 import argparse
@@ -290,7 +293,7 @@ class YoloGrasp:
         return response
 
     def _srv_grasp_hold(self, request, response):
-        """抓取后保持夹持，不自动松手（供 mission_executor 抓完再 place）。"""
+        """抓取后保持夹持，并直接去示教放置位（供 mission_executor 再调 place）。"""
         self.robot.get_logger().info('[服务] 收到抓取保持指令 (grasp_hold)')
         ok, msg = self.grasp(release_after=False)
         response.success = ok
@@ -866,10 +869,10 @@ class YoloGrasp:
 
     def grasp(self, release_after=True):
         """执行一次抓取流程：先到预备位姿（相机视野最佳）→ 开启按需识别
-        → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2；
-        release_after=True 时抓取成功归位后自动松开机械手（单机调试用）；
-        release_after=False（/yolo_grasp/grasp_hold）保持夹持，
-        等调度方调 /yolo_grasp/place 再放下。
+        → 锁存目标后关闭识别 → 抓取；
+        release_after=True 时抓取成功归位（Home2）后自动松开机械手（单机调试用）；
+        release_after=False（/yolo_grasp/grasp_hold）抓取成功夹住后
+        直接去示教放置位（跳过 Home2），等调度方调 /yolo_grasp/place 再放下。
         返回 (成功与否, 结果描述)。"""
         backend = self._get_backend()
         print(f"   当前识别后端: {backend}")
@@ -910,8 +913,16 @@ class YoloGrasp:
             # 目标已锁存（或抓取失败），关闭识别省算力
             self._set_perception(False)
 
-        # 无论成败，收拢到 Home2，保证底盘导航期间机械臂处于安全姿态
-        self.home2()
+        # grasp_hold 抓取成功：直接去示教放置位（跳过 Home2），等 place 张开；
+        # 抓取失败或单机 grasp：收拢到 Home2
+        if ok and not release_after and self.place_joints is not None:
+            print("   [归位] 抓取成功，直接去示教放置位...")
+            self.send_movej(self.place_joints)
+            if not self.wait_motion_done():
+                print("   !! 到放置位超时，退回 Home2")
+                self.home2()
+        else:
+            self.home2()
 
         # 抓取成功且已归位后，按调用方式决定是否松开机械手
         if ok and release_after:

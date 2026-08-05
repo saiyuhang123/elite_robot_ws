@@ -37,13 +37,16 @@ DEFAULT_TARGET_CLASSES = {'apple'}
 # 置信度阈值：低于此值的检测框直接忽略
 CONF_THRESHOLD = 0.25
 
-# 深度帧新鲜度保护：识别开启后只接受"晚于开启时刻"的深度帧，且 color/depth
-# 时间戳差需与已观测的固定偏差一致（防止深度流丢帧/滞后时，把运动途中拍的
-# 旧深度和当前彩色帧拼在一起算出错误 3D 点）。
-# 图漾相机只有 ~0.8fps，color/depth 帧间隔约 1.25s，时间戳差天然很大，
-# 校验太严会把正常帧全弃掉导致"识别不到"，所以放宽。
-DEPTH_COLOR_TOL_S = 0.5     # 与基线偏差超过该值（秒）即弃帧，等下一帧
-DEPTH_HARD_MAX_DT_S = 2.0   # 无基线时的绝对界限（秒），color/depth 差太大弃帧
+# 深度帧新鲜度：只要求是"识别开启之后新到的深度帧"。
+# 拍照时机械臂已停稳，0.8fps 图漾的 color/depth 时间戳差天然很大，
+# 做时间戳差校验只会把好帧丢掉（灵巧手时代也没有这道校验）。
+
+# 灵巧手模式（--mode linkerhand，默认）：帧间一致性多帧判断 + 中心点深度，
+# 与旧版一致；二指模式（--mode two_finger）用鲁棒深度 + 单帧发布。
+CONSISTENT_FRAMES = 3
+CONSISTENT_TOL_M = 0.015
+CONSISTENT_MAX_TRIES = 4
+CONSISTENT_MAX_SECONDS = 2.0
 
 def load_hand_eye_matrix(path):
     """从 hand_eye_result.json 读取 相机->法兰 的 4x4 变换矩阵。"""
@@ -56,9 +59,10 @@ def load_hand_eye_matrix(path):
 
 
 class YoloGraspPerceptionNode(Node):
-    def __init__(self, initial_classes=None):
+    def __init__(self, initial_classes=None, mode='linkerhand'):
         super().__init__('yolo_grasp_perception_node')
         self.get_logger().info('>>> YOLO 抓取感知节点正在启动...')
+        self.mode = mode
 
         # ---------------- 1. 初始化参数与配置 ----------------
         self.bridge = CvBridge()
@@ -106,11 +110,13 @@ class YoloGraspPerceptionNode(Node):
         self.latest_info = None
         # 深度新鲜度/帧间一致性状态
         self._depth_stamp_at_enable = None  # 开启识别时刻缓存的深度帧时间戳
-        self._dt_offsets = deque(maxlen=12)  # 最近接受帧的 color/depth 时间戳差
-        self._dt_baseline = None             # 时间戳差的固定偏差基线（秒）
         self._depth_rejects_old = 0          # 因"识别开启前旧深度"弃帧计数
-        self._depth_rejects_dt = 0           # 因"时间戳差异常"弃帧计数
         self._last_reject_log = 0.0
+        # 灵巧手模式：帧间一致性窗口状态
+        self._pose_window = deque(maxlen=5)
+        self._pose_cls = None
+        self._pose_tries = 0
+        self._pose_start = None
         self.create_subscription(
             Image, '/camera/color/image_raw', self._color_cb, 10)
         self.create_subscription(
@@ -164,31 +170,14 @@ class YoloGraspPerceptionNode(Node):
         self.latest_info = msg
 
     def _depth_is_fresh(self, depth_msg, color_msg):
-        """深度帧新鲜度校验：识别开启前缓存（可能是停稳前/运动途中）的深度
-        帧一律不用；color/depth 时间戳差偏离已观测固定偏差（深度流滞后、
-        丢帧）也弃帧，等下一帧。"""
+        """深度帧新鲜度：识别开启前缓存（可能是停稳前/运动途中）的深度帧
+        一律不用；拍照时机械臂已停稳，不再校验 color/depth 时间戳差。"""
         depth_t = rclpy.time.Time.from_msg(depth_msg.header.stamp)
-        # 1) 必须是识别开启之后新到的深度帧
         if self._depth_stamp_at_enable is not None:
             if depth_t <= self._depth_stamp_at_enable:
                 self._depth_rejects_old += 1
                 self._log_depth_rejects()
                 return False
-        # 2) color/depth 时间戳差：先绝对界限，再与已观测固定偏差比对
-        dt = (depth_t - rclpy.time.Time.from_msg(
-            color_msg.header.stamp)).nanoseconds / 1e9
-        if abs(dt) > DEPTH_HARD_MAX_DT_S:
-            self._depth_rejects_dt += 1
-            self._log_depth_rejects()
-            return False
-        if (self._dt_baseline is not None
-                and abs(dt - self._dt_baseline) > DEPTH_COLOR_TOL_S):
-            self._depth_rejects_dt += 1
-            self._log_depth_rejects()
-            return False
-        self._dt_offsets.append(dt)
-        if len(self._dt_offsets) >= 5:
-            self._dt_baseline = float(np.median(self._dt_offsets))
         return True
 
     def _log_depth_rejects(self):
@@ -198,8 +187,34 @@ class YoloGraspPerceptionNode(Node):
         self._last_reject_log = time.time()
         self.get_logger().warn(
             f'[诊断] 深度帧被弃用: 旧帧×{self._depth_rejects_old}, '
-            f'时间戳差×{self._depth_rejects_dt} '
-            f'(基线={getattr(self, "_dt_baseline", None)})')
+            f'时间戳差×0（已去掉时间戳差校验）')
+
+    def _consistency_gate(self, P_base, cls_name):
+        """灵巧手模式：帧间一致性。同一类别连续 CONSISTENT_FRAMES 帧位置
+        一致才返回；连续 CONSISTENT_MAX_TRIES 帧或超 CONSISTENT_MAX_SECONDS
+        仍不一致时按最新帧兜底（与旧版一致）。"""
+        if self._pose_cls != cls_name:
+            self._pose_cls = cls_name
+            self._pose_window.clear()
+            self._pose_tries = 0
+            self._pose_start = time.time()
+        self._pose_tries += 1
+        self._pose_window.append(P_base[:3])
+
+        if len(self._pose_window) >= CONSISTENT_FRAMES:
+            arr = np.array(self._pose_window)
+            spread = float(np.max(arr.max(axis=0) - arr.min(axis=0)))
+            if spread <= CONSISTENT_TOL_M:
+                return P_base[:3]
+            elapsed = time.time() - (self._pose_start or time.time())
+            if (self._pose_tries >= CONSISTENT_MAX_TRIES
+                    or elapsed >= CONSISTENT_MAX_SECONDS):
+                self.get_logger().warn(
+                    f'[诊断] {self._pose_tries}帧/'
+                    f'{elapsed:.1f}s 位置不一致(跨度{spread*1000:.1f}mm)，'
+                    f'按最新帧发布')
+                return P_base[:3]
+        return None
 
     # ---- 按需识别开关服务 ----
     def _set_enabled_cb(self, request, response):
@@ -209,6 +224,11 @@ class YoloGraspPerceptionNode(Node):
             self._depth_stamp_at_enable = (
                 rclpy.time.Time.from_msg(self.latest_depth.header.stamp)
                 if self.latest_depth is not None else None)
+            # 灵巧手模式：一致性窗口清零，防止沿用上一次识别会话的旧帧
+            self._pose_window.clear()
+            self._pose_cls = None
+            self._pose_tries = 0
+            self._pose_start = None
         response.success = True
         response.message = '识别已开启' if self.enabled else '识别已关闭'
         self.get_logger().info(
@@ -357,37 +377,78 @@ class YoloGraspPerceptionNode(Node):
             u_center = int((xyxy[0] + xyxy[2]) / 2)
             v_center = int((xyxy[1] + xyxy[3]) / 2)
 
-            # ---------------- 7x7 窗口中值滤波提取深度 ----------------
-            patch_size = 7
-            half = patch_size // 2
+            if self.mode == 'two_finger':
+                # ---------------- 二指：鲁棒深度提取 ----------------
+                # 深色/反光塑料瓶中心常缺深度（0），但瓶身边缘通常有值。
+                # 取检测框中央偏下区域（60%宽 × 35%~95%高）的有效深度，
+                # 用低分位(15%)选"最近的瓶子表面"，背景/地面更远不会被选中；
+                # 再用这些最近像素的质心做投影点。
+                bx1, by1, bx2, by2 = [int(v) for v in xyxy]
+                bw = bx2 - bx1
+                bh = by2 - by1
+                r_x1 = max(0, int(bx1 + 0.20 * bw))
+                r_x2 = min(depth_img.shape[1], int(bx2 - 0.20 * bw))
+                r_y1 = max(0, int(by1 + 0.35 * bh))
+                r_y2 = min(depth_img.shape[0], int(by2 - 0.05 * bh))
 
-            # 边界保护
-            v_start = max(0, v_center - half)
-            v_end = min(depth_img.shape[0], v_center + half + 1)
-            u_start = max(0, u_center - half)
-            u_end = min(depth_img.shape[1], u_center + half + 1)
+                u0, v0 = r_x1, r_y1
+                roi = depth_img[v0:r_y2, u0:r_x2]
+                valid_depths = roi[roi > 0]
 
-            depth_patch = depth_img[v_start:v_end, u_start:u_end]
-            valid_depths = depth_patch[depth_patch > 0]  # 过滤掉 0 深度无效值
+                if valid_depths.size < 3:
+                    # 回退：中心 7x7
+                    u0 = max(0, u_center - 3)
+                    v0 = max(0, v_center - 3)
+                    roi = depth_img[v0:min(depth_img.shape[0], v_center + 4),
+                                    u0:min(depth_img.shape[1], u_center + 4)]
+                    valid_depths = roi[roi > 0]
 
-            if len(valid_depths) == 0:
-                self.get_logger().warn(f'目标 [{cls_name}] 中心点深度无效，跳过...')
-                continue
+                if valid_depths.size == 0:
+                    self.get_logger().warn(
+                        f'目标 [{cls_name}] 深度无效，跳过...')
+                    continue
 
-            # 取深度中位数 (Percipio 原始值 0.25mm/LSB -> 转换为 m)
-            depth_raw = np.median(valid_depths)
-            Z_c = float(depth_raw) * 0.25 / 1000.0
+                # 低分位选最近表面
+                thr = float(np.percentile(valid_depths, 15))
+                mask = (roi > 0) & (roi <= thr)
+                ys, xs = np.nonzero(mask)
+                if xs.size > 0:
+                    u_use = u0 + float(np.mean(xs))
+                    v_use = v0 + float(np.mean(ys))
+                    depth_raw = float(np.median(roi[mask]))
+                else:
+                    u_use, v_use = float(u_center), float(v_center)
+                    depth_raw = float(np.percentile(valid_depths, 15))
+            else:
+                # ---------------- 灵巧手：中心 7x7 中位数（旧方案） ----------------
+                v_start = max(0, v_center - 3)
+                v_end = min(depth_img.shape[0], v_center + 4)
+                u_start = max(0, u_center - 3)
+                u_end = min(depth_img.shape[1], u_center + 4)
+                depth_patch = depth_img[v_start:v_end, u_start:u_end]
+                valid_depths = depth_patch[depth_patch > 0]
+
+                if len(valid_depths) == 0:
+                    self.get_logger().warn(
+                        f'目标 [{cls_name}] 中心点深度无效，跳过...')
+                    continue
+                depth_raw = float(np.median(valid_depths))
+                u_use, v_use = float(u_center), float(v_center)
+
+            # Percipio 原始值 0.25mm/LSB -> 转换为 m
+            Z_c = depth_raw * 0.25 / 1000.0
 
             # 过滤不合理的深度值 (比如小于10cm 或 大于 3m)
             if Z_c < 0.1 or Z_c > 3.0:
                 continue
 
             # ---------------- 反推相机坐标系 3D 坐标 (X_c, Y_c, Z_c) ----------------
-            X_c = (u_center - cx) * Z_c / fx
-            Y_c = (v_center - cy) * Z_c / fy
+            X_c = (u_use - cx) * Z_c / fx
+            Y_c = (v_use - cy) * Z_c / fy
 
             if best is None or Z_c < best[0]:
-                best = (Z_c, xyxy, cls_name, conf, X_c, Y_c, u_center, v_center)
+                best = (Z_c, xyxy, cls_name, conf, X_c, Y_c,
+                        int(u_use), int(v_use))
 
         if best is None:
             self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
@@ -445,21 +506,33 @@ class YoloGraspPerceptionNode(Node):
             f'基座系: [{X_b:.3f}, {Y_b:.3f}, {Z_b:.3f}]m'
         )
 
-        # ---------------- 单帧发布 ----------------
-        # 拍照时机械臂已停稳：不做多帧一致性/平均（0.8fps 慢相机下多帧
-        # 窗口会被坏帧污染），单帧识别 + 有效深度直接发布。
-        gate_pos = P_base[:3]
+        # ---------------- 发布策略 ----------------
+        # 二指：拍照时机械臂已停稳，单帧识别 + 有效深度直接发布
+        #       （0.8fps 慢相机下多帧窗口会被坏帧污染）；
+        # 灵巧手：恢复旧版多帧一致性判断（_consistency_gate）。
+        if self.mode == 'two_finger':
+            gate_pos = P_base[:3]
+        else:
+            gate_pos = self._consistency_gate(P_base, cls_name)
 
         # ---------------- 图像上绘制调试信息 ----------------
         cv2.rectangle(color_img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
         cv2.circle(color_img, (u_center, v_center), 5, (0, 0, 255), -1)
-        label = (f'{cls_name}: Base[{gate_pos[0]:.2f}, '
-                 f'{gate_pos[1]:.2f}, {gate_pos[2]:.2f}]m')
+        if gate_pos is not None:
+            label = (f'{cls_name}: Base[{gate_pos[0]:.2f}, '
+                     f'{gate_pos[1]:.2f}, {gate_pos[2]:.2f}]m')
+        else:
+            label = (f'{cls_name}: raw[{X_b:.3f},{Y_b:.3f},{Z_b:.3f}] '
+                     f'wait')
         cv2.putText(color_img, label, (xyxy[0], xyxy[1] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         # 发布画框调试后的图像
         self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
+
+        # 灵巧手：未达成一致时不发布位姿，等下一帧
+        if gate_pos is None:
+            return
 
         X_b, Y_b, Z_b = gate_pos
         # ---------------- 发布 PoseStamped 消息与 TF 广播 ----------------
@@ -493,13 +566,17 @@ def main(args=None):
         '--target-class', default=None,
         help='初始检测类别，逗号分隔，如 bottle 或 bottle,cup；'
              '默认 apple（兼容旧抓果流程）')
+    parser.add_argument(
+        '--mode', default='linkerhand', choices=['linkerhand', 'two_finger'],
+        help='linkerhand=多帧一致性+中心点深度（旧方案，默认）；'
+             'two_finger=鲁棒深度+单帧发布')
     parsed, unknown = parser.parse_known_args(sys.argv[1:])
     rclpy.init(args=unknown)
     initial = None
     if parsed.target_class:
         initial = {c.strip() for c in parsed.target_class.split(',')
                    if c.strip()}
-    node = YoloGraspPerceptionNode(initial_classes=initial)
+    node = YoloGraspPerceptionNode(initial_classes=initial, mode=parsed.mode)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -179,7 +179,8 @@ def generate_launch_description():
 
     yolo_perception = ExecuteProcess(
         cmd=["python3", yolo_perception_script,
-             "--target-class", "bottle"],
+             "--target-class", "bottle",
+             "--mode", "two_finger"],
         cwd=yolo_dir,
         output="screen",
         name="yolo_grasp_perception",
