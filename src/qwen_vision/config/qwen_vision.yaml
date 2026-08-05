@@ -1,0 +1,34 @@
+/**:
+  ros__parameters:
+    api_key: "sk-87234c4787964295b2bc8687b1814656"
+    base_url: "https://ws-v8pujxl0xq3m2mlx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    model: "qwen3.7-plus"
+    prompt: "请只定位目标物体的位置（只返回bbox）"
+    target: "apple"
+
+    # 手眼标定与 TF（与 YOLO/yolo_grasp_perception.py 同一套）
+    hand_eye_json: "/home/nvidia/Documents/elite_robot_ws/biaoding/hand_eye_result.json"
+    base_frame: "cs66_base_link"
+    tool_frame: "cs66_tool0"
+
+    # 图漾 Percipio 深度：原始值 0.25mm/LSB
+    depth_scale: 0.00025
+    min_depth_m: 0.10
+    max_depth_m: 3.00
+    patch_size: 7
+    min_valid_depth: 10
+    # 用 bbox 内与目标深度一致的点群质心代替几何中心，修正大模型框偏问题
+    use_depth_centroid: false
+    depth_tol_m: 0.03
+    # 深度帧与彩色帧时间戳最大偏差（秒），避免拿旧深度算新框
+    depth_color_tol_s: 0.5
+
+    # 识别节奏与接口
+    poll_interval: 1.0
+    api_timeout: 60.0
+    locate_timeout: 20.0
+    confidence_threshold: 0.0
+    # Qwen 的 center 点目前不如 bbox 稳定，默认不用
+    use_model_center: false
+    debug: true
+    image_save_dir: "/tmp/qwen_vision"

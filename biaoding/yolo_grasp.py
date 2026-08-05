@@ -64,6 +64,13 @@ from grippers import create_gripper
 # ---------------- 通用配置 ----------------
 SCRIPT_TOPIC = "/script_sender/script_command"
 TARGET_TOPIC = "/target_object_pose"
+PERCEPTION_ENABLE_SERVICE = "/vision_perception/set_enabled"
+YOLO_PERCEPTION_ENABLE_SERVICE = "/yolo_perception/set_enabled"
+
+# 大模型识别兜底：Qwen API 单次可能要几十秒，必须等它返回结果后再判定超时/回位。
+# YOLO 保持原来的短等待，不需要走这个逻辑。
+LLM_RESULT_TIMEOUT = 90.0
+LLM_OBSERVE_TIMEOUT = 90.0
 
 # 倾斜安装实测：世界系"上"在基座系下的方向（calibrate_vertical.py 可重测）
 V_UP_IN_BASE = np.array([-0.7431, 0.0120, 0.6691])
@@ -180,6 +187,11 @@ class YoloGrasp:
         self._target_locked = False
         self.robot.create_subscription(
             PoseStamped, TARGET_TOPIC, self._target_cb, 10)
+        self.latest_qwen_done = None
+        self.latest_qwen_done_time = 0.0
+        self._llm_clear_time = 0.0
+        self.robot.create_subscription(
+            String, '/qwen/perception_done', self._qwen_done_cb, 10)
 
         # ---- 末端力传感器（力控下探用）----
         self.latest_force = None
@@ -202,8 +214,15 @@ class YoloGrasp:
                 print(f"读取手眼标定 {HAND_EYE_JSON} 失败: {e}（补拍将禁用）")
 
         # 按需识别开关（感知节点默认关闭识别，抓取前才临时开启）
+        # 优先使用 qwen/yolo 通用切换服务；切换器未启动时回退到原 YOLO 服务
         self.perception_enable_cli = self.robot.create_client(
-            SetBool, '/yolo_perception/set_enabled')
+            SetBool, PERCEPTION_ENABLE_SERVICE)
+        self.yolo_perception_enable_cli = self.robot.create_client(
+            SetBool, YOLO_PERCEPTION_ENABLE_SERVICE)
+        self.qwen_perception_enable_cli = self.robot.create_client(
+            SetBool, '/qwen_perception/set_enabled')
+        self.vision_backend_cli = self.robot.create_client(
+            Trigger, '/vision_perception/backend')
 
         # ---- ROS 服务 ----
         self.robot.create_service(Trigger, '/yolo_grasp/grasp', self._srv_grasp,
@@ -323,6 +342,10 @@ class YoloGrasp:
         self.latest_target = np.array([
             msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         self.latest_target_time = time.time()
+
+    def _qwen_done_cb(self, msg):
+        self.latest_qwen_done = msg.data
+        self.latest_qwen_done_time = time.time()
 
     # ---------------- 末端力传感器 ----------------
     def _ft_cb(self, msg):
@@ -613,12 +636,21 @@ class YoloGrasp:
 
     def _set_perception(self, enabled: bool) -> bool:
         """开关感知节点的按需识别。返回服务是否调用成功。"""
-        if not self.perception_enable_cli.wait_for_service(timeout_sec=2.0):
-            print("   !! 感知开关服务不可用（yolo_grasp_perception.py 未启动？）")
+        if self.perception_enable_cli.service_is_ready():
+            cli = self.perception_enable_cli
+        elif self.yolo_perception_enable_cli.service_is_ready():
+            cli = self.yolo_perception_enable_cli
+        elif self.perception_enable_cli.wait_for_service(timeout_sec=1.0):
+            cli = self.perception_enable_cli
+        elif self.yolo_perception_enable_cli.wait_for_service(timeout_sec=1.0):
+            cli = self.yolo_perception_enable_cli
+        else:
+            print("   !! 感知开关服务不可用（qwen_vision 切换器或 "
+                  "yolo_grasp_perception.py 未启动？）")
             return False
         req = SetBool.Request()
         req.data = bool(enabled)
-        future = self.perception_enable_cli.call_async(req)
+        future = cli.call_async(req)
         # 节点由后台 MultiThreadedExecutor  spinning，轮询等待即可，
         # 不能再 spin_until_future_complete（一个节点挂两个执行器会互踩）
         start = time.time()
@@ -638,7 +670,55 @@ class YoloGrasp:
             time.sleep(0.05)
         return self.latest_target is not None
 
-    def _search_observe_poses(self):
+    def _wait_llm_result(self, timeout, reset=True):
+        """大模型专用等待：等到目标发布或 /qwen/perception_done 返回。
+
+        关键点：Qwen API 可能几十秒才返回，不能像 YOLO 一样 8 秒没目标就
+        移动/回位。这里会一直等到模型“已经返回结果”（无论有没有目标），
+        只有超过兜底超时才判定失败。
+        """
+        if reset:
+            self.latest_target = None
+            self.latest_target_time = 0.0
+            self.latest_qwen_done = None
+            self.latest_qwen_done_time = 0.0
+            self._llm_clear_time = time.time()
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.latest_target is not None:
+                return True
+            if self.latest_qwen_done_time >= self._llm_clear_time:
+                print(f"   [大模型] 已返回结果（{self.latest_qwen_done}），"
+                      "未检测到目标")
+                return False
+            time.sleep(0.05)
+        print(f"   [大模型] {timeout:.0f}s 内未等到识别结果，判定超时")
+        return False
+
+    def _get_backend(self):
+        """查询当前感知后端（qwen/yolo）。切换器不在时按 YOLO 处理。"""
+        if self.vision_backend_cli is not None \
+                and self.vision_backend_cli.service_is_ready():
+            future = self.vision_backend_cli.call_async(Trigger.Request())
+            deadline = time.time() + 3.0
+            while not future.done() and time.time() < deadline:
+                time.sleep(0.02)
+            if future.done():
+                try:
+                    msg = (future.result().message or '').lower()
+                    if 'qwen' in msg:
+                        return 'qwen'
+                    if 'yolo' in msg:
+                        return 'yolo'
+                except Exception:
+                    pass
+        # 切换器没启动时兜底：只有 Qwen 在线就按大模型处理
+        if self.qwen_perception_enable_cli.service_is_ready() \
+                and not self.yolo_perception_enable_cli.service_is_ready():
+            return 'qwen'
+        return 'yolo'
+
+    def _search_observe_poses(self, backend='yolo'):
         """依次转到观察位姿找目标，检测到即停（留在该位姿）。"""
         for i, pose in enumerate(OBSERVE_POSES):
             print(f"   [观察] 预备位姿无目标，转观察位姿 "
@@ -648,7 +728,11 @@ class YoloGrasp:
                 print("   [观察] 移动超时，试下一个")
                 continue
             time.sleep(0.5)  # 停稳
-            if self._wait_target(OBSERVE_WAIT):
+            if backend == 'qwen':
+                found = self._wait_llm_result(LLM_OBSERVE_TIMEOUT)
+            else:
+                found = self._wait_target(OBSERVE_WAIT)
+            if found:
                 print(f"   [观察] 位姿 {i+1} 检测到目标")
                 return
         print("   [观察] 所有观察位姿均未检测到目标")
@@ -658,6 +742,9 @@ class YoloGrasp:
         → 锁存目标后关闭识别 → 抓取 → 无论成败都收拢到 Home2；
         抓取成功归位后自动松开机械手。
         返回 (成功与否, 结果描述)。"""
+        backend = self._get_backend()
+        print(f"   当前识别后端: {backend}")
+
         # 0. 先到抓取预备位姿，此位姿下相机视野最好
         print("0. movej 到抓取预备位姿...")
         self.send_movej(READY_JOINTS)
@@ -670,13 +757,22 @@ class YoloGrasp:
         #    避免混入导航/摆臂过程中的旧检测结果导致抓取点跑偏
         self.latest_target = None
         self.latest_target_time = 0.0
+        self.latest_qwen_done = None
+        self.latest_qwen_done_time = 0.0
+        self._llm_clear_time = time.time()
         if not self._set_perception(True):
             return False, "感知节点未响应（识别未开启，放弃）"
         try:
-            # 2. 默认（预备）位姿等 5s 检测；检测不到则遍历观察位姿，
-            #    哪个位姿检测到就在哪个位姿继续抓取
-            if not self._wait_target(8.0):
-                self._search_observe_poses()
+            # 2. 默认（预备）位姿等检测；检测不到则遍历观察位姿，
+            #    哪个位姿检测到就在哪个位姿继续抓取。
+            #    大模型模式必须等模型返回结果后再移动/超时/回位，
+            #    YOLO 保持原来的短等待。
+            if backend == 'qwen':
+                found = self._wait_llm_result(LLM_RESULT_TIMEOUT, reset=False)
+            else:
+                found = self._wait_target(8.0)
+            if not found:
+                self._search_observe_poses(backend)
             if self.latest_target is None:
                 ok, msg = False, "所有位姿均未检测到目标"
             else:
