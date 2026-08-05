@@ -140,6 +140,11 @@ HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，
 OBSERVE_POSES = [
     [-0.038397, 0.308923, -1.619919, -1.680604, 1.712094, 1.504874],
 ]
+# 二指夹爪地面拍照位姿（车前地面瓶子，2026-08-05 实测标定）
+# 只对 two_finger 生效；灵巧手仍使用上面的 OBSERVE_POSES
+TWO_FINGER_GROUND_OBSERVE_POSES = [
+    [-0.041888, -1.021018, -1.664225, -1.188569, 1.586504, 0.022689],
+]
 OBSERVE_WAIT = 5.0         # 观察位姿等待检测的时间（秒）
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
@@ -372,13 +377,16 @@ class YoloGrasp:
     def force_guided_descend(self, down_dir, max_dist, step=FORCE_DIVE_STEP,
                              v=FORCE_DIVE_V, threshold=FORCE_THRESHOLD,
                              contact_dir_flange=None,
-                             proj_threshold=FORCE_PROJ_THRESHOLD):
+                             proj_threshold=FORCE_PROJ_THRESHOLD,
+                             joint_space=False):
         """慢速分段下探：每走一小步检查力变化，触力即停。
         停止判据（任一满足）：
           - 力变化模长 > threshold（硬保护，任意方向大力）
           - 力变化在接触方向上的投影 > proj_threshold 连续 FORCE_PROJ_HITS 次
             （软接触，轻触也能检出；contact_dir_flange 为接触力方向在法兰系
             下的单位向量，None 则关闭投影判据）
+        joint_space=True（two_finger 地面抓取）：每步用 IK+movej，
+        不经过控制器 movel 的笛卡尔插补。
         返回 True=触力停止，False=走满行程未触力，None=出错。"""
         base = self._force_baseline()
         if base is None:
@@ -397,7 +405,9 @@ class YoloGrasp:
             if tcp is None:
                 return None
             nxt = np.array(tcp[0]) + d * down_dir
-            if not self.send_movel_keep_orientation(nxt, a=0.3, v=v):
+            if not self.move_keep_orientation(
+                    nxt, a=0.3, v=(0.05 if joint_space else v),
+                    joint_space=joint_space):
                 return None
             # 等本步走完，中途触力立即停
             start = time.time()
@@ -409,7 +419,10 @@ class YoloGrasp:
                     if df > threshold:
                         print(f"   [力控] 硬触发 {df:.1f}N > {threshold}N，停止下探"
                               f"（已下探 {traveled*1000:.0f}mm）")
-                        self.send_stopl()
+                        if joint_space:
+                            self.send_stopj()
+                        else:
+                            self.send_stopl()
                         time.sleep(0.3)
                         return True
                     if contact_dir_flange is not None:
@@ -423,7 +436,10 @@ class YoloGrasp:
                             print(f"   [力控] 软接触触发（投影 {proj:.1f}N "
                                   f"连续 {proj_hits} 次），停止下探"
                                   f"（已下探 {traveled*1000:.0f}mm）")
-                            self.send_stopl()
+                            if joint_space:
+                                self.send_stopj()
+                            else:
+                                self.send_stopl()
                             time.sleep(0.3)
                             return True
                 tcp2 = self.robot.get_tcp_pose()
@@ -442,7 +458,8 @@ class YoloGrasp:
     def close_with_force_relief(self, up_dir_base,
                                 threshold=FORCE_RELIEF_THRESHOLD,
                                 step=FORCE_RELIEF_STEP,
-                                max_lift=FORCE_RELIEF_MAX):
+                                max_lift=FORCE_RELIEF_MAX,
+                                joint_space=False):
         """闭合夹爪（攥紧段），闭合过程中监测挤压力（模长），超阈值就上抬
         一小段卸力。防止收拢时挤压物体导致力控报警。返回累计上抬量（米）。"""
         base = self._force_baseline(0.3)
@@ -459,7 +476,9 @@ class YoloGrasp:
                         target = np.array(tcp[0]) + step * up_dir_base
                         print(f"   [卸力] 闭合挤压力 {df:.1f}N > {threshold}N，"
                               f"上抬 {step*1000:.0f}mm")
-                        self.send_movel_keep_orientation(target, a=0.3, v=0.02)
+                        self.move_keep_orientation(
+                            target, a=0.3, v=0.02,
+                            joint_space=joint_space)
                         self.wait_motion_done(timeout=5.0)
                         lifted += step
                         t_end = time.time() + 0.5  # 抬完留点时间让夹爪走完
@@ -479,6 +498,31 @@ class YoloGrasp:
         j = ", ".join(f"{x:.6f}" for x in joints_rad)
         self._send(f"def prog():\n    movej([{j}], a={a:.3f}, v={v:.3f}, r=0)\nend")
 
+    def send_movej_to_pose(self, pos, rot, a, v, label=""):
+        """IK 解算并 movej 到目标法兰位姿（关节空间）。
+
+        二指地面抓取专用：不用控制器的 movel 笛卡尔插补，而是每一小步
+        都本地 IK 成关节角再 movej，从根本上避开 movel 在该低位姿上的
+        笛卡尔 IK 翻转/扭动问题（旧版 visual_grasp_test.py 全程 movej
+        是正常的）。
+        """
+        q_guess = self.robot.get_joint_positions()
+        if q_guess is None:
+            print("   !! 无法读取当前关节角")
+            return False
+        joint_target = cs66_inverse_kinematics(
+            np.asarray(pos, dtype=float), np.asarray(rot, dtype=float),
+            q_guess)
+        if joint_target is None:
+            print(f"   !! IK 失败：{label} [目标 {np.round(pos, 4)}]")
+            return False
+        self.send_movej(joint_target, a=a, v=v)
+        return True
+
+    def send_stopj(self, a=0.5):
+        """急停当前关节运动。"""
+        self._send(f"def prog():\n    stopj({a})\nend")
+
     def send_movel_keep_orientation(self, pos, a=MOVEL_A, v=MOVEL_V):
         self.spin(5)
         tcp = self.robot.get_tcp_pose()
@@ -486,9 +530,28 @@ class YoloGrasp:
             return False
         q = tcp[1]
         rx, ry, rz = quat_to_rotvec(*q)
+        print(f"  [movel ROTVEC] rx={rx:.6f} ry={ry:.6f} rz={rz:.6f}")
         p = ", ".join(f"{x:.6f}" for x in (*pos, rx, ry, rz))
         self._send(f"def prog():\n    movel([{p}], a={a:.3f}, v={v:.3f})\nend")
         return True
+
+    def move_keep_orientation(self, pos, a=MOVEL_A, v=MOVEL_V,
+                              joint_space=False, rot=None):
+        """保持当前物理法兰姿态平移到位。
+
+        joint_space=True（two_finger 地面抓取）时走 IK+movej 小步，
+        rot 可显式传入目标旋转矩阵（默认为当前关节角的 FK）。
+        其他夹爪保持原 movel 行为不变。
+        """
+        if not joint_space:
+            return self.send_movel_keep_orientation(pos, a=a, v=v)
+        if rot is None:
+            q = self.robot.get_joint_positions()
+            if q is None:
+                return False
+            _, rot = cs66_forward_kinematics(q)
+        return self.send_movej_to_pose(pos, rot, a=a, v=v,
+                                       label="move_keep_orientation")
 
     def _send(self, script):
         msg = String()
@@ -720,9 +783,13 @@ class YoloGrasp:
 
     def _search_observe_poses(self, backend='yolo'):
         """依次转到观察位姿找目标，检测到即停（留在该位姿）。"""
-        for i, pose in enumerate(OBSERVE_POSES):
+        poses = list(OBSERVE_POSES)
+        if self.gripper.name == 'two_finger':
+            # 二指夹爪：先试地面拍照位姿，再退回旧观察位姿
+            poses = list(TWO_FINGER_GROUND_OBSERVE_POSES) + poses
+        for i, pose in enumerate(poses):
             print(f"   [观察] 预备位姿无目标，转观察位姿 "
-                  f"{i+1}/{len(OBSERVE_POSES)}...")
+                  f"{i+1}/{len(poses)}...")
             self.send_movej(pose)
             if not self.wait_motion_done():
                 print("   [观察] 移动超时，试下一个")
@@ -899,6 +966,9 @@ class YoloGrasp:
         if not self.wait_motion_done():
             print("   !! 运动超时，放弃")
             return False, "movej 运动超时"
+        # 二指地面抓取：控制器 movel 在这个低位姿会出现笛卡尔 IK 翻转，
+        # 下降/上抬/退回全部改走 IK+movej 关节空间小步（旧版全程 movej 正常）。
+        joint_space = (gripper.name == 'two_finger')
 
         self.spin(5)
         actual_tcp = self.robot.get_tcp_pose()
@@ -906,19 +976,28 @@ class YoloGrasp:
             tcp_err = np.linalg.norm(np.array(actual_tcp[0]) - pre_flange)
             print(f"   [诊断] movej 后偏差: {tcp_err*1000:.1f}mm")
 
-        # 4. movel 下降：先快速接近到抓取点上方，再慢速力控下探（触力即停）
+        # 4. 下降：先快速接近到抓取点上方，再慢速力控下探（触力即停）。
+        #    two_finger 走 IK+movej 关节空间；其余夹爪保持原 movel。
         reach_flange = grasp_tip - L * tool_dir
         approach_tip = grasp_tip + FORCE_APPROACH_H * V_UP_IN_BASE
         approach_flange = approach_tip - L * tool_dir
         print(f"   抓取TCP: [{grasp_tip[0]:.4f}, {grasp_tip[1]:.4f}, "
               f"{grasp_tip[2]:.4f}]")
-        print(f"5. movel 快速接近（抓取点上方 {FORCE_APPROACH_H*100:.0f}cm）...")
-        if not self.send_movel_keep_orientation(approach_flange):
+        move_kind = "movej" if joint_space else "movel"
+        print(f"5. {move_kind} 快速接近（抓取点上方 "
+              f"{FORCE_APPROACH_H*100:.0f}cm）...")
+        if joint_space:
+            ok = self.send_movej_to_pose(approach_flange, grasp_rot,
+                                         a=0.5, v=0.12,
+                                         label="快速接近")
+        else:
+            ok = self.send_movel_keep_orientation(approach_flange)
+        if not ok:
             print("   !! 无法读取当前位姿，放弃")
             return False, "无法读取当前位姿"
         if not self.wait_motion_done():
-            print("   !! movel 接近超时，放弃")
-            return False, "movel 接近超时"
+            print(f"   !! {move_kind} 接近超时，放弃")
+            return False, f"{move_kind} 接近超时"
 
         print("6. 慢速力控下探（触力即停）...")
         # 接触力方向（世界上）转到法兰系，用于软接触投影判据
@@ -926,13 +1005,18 @@ class YoloGrasp:
         contact_dir_flange /= np.linalg.norm(contact_dir_flange)
         contact = self.force_guided_descend(
             -V_UP_IN_BASE, FORCE_APPROACH_H + FORCE_DIVE_OVERSHOOT,
-            contact_dir_flange=contact_dir_flange)
+            contact_dir_flange=contact_dir_flange,
+            joint_space=joint_space)
         if contact is None:
             return False, "力传感器异常或无法读取位姿"
         if not contact:
             # 力反馈是抓取的必要条件：探到底都没力说明目标不在，不闭合
             print("   !! 下探到底未触到力，退回预抓取点")
-            self.send_movel_keep_orientation(pre_flange)
+            if joint_space:
+                self.move_keep_orientation(pre_flange, a=0.5, v=0.12,
+                                           joint_space=True, rot=grasp_rot)
+            else:
+                self.send_movel_keep_orientation(pre_flange)
             self.wait_motion_done()
             return False, "未触到物体（抓空）"
 
@@ -942,7 +1026,12 @@ class YoloGrasp:
         if tcp is None:
             return False, "无法读取当前位姿"
         lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
-        if not self.send_movel_keep_orientation(lift_flange):
+        if joint_space:
+            ok = self.move_keep_orientation(lift_flange, a=0.3, v=0.05,
+                                            joint_space=True, rot=grasp_rot)
+        else:
+            ok = self.send_movel_keep_orientation(lift_flange)
+        if not ok:
             return False, "无法读取当前位姿"
         if not self.wait_motion_done():
             print("   !! 上抬超时，放弃")
@@ -950,11 +1039,16 @@ class YoloGrasp:
 
         # 5. 闭合（一次性攥紧，带力控卸力兜底）
         print(f"7. 闭合 [{gripper.name}]...")
-        self.close_with_force_relief(V_UP_IN_BASE)
+        self.close_with_force_relief(V_UP_IN_BASE, joint_space=joint_space)
 
-        # 6. movel 退回
-        print("8. movel 退回...")
-        if not self.send_movel_keep_orientation(pre_flange):
+        # 6. 退回
+        print(f"8. {'movej' if joint_space else 'movel'} 退回...")
+        if joint_space:
+            ok = self.move_keep_orientation(pre_flange, a=0.5, v=0.12,
+                                            joint_space=True, rot=grasp_rot)
+        else:
+            ok = self.send_movel_keep_orientation(pre_flange)
+        if not ok:
             print("   !! 无法读取当前位姿")
             return False, "退回失败（无法读取位姿，物体可能已夹住）"
         if not self.wait_motion_done():

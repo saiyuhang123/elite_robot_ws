@@ -673,6 +673,8 @@ class RobotCartesianControl(Node):
         quat = target_orientation
         from scipy.spatial.transform import Rotation as Rot
         r = Rot.from_quat(quat)
+        # Elite movel 姿态格式为旋转向量（与 RTSI getActualTCPPose 一致；
+        # 官方 trajectory_example 就是把 RTSI 位姿直接回填 movel）
         rotvec = r.as_rotvec()
 
         x, y, z = target_position
