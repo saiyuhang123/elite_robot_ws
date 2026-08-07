@@ -102,15 +102,18 @@ class YoloGraspPerceptionNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ---------------- 3. 话题订阅 ----------------
-        # 不用时间同步器（本机相机各话题时间戳有固定偏差，同步器凑不齐）。
-        # 各自缓存最新一帧，彩色图到达时用最新的深度+内参处理（静态场景够用）。
+        # 不用 message_filters 时间同步器。二指模式下自行做单向严格配对：
+        # 只允许 depth_stamp >= color_stamp；彩色先到时缓存，等深度回调再处理。
+        # 灵巧手保留原来的“彩色到达时取最新深度”行为，避免改变既有流程。
         self._received = {'color': False, 'depth': False, 'info': False, 'tf': False}
         self.latest_color = None
         self.latest_depth = None
         self.latest_info = None
+        self._pending_color = None          # 二指：等待同时间或更新深度的彩色帧
         # 深度新鲜度/帧间一致性状态
         self._depth_stamp_at_enable = None  # 开启识别时刻缓存的深度帧时间戳
         self._depth_rejects_old = 0          # 因"识别开启前旧深度"弃帧计数
+        self._depth_rejects_before_color = 0 # 二指：深度时间戳早于彩色
         self._last_reject_log = 0.0
         # 灵巧手模式：帧间一致性窗口状态
         self._pose_window = deque(maxlen=5)
@@ -151,31 +154,68 @@ class YoloGraspPerceptionNode(Node):
     def _color_cb(self, msg):
         self._mark('color')
         self.latest_color = msg
-        # 彩色图到达时驱动一次感知（仅在按需识别开启时；深度需已就绪且新鲜）
-        if (self.enabled and self.latest_depth is not None
-                and self.latest_info is not None
+        if not self.enabled:
+            return
+
+        if self.mode == 'two_finger':
+            # 0.8Hz 相机可能出现彩色回调先于同帧深度回调。不能拿上一帧
+            # 深度配当前彩色；先缓存彩色，若深度未就绪则由 _depth_cb 重试。
+            self._pending_color = msg
+            self._try_process_pending_color()
+            return
+
+        # 灵巧手保留原逻辑：彩色图到达时使用最新且为识别开启后到达的深度。
+        if (self.latest_depth is not None and self.latest_info is not None
                 and self._depth_is_fresh(self.latest_depth, msg)):
-            try:
-                self.perception_callback(msg, self.latest_depth, self.latest_info)
-            except Exception as e:
-                import traceback
-                self.get_logger().error(f'[诊断] 感知回调异常: {e}\n{traceback.format_exc()}')
+            self._run_perception(msg, self.latest_depth, self.latest_info)
 
     def _depth_cb(self, msg):
         self._mark('depth')
         self.latest_depth = msg
+        # 二指模式：彩色先到时，等到同时间戳或更新的深度帧再触发推理。
+        if self.enabled and self.mode == 'two_finger':
+            self._try_process_pending_color()
 
     def _info_cb(self, msg):
         self._mark('info')
         self.latest_info = msg
 
+    def _run_perception(self, color_msg, depth_msg, info_msg):
+        """统一执行感知并记录异常，避免彩色/深度回调重复异常处理代码。"""
+        try:
+            self.perception_callback(color_msg, depth_msg, info_msg)
+        except Exception as e:
+            import traceback
+            self.get_logger().error(
+                f'[诊断] 感知回调异常: {e}\n{traceback.format_exc()}')
+
+    def _try_process_pending_color(self):
+        """二指模式严格配对：深度时间戳不得早于待处理彩色帧。"""
+        color_msg = self._pending_color
+        if (not self.enabled or color_msg is None
+                or self.latest_depth is None or self.latest_info is None):
+            return False
+        if not self._depth_is_fresh(self.latest_depth, color_msg):
+            return False
+
+        # 先清空，防止本次推理异常时重复处理同一彩色帧。
+        self._pending_color = None
+        self._run_perception(color_msg, self.latest_depth, self.latest_info)
+        return True
+
     def _depth_is_fresh(self, depth_msg, color_msg):
         """深度帧新鲜度：识别开启前缓存（可能是停稳前/运动途中）的深度帧
-        一律不用；拍照时机械臂已停稳，不再校验 color/depth 时间戳差。"""
+        一律不用；二指还要求深度时间戳不早于当前彩色时间戳。"""
         depth_t = rclpy.time.Time.from_msg(depth_msg.header.stamp)
         if self._depth_stamp_at_enable is not None:
             if depth_t <= self._depth_stamp_at_enable:
                 self._depth_rejects_old += 1
+                self._log_depth_rejects()
+                return False
+        if self.mode == 'two_finger':
+            color_t = rclpy.time.Time.from_msg(color_msg.header.stamp)
+            if depth_t < color_t:
+                self._depth_rejects_before_color += 1
                 self._log_depth_rejects()
                 return False
         return True
@@ -187,7 +227,7 @@ class YoloGraspPerceptionNode(Node):
         self._last_reject_log = time.time()
         self.get_logger().warn(
             f'[诊断] 深度帧被弃用: 旧帧×{self._depth_rejects_old}, '
-            f'时间戳差×0（已去掉时间戳差校验）')
+            f'早于彩色×{self._depth_rejects_before_color}')
 
     def _consistency_gate(self, P_base, cls_name):
         """灵巧手模式：帧间一致性。同一类别连续 CONSISTENT_FRAMES 帧位置
@@ -219,6 +259,8 @@ class YoloGraspPerceptionNode(Node):
     # ---- 按需识别开关服务 ----
     def _set_enabled_cb(self, request, response):
         self.enabled = bool(request.data)
+        # 每次识别会话都从新的彩色帧开始，禁止沿用上次待配对的图像。
+        self._pending_color = None
         if self.enabled:
             # 记录开启时刻已缓存的深度帧；更早的一律视为停稳前旧帧
             self._depth_stamp_at_enable = (
