@@ -932,7 +932,7 @@ class YoloGrasp:
             self.home2()
 
         # 抓取成功且已归位后，按调用方式决定是否松开机械手
-        if ok and (release_after or self.gripper.name == 'linkerhand'):
+        if ok and (release_after ):  #or self.gripper.name == 'linkerhand'
             print("   [归位] 抓取成功，松开机械手...")
             self.gripper.open()
         elif ok:
