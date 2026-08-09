@@ -15,7 +15,6 @@ YOLO 视觉抓取一体化 Launch 文件（LinkerHand O6 机械手版）。
 用法：
   source /opt/ros/humble/setup.bash
   source ~/Documents/elite_robot_ws/install/setup.bash
-  source ~/Documents/linker_hand_ros2_sdk/install/setup.bash
   ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp.launch.py
 
   YOLO 感知启动后会自动在一个新终端窗口中启动抓取主程序（交互式）：
@@ -154,13 +153,14 @@ def generate_launch_description():
 
     # ============================================================
     # 3. LinkerHand O6 SDK（机械手控制）
-    #    —— 位于独立工作区，用 bash -c 先 source 再 ros2 launch
+    #    —— 源码位于当前工作区 src/linkerhand-ros2-sdk，安装到当前工作区 install/
     # ============================================================
-    linker_hand_ws = os.path.expanduser("~/Documents/linker_hand_ros2_sdk")
+    workspace_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    workspace_install = os.path.join(workspace_root, "install")
     linker_hand = ExecuteProcess(
         cmd=[
             "bash", "-c",
-            f"source {linker_hand_ws}/install/setup.bash && "
+            f"source {workspace_install}/setup.bash && "
             "ros2 launch linker_hand_ros2_sdk linker_hand.launch.py"
         ],
         output="screen",

@@ -55,7 +55,7 @@ python3 yolo_grasp.py --gripper soft_touch     # 柔触三指气动夹爪
 
 | 夹爪 | 前置节点 |
 |---|---|
-| linkerhand | `ros2 launch linker_hand_ros2_sdk linker_hand.launch.py` |
+| linkerhand | `source ~/Documents/elite_robot_ws/install/setup.bash && ros2 launch linker_hand_ros2_sdk linker_hand.launch.py` |
 | two_finger | `ros2 run inspire_gripper Gripper_control_node` |
 | soft_touch | `ros2 run gripper_control gripper_server` |
 
@@ -99,7 +99,7 @@ ros2 launch percipio_camera percipio_camera.launch.py \
 **终端3 — LinkerHand SDK**
 
 ```bash
-cd /home/nvidia/Documents/linker_hand_ros2_sdk
+cd ~/Documents/elite_robot_ws
 source ./install/setup.bash
 ros2 launch linker_hand_ros2_sdk linker_hand.launch.py
 ```
