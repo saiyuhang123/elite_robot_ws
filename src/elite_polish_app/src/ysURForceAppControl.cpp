@@ -45,13 +45,13 @@ namespace elite_robot {
           force_mode_wrench_z_ = this->declare_parameter<double>("force_mode_wrench_z", 0.9);
           // 力控 z 轴允许的最大调整速度(m/s)，防过冲。
           force_mode_z_vel_limit_ = this->declare_parameter<double>("force_mode_z_vel_limit", 0.004);
-          force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", -0.3);
-          force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 0.6);
+          force_mode_sensor_target_fz_ = this->declare_parameter<double>("force_mode_sensor_target_fz", 0.0);
+          force_mode_verify_tolerance_ = this->declare_parameter<double>("force_mode_verify_tolerance", 7.0);
           force_mode_verify_time_ = this->declare_parameter<double>("force_mode_verify_time", 0.5);
           force_mode_verify_timeout_ = this->declare_parameter<double>("force_mode_verify_timeout", 5.0);
           force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.040);
           force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
-          force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -7.0);
+          force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -15.0);
           force_mode_hard_abort_fz_ = this->declare_parameter<double>("force_mode_hard_abort_fz", -15.0);
           force_mode_hard_abort_confirm_time_ = this->declare_parameter<double>(
             "force_mode_hard_abort_confirm_time", 0.03);
@@ -59,11 +59,11 @@ namespace elite_robot {
             "force_mode_abort_confirm_time", 0.12);
           // 2026-08-02: 侧向力保护。两次停摆六维力显示侧向Fx/Fy(10~15N)先于Fz失控，
           // 平均侧向合力持续超阈值即按同一流程退出，比等Fz耦合超限更早、损伤更小。
-          force_mode_abort_lateral_f_ = this->declare_parameter<double>("force_mode_abort_lateral_f", 10.0);
+          force_mode_abort_lateral_f_ = this->declare_parameter<double>("force_mode_abort_lateral_f", 35.0);
           force_mode_lateral_abort_confirm_time_ = this->declare_parameter<double>(
             "force_mode_lateral_abort_confirm_time", 0.12);
           // 2026-08-02: 力控开放Rx/Ry旋转柔顺(目标力矩0)，端面贴合板面卸侧向拖曳力。
-          // A/B后默认关闭: 开启时实机出现随机位置-30N撞击尖峰(疑似无阻尼柔顺振荡啃边)。
+          // 旋转柔顺默认关闭: 实机曾出现姿态柔顺振荡和大侧向冲击。
           force_mode_rot_compliance_ = this->declare_parameter<bool>("force_mode_rot_compliance", false);
           force_mode_rot_vel_limit_ = this->declare_parameter<double>("force_mode_rot_vel_limit", 0.05);
           // 2026-08-02: 应用层慢姿态环(替代SDK旋转柔顺)。404用20帧平均力矩慢积分

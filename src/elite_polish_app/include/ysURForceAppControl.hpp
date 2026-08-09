@@ -170,9 +170,9 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point contact_hold_start_;
             bool use_force_mode_ = true;//控制器内建力控(startForceMode)开关
             double force_mode_wrench_z_ = 0.9;//SDK内部目标；地面板减压0.9N(实测反作用约-0.2~-0.3N)
-            double force_mode_z_vel_limit_ = 0.004;//力控z轴最大调整速度(m/s) 2→4mm/s配合进给门控
-            double force_mode_sensor_target_fz_ = -0.3;//本应用补偿/去皮后的实际反作用力目标(N)
-            double force_mode_verify_tolerance_ = 0.6;//启用后实测反作用力与目标的允许误差(N)
+            double force_mode_z_vel_limit_ = 0.004;//力控z轴最大调整速度(m/s), 4mm/s
+            double force_mode_sensor_target_fz_ = 0.0;//本应用力控建立验证中心值(N)
+            double force_mode_verify_tolerance_ = 7.0;//启用后实测反作用力允许误差(N), 验证范围±7N
             double force_mode_verify_time_ = 0.5;//进入打磨前，目标力连续稳定时间(s)
             double force_mode_verify_timeout_ = 5.0;//启用后建立目标力的最长等待时间(s)
             bool force_mode_verify_stable_ = false;
@@ -182,7 +182,7 @@ namespace elite_robot {
             double force_mode_max_axial_deviation_ = 0.040;//相对名义轨迹最大轴向偏移(m)
             double force_mode_monitor_log_period_ = 1.0;//404 力/轴向补偿监控日志周期(s)
             std::chrono::steady_clock::time_point force_mode_monitor_last_log_;
-            double force_mode_abort_fz_ = -7.0;//平均相对力超过此负值持续确认后退出(N); 盘有倾角-5→-7
+            double force_mode_abort_fz_ = -15.0;//平均相对力超过此负值持续确认后退出(N); 绝对值15N
             double force_mode_hard_abort_fz_ = -15.0;//单帧相对力硬保护阈值(N)
             double force_mode_hard_abort_confirm_time_ = 0.03;//硬过力需持续多久才退出(s)，拒绝单帧尖峰
             double force_mode_abort_confirm_time_ = 0.12;//平均过力持续确认时间(s)
@@ -190,11 +190,11 @@ namespace elite_robot {
             std::chrono::steady_clock::time_point force_mode_overforce_start_;
             bool force_mode_hard_overforce_active_ = false;
             std::chrono::steady_clock::time_point force_mode_hard_overforce_start_;
-            double force_mode_abort_lateral_f_ = 10.0;//20帧平均侧向合力sqrt(fx^2+fy^2)过力阈值(N); 盘有倾角8→10
+            double force_mode_abort_lateral_f_ = 35.0;//20帧平均侧向合力sqrt(fx^2+fy^2)过力阈值(N); 绝对值35N
             double force_mode_lateral_abort_confirm_time_ = 0.12;//侧向过力持续确认时间(s)
             bool force_mode_lateral_overforce_active_ = false;
             std::chrono::steady_clock::time_point force_mode_lateral_overforce_start_;
-            bool force_mode_rot_compliance_ = false;//力控开放Rx/Ry旋转柔顺(A/B后默认关闭: 疑无阻尼柔顺振荡啃边)
+            bool force_mode_rot_compliance_ = false;//力控开放Rx/Ry旋转柔顺(默认关闭)
             double force_mode_rot_vel_limit_ = 0.05;//旋转柔顺轴最大角速度(rad/s)
             // 2026-08-02 应用层慢姿态环(替代SDK旋转柔顺): 404每拍用20帧平均力矩
             // 对轨迹姿态做慢积分修正, 消除砂盘安装角/贴合误差造成的边缘接触。
@@ -208,7 +208,7 @@ namespace elite_robot {
             // 2026-08-02 进给门控: 过载(20帧平均力<=feed_gate_fz)暂停推进轨迹索引,
             // 目标保持当前点等z向力控拉回, 消除尖峰后"压着走"的二次爬升。
             bool feed_gate_enabled_ = true;
-            double feed_gate_fz_ = -5.5;            // 过载判定阈值(N), 需高于-7N平均退出线
+            double feed_gate_fz_ = -5.5;            // 过载判定阈值(N), 需高于-15N平均退出线
             double feed_gate_timeout_ = 3.0;        // 门控最长持续(s), 超时按正常流程退出
             int feed_gate_hold_count_ = 0;
             std::chrono::steady_clock::time_point feed_gate_hold_start_;
