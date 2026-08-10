@@ -356,7 +356,7 @@ private:
 class GripperServer : public rclcpp::Node {
 public:
   GripperServer() : Node("gripper_server") {
-    this->declare_parameter<std::string>("device_ip", "192.168.3.200");
+    this->declare_parameter<std::string>("device_ip", "192.168.1.194");
     this->declare_parameter<int>("device_port", 502);
     this->declare_parameter<double>("poll_rate_hz", 10.0);
 

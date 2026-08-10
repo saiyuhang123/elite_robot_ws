@@ -184,7 +184,7 @@ ysCamera3DSolver:
     # 其余两个点只供 plane_fit_enabled=false 的旧三点法回退使用。
     # 2026-08-02: 地面板标定(grinder_tip.py 实测板心, 与点云质心偏差约2mm)。
     plane_box_z_range: [0.50, 0.82]
-    plane_point_o: [0.8073, -0.1318]  # 原点测点 (x, y) = 打磨头碰板心
+    plane_point_o: [0.7598, -0.191]  # 原点测点 (x, y) = 打磨头碰板心
     plane_point_x: [0.684,  0.111]
     plane_point_y: [0.638, -0.015]    # Y 参考测点
 
@@ -197,7 +197,7 @@ ysCamera3DSolver:
     # ---- 圆弧坐标系常数 ----
     curve_radius: 0.9306       # 与状态机 polishcurve_radius 一致
     curve_center_dz: 1.89539   # 与状态机 polishcurve_center_dz 一致
-    curve_tool_offset: 0.205    # 打磨头(含沙盘)沿 tool z 伸出法兰长度(m)，2026-07-27 平贴实测 0.205；法兰目标=表面-此值×法向
+    curve_tool_offset: 0.183     # 打磨头(含沙盘)沿 tool z 伸出法兰长度(m)，2026-07-27 平贴实测 0.205；法兰目标=表面-此值×法向
     # 2026-08-01: 0.1 → 0.05。旧值按旧工件弧面 y 范围(-0.04~0.13)调，
     # 新工件弧面 y 范围 [0.018, 0.128]，旧值导致打磨带整体偏低、第一道从弧面中间开始。
     # 0.05 使三道 y≈0.118/0.078/0.038，第一道落在弧面上部（接近左上角）。
