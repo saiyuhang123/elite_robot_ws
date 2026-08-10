@@ -147,16 +147,20 @@ HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，
 OBSERVE_POSES = [
     [-0.038397, 0.308923, -1.619919, -1.680604, 1.712094, 1.504874],
 ]
-# 二指夹爪地面拍照位姿（车前地面瓶子，2026-08-05 实测标定）
-# 只对 two_finger 生效；灵巧手仍使用上面的 OBSERVE_POSES
+# 二指/柔触夹爪地面拍照位姿（车前地面瓶子，2026-08-05 实测标定）
+# 对 two_finger 和 soft_touch 生效；灵巧手仍使用上面的 OBSERVE_POSES
 TWO_FINGER_GROUND_OBSERVE_POSES = [
     [-0.041888, -1.021018, -1.664225, -1.188569, 1.586504, 0.022689],
 ]
 OBSERVE_WAIT = 5.0         # 观察位姿等待检测的时间（秒）
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+# 柔触三指专用 Home 位（收拢位；其他夹爪仍用上面的 HOME_JOINTS 不变）
+HOME_JOINTS_SOFT_TOUCH = [-0.038, 0.344, -2.702, -1.083, 1.642, 1.470]
 # 第二 Home 位姿（角度: -2.2, 19.7, -154.8, -86.3, 94.1, 84.2）
 HOME2_JOINTS = [-0.0384, 0.3438, -2.7018, -1.5062, 1.6424, 1.4696]
+# 柔触三指专用 Home2 位（抓取/识别失败后的归位；其他夹爪仍用上面的 HOME2_JOINTS 不变）
+HOME2_JOINTS_SOFT_TOUCH = [-0.038, 0.344, -2.702, -1.083, 1.642, 1.470]
 # 抓取预备位姿（角度: -2.2, -38.3, -124.8, -16.3, 102.1, 94.2）
 READY_JOINTS = [-0.0384, 0.4503, -2.7262, -0.1693, 1.6424, 1.4696]
 SHOULDER_Z = 0.1625
@@ -851,8 +855,8 @@ class YoloGrasp:
     def _search_observe_poses(self, backend='yolo'):
         """依次转到观察位姿找目标，检测到即停（留在该位姿）。"""
         poses = list(OBSERVE_POSES)
-        if self.gripper.name == 'two_finger':
-            # 二指夹爪：先试地面拍照位姿，再退回旧观察位姿
+        if self.gripper.name in ('two_finger', 'soft_touch'):
+            # 二指/柔触夹爪：先试地面拍照位姿，再退回旧观察位姿
             poses = list(TWO_FINGER_GROUND_OBSERVE_POSES) + poses
         for i, pose in enumerate(poses):
             print(f"   [观察] 预备位姿无目标，转观察位姿 "
@@ -1296,14 +1300,20 @@ class YoloGrasp:
         return True, "抓取完成"
 
     def home(self):
+        # 柔触三指走专用收拢 Home 位，其他夹爪保持原零位不变
+        joints = (HOME_JOINTS_SOFT_TOUCH
+                  if self.gripper.name == 'soft_touch' else HOME_JOINTS)
         print("回零位...")
-        self.send_movej(HOME_JOINTS)
+        self.send_movej(joints)
         if self.wait_motion_done():
             print("已回零")
 
     def home2(self):
+        # 柔触三指走专用 Home2 位，其他夹爪保持原 HOME2 不变
+        joints = (HOME2_JOINTS_SOFT_TOUCH
+                  if self.gripper.name == 'soft_touch' else HOME2_JOINTS)
         print("回 Home2 位姿...")
-        self.send_movej(HOME2_JOINTS)
+        self.send_movej(joints)
         if self.wait_motion_done():
             print("已到 Home2 位姿")
 
@@ -1333,8 +1343,11 @@ class YoloGrasp:
         time.sleep(self.gripper.close_delay)
 
         # 3. 退回 Home2 收拢位姿（底盘导航期间的安全姿态）
+        #    柔触三指走专用 Home2 位，其他夹爪保持原 HOME2 不变
         print("3. 退回 Home2 位姿...")
-        self.send_movej(HOME2_JOINTS)
+        joints = (HOME2_JOINTS_SOFT_TOUCH
+                  if self.gripper.name == 'soft_touch' else HOME2_JOINTS)
+        self.send_movej(joints)
         if not self.wait_motion_done():
             return False, "退回 Home2 超时（物体已放下）"
 

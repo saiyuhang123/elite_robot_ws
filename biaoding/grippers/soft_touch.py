@@ -41,7 +41,7 @@ class SoftTouchGripper(GripperBase):
     def __init__(self, robot_node,
                  pressure_limit: int = 150,
                  vacuum_value: int = -50,
-                 tip_length: float = 0.15):
+                 tip_length: float = 0.19):
         self._node = robot_node
         self._pressure_limit = pressure_limit
         self._vacuum_value = vacuum_value
@@ -61,8 +61,8 @@ class SoftTouchGripper(GripperBase):
 
     @property
     def grasp_offset_world(self) -> np.ndarray:
-        # 指尖平面略高于物体中心（三指环抱）
-        return np.array([0.0, 0.0, 0.02])
+        # 与二指一致：指尖平面（TCP）对准目标点，不上抬
+        return np.array([0.0, 0.0, 0.0])
 
     @property
     def tool_length(self) -> float:

@@ -128,6 +128,12 @@ python3 yolo_grasp.py
 
 ---
 
+柔触
+source /opt/ros/humble/setup.bash
+source ~/Documents/elite_robot_ws/install/setup.bash
+
+ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp_soft_touch.launch.py
+
 ## 键盘操作（yolo_grasp.py 终端内）
 
 | 按键 | 作用 |

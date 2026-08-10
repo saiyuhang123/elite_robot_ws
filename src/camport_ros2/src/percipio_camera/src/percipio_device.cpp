@@ -460,6 +460,9 @@ PercipioDevice::~PercipioDevice()
     }
 
     alive = false;
+    // 唤醒可能正阻塞在条件变量上的重连线程，否则下面的 join 永远卡住，
+    // 进程被强杀导致 TYCloseDevice 执行不到、相机控制通道不释放
+    offline_detect_cond.notify_all();
     if (device_reconnect_thread && device_reconnect_thread->joinable()) {//
         device_reconnect_thread->join();
         device_reconnect_thread = nullptr;
@@ -1047,9 +1050,10 @@ void PercipioDevice::device_offline_reconnect() {
         //TODO
         std::unique_lock<std::mutex> lck(offline_detect_mutex);
         offline_detect_cond.wait(lck);
+        if(!isAlive()) break;   // 析构时被唤醒：直接退出，不做重连
         reconnect = true;
         Release();
-        while(true) {
+        while(isAlive()) {      // 关闭过程中不再尝试重连（原 while(true)）
             TY_STATUS status = Reconnect();
             if(status == TY_STATUS_OK) {
                 RCLCPP_WARN_STREAM(rclcpp::get_logger(LOG_HEAD_PERCIPIO_DEVICE), "Device Offline, reconnect ok, now restart stream!");
