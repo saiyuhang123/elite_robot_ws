@@ -28,7 +28,7 @@ class TwoFingerGripper(GripperBase):
     """Inspire 4B4C 二指电动夹爪。
 
     依赖: inspire_gripper 包的 Gripper_control_node 已运行。
-    默认串口 /dev/ttyUSB0, 115200 baud, gripper_id=1。
+    默认串口 /dev/ttyGripper（原 ttyCH341USB1）, 115200 baud, gripper_id=1。
 
     参数:
         gripper_id:  夹爪 ID (1-254)

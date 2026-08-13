@@ -153,10 +153,11 @@ ysCamera3DSolver:
     handeye_translation: [-0.127097, 0.046615, 0.083001]    # m (t_cam2tool)
 
     # ---- 大盒 (cs66_base_link 系, 工件整体包围盒) ----
-    # 2026-08-02 地面板标定(biaoding/analyze_ground_board.py 基于留底云): 盒内板面占99.4%,
-    # 地面(沿法向板下2~3cm)基本被z下限切掉。板面在base系为斜面, z下限按最低板面角-8mm。
-    target_box_min: [0.724, -0.316, 0.321]
-    target_box_max: [0.848,  0.052, 0.567]
+    # 2026-08-09 地面板标定(biaoding/analyze_ground_board.py 基于留底云): 盒内板面占99.2%,
+    # 深层杂物0.3%。板面在base系为斜面, z下限按最低板面角-8mm。
+    # 板子相对 08-02 位置平移约 +11cm(x)/+2cm(y), 表面更低。
+    target_box_min: [0.813, -0.300, 0.202]
+    target_box_max: [0.938,  0.071, 0.382]
 
     # ---- 工件平面拟合 (base_link 系) ----
     # 默认用 target_box 内全部候选点做带方向约束的 RANSAC，不再用三个10×10mm小框
@@ -182,9 +183,9 @@ ysCamera3DSolver:
 
     # plane_point_o 的 x/y 继续作为轨迹局部原点锚点，实际原点会投影到拟合平面。
     # 其余两个点只供 plane_fit_enabled=false 的旧三点法回退使用。
-    # 2026-08-02: 地面板标定(grinder_tip.py 实测板心, 与点云质心偏差约2mm)。
+    # 2026-08-09: 地面板标定(analyze_ground_board.py 实测板心; 碰点 du=-0.011 dv=-0.005)。
     plane_box_z_range: [0.50, 0.82]
-    plane_point_o: [0.7598, -0.191]  # 原点测点 (x, y) = 打磨头碰板心
+    plane_point_o: [0.8760, -0.1149]  # 原点测点 (x, y) = 云实测板心(碰点+du/dv修正)
     plane_point_x: [0.684,  0.111]
     plane_point_y: [0.638, -0.015]    # Y 参考测点
 

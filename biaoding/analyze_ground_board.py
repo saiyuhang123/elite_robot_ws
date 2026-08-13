@@ -3,7 +3,7 @@
 import numpy as np
 
 PCD = "/tmp/base_calib.pcd"
-TIP = np.array([0.7598, -0.1915, 0.3846])       # grinder_tip 实测板心
+TIP = np.array([0.8687, -0.1098, 0.2706])       # grinder_tip 实测板心
 N = np.array([0.7431, -0.0120, -0.6691])       # 世界向下(压入方向), base 系
 N = N / np.linalg.norm(N)
 

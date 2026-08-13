@@ -161,7 +161,7 @@ def generate_launch_description():
 
     # ============================================================
     # 3. Inspire 4B4C 二指夹爪控制节点
-    #    与机械臂同工作区（elite_robot_ws），串口默认 /dev/ttyUSB0
+    #    与机械臂同工作区（elite_robot_ws），串口为 /dev/ttyGripper（udev 按物理端口固定）
     # ============================================================
     inspire_gripper = ExecuteProcess(
         cmd=["ros2", "run", "inspire_gripper", "Gripper_control_node"],
