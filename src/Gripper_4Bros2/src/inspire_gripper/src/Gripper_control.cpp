@@ -1,6 +1,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
+#include <chrono>
 #include "rclcpp/rclcpp.hpp"
 #include "serial/serial.h"
 #include "service_interfaces/srv/set_id.h"
@@ -780,21 +782,41 @@ int main(int argc, char **argv)
     ros_ser.setBaudrate(115200);
     serial::Timeout to =serial::Timeout::simpleTimeout(100);
     ros_ser.setTimeout(to);
-    try
+
+    // 开机/插拔后 USB 串口可能尚未就绪（udev 别名未建好/设备未枚举完），
+    // 单次 open 失败会直接退出导致服务永不出现。这里改为最多重试 30 次，每次间隔 1s。
+    const int MAX_OPEN_RETRY = 30;
+    bool opened = false;
+    for (int i = 1; i <= MAX_OPEN_RETRY; i++)
     {
-        ros_ser.open();
+        try
+        {
+            if (!ros_ser.isOpen())
+            {
+                ros_ser.open();
+            }
+        }
+        catch (const std::exception &e)
+        {
+            // 端口未就绪，稍后重试
+        }
+        if (ros_ser.isOpen())
+        {
+            opened = true;
+            break;
+        }
+        std::cout << "[gripper] 串口未就绪，1s 后重试 (" << i << "/"
+                  << MAX_OPEN_RETRY << ")" << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    catch(serial::IOException &e)
-    {
-        std::cout<<"serial unable to open"<<std::endl;
-        return -1;
-    }
-    if(ros_ser.isOpen())
+    if (opened)
     {
         std::cout<<"serial open success"<<std::endl;
     }
     else
     {
+        std::cout<<"serial unable to open after "<<MAX_OPEN_RETRY
+                 <<" retries"<<std::endl;
         return -1;
     }
     auto node = std::make_shared<Gripper_control>();

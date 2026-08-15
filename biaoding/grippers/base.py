@@ -2,6 +2,8 @@
 """夹爪抽象基类。所有夹爪实现必须继承此类。"""
 
 from abc import ABC, abstractmethod
+import time
+
 import numpy as np
 
 
@@ -111,6 +113,19 @@ class GripperBase(ABC):
     def validate(self) -> bool:
         """启动自检：检查控制通道是否连通。返回 True 表示就绪。"""
         return True
+
+    def wait_ready(self, timeout: float = 30.0) -> bool:
+        """启动自检：等待控制通道就绪（最多 timeout 秒）。
+
+        启动时 USB 串口/控制节点可能尚未就绪、服务上线较晚，轮询
+        validate() 直到成功或超时。子类无需重写。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.validate():
+                return True
+            time.sleep(1.0)
+        return self.validate()
 
     def is_grasping(self) -> bool:
         """可选：判断是否夹住物体。默认返回 True（不阻塞流程）。"""

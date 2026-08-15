@@ -180,7 +180,7 @@ ros2 topic pub -1 /yolo/target_class std_msgs/msg/String "data: 'all'"
 
 ```bash
 # 触发一次完整抓取
-ros2 service call /yolo_grasp/grasp std_srvs/srv/Trigger
+
 
 # 抓取并保持夹持（不自动松手，等 /yolo_grasp/place 放下；全程调度用这个）
 ros2 service call /yolo_grasp/grasp_hold std_srvs/srv/Trigger

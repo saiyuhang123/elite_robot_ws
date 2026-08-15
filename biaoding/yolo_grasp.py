@@ -110,14 +110,15 @@ FORCE_THRESHOLD = 2.0       # 硬保护阈值（N，力变化模长），任何�
 FORCE_PROJ_THRESHOLD = 1.2   # 软接触阈值（N，下压方向投影），轻触也能检出
 FORCE_PROJ_HITS = 3          # 投影连续超阈值次数，滤毛刺
 FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
-FORCE_DIVE_OVERSHOOT = 0.03   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
+FORCE_DIVE_OVERSHOOT = 0.07   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
+                                  # 下探总行程 = FORCE_APPROACH_H + 本值 = 0.10m (10cm)
 FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
 FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
 FORCE_APPROACH_THRESHOLD = 20.0   # 快速接近段力保护阈值（N）：movej 加减速惯性
                                   # 实测可达 12~13N，10N 会误报；真碰撞通常几十牛
 FORCE_APPROACH_HITS = 3           # 连续几帧超阈值才算触发（滤掉瞬时惯性尖峰）
 FORCE_APPROACH_RETRIES = 2        # 快速接近触力后最多收回重拍重试次数
-LIFT_BEFORE_CLOSE = 0.0120    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
+LIFT_BEFORE_CLOSE = 0.0060    # 触力后先上抬再闭合（米），避免收拢挤压物体触发力报警
 # 闭合卸力：闭合过程中挤压力超阈值就自动上抬一点（防收拢时力控报警）
 FORCE_RELIEF_THRESHOLD = 2.0  # 闭合挤压力阈值（N，力变化模长）
 FORCE_RELIEF_STEP = 0.004     # 每次卸力上抬 4mm
@@ -770,15 +771,25 @@ class YoloGrasp:
 
     def _set_perception(self, enabled: bool) -> bool:
         """开关感知节点的按需识别。返回服务是否调用成功。"""
-        if self.perception_enable_cli.service_is_ready():
-            cli = self.perception_enable_cli
-        elif self.yolo_perception_enable_cli.service_is_ready():
-            cli = self.yolo_perception_enable_cli
-        elif self.perception_enable_cli.wait_for_service(timeout_sec=1.0):
-            cli = self.perception_enable_cli
-        elif self.yolo_perception_enable_cli.wait_for_service(timeout_sec=1.0):
-            cli = self.yolo_perception_enable_cli
-        else:
+        # 开启识别时多等一会：感知节点在系统负载高时（大模型加载 / CUDA
+        # 预热）上线可能很慢，原来只等 1s，查不到就直接放弃，
+        # 导致"到拍照位没待一会就退回"。关闭识别时服务必然在线，快速返回。
+        wait_sec = 60.0 if enabled else 1.0
+        cli = None
+        waited = False
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            if self.perception_enable_cli.service_is_ready():
+                cli = self.perception_enable_cli
+                break
+            if self.yolo_perception_enable_cli.service_is_ready():
+                cli = self.yolo_perception_enable_cli
+                break
+            if not waited:
+                waited = True
+                print(f"   [感知] 正在等待感知节点上线（最多 {int(wait_sec)}s）...")
+            time.sleep(0.2)
+        if cli is None:
             print("   !! 感知开关服务不可用（qwen_vision 切换器或 "
                   "yolo_grasp_perception.py 未启动？）")
             return False
@@ -1199,6 +1210,18 @@ class YoloGrasp:
         print(f"7. 闭合 [{gripper.name}]...")
         self.close_with_force_relief(V_UP_IN_BASE, joint_space=joint_space)
 
+        # 5'. 空夹检测：闭合停稳后开口度≈全闭 = 没夹到，退回放弃
+        #     （读不到开口度的夹爪 is_grasping 恒真，不影响原流程）
+        if not self.gripper.is_grasping():
+            print("   !! 空夹（开口度≈全闭，未夹到物体），退回预抓取点")
+            if joint_space:
+                self.move_keep_orientation(pre_flange, a=0.5, v=0.12,
+                                           joint_space=True, rot=grasp_rot)
+            else:
+                self.send_movel_keep_orientation(pre_flange)
+            self.wait_motion_done()
+            return False, "未夹到物体（空夹）"
+
         # 6. 退回
         print(f"8. {'movej' if joint_space else 'movel'} 退回...")
         if joint_space:
@@ -1378,7 +1401,7 @@ def main():
     rclpy.init()
     g = YoloGrasp(gripper_name=args.gripper)
 
-    if not g.robot.wait_for_state(timeout=10.0):
+    if not g.robot.wait_for_state(timeout=60.0):
         print("错误：收不到机械臂状态，请确认驱动已启动")
         g.robot.destroy_node()
         rclpy.shutdown()
@@ -1390,9 +1413,11 @@ def main():
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
-    # 初始化夹爪
-    g.gripper.setup()
-    g.gripper.validate()
+    # 初始化夹爪：先等服务上线（USB 串口可能启动较慢），再清故障
+    if not g.gripper.wait_ready(timeout=30.0):
+        print("错误：夹爪控制通道未就绪（超过 30s），请检查 Gripper_control_node / 串口")
+    else:
+        g.gripper.setup()
 
     # 同步检测类别给臂上 YOLO 感知（默认 apple；二指抓瓶用 bottle）
     g.set_target_class(args.target_class)
