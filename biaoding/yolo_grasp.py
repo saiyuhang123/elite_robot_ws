@@ -25,9 +25,10 @@
   python3 yolo_grasp.py --headless               # 无人值守：仅服务驱动
 
 调度集成：
-  调 /yolo_grasp/grasp（Trigger）触发抓取：先到预备位姿（相机视野
-  最佳）→ 开启按需识别（/yolo_perception/set_enabled）→ 只用停稳后
-  的新帧锁存目标 → 关闭识别 → 抓取；失败时收拢到 Home2。
+  调 /yolo_grasp/grasp（Trigger）触发抓取：先到当前夹爪的观察位姿
+  （二指/柔触直接到地面拍照位姿；灵巧手到预备位姿）→ 开启按需识别
+  （/yolo_perception/set_enabled）→ 只用停稳后的新帧锁存目标 →
+  关闭识别 → 抓取；失败时收拢到 Home2。
   调 /yolo_grasp/grasp_hold：抓取成功夹住后直接去示教放置位
   （跳过 Home2），等 /yolo_grasp/place 张开放下。
   response.success/message 为真实结果。
@@ -143,13 +144,14 @@ HANG_PALM_BELOW = 0.0      # 掌心在目标点下方偏移（米，侧抓时一
 HANG_DETACH_PULL = 0.05    # 摘取下拉（米）
 HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，当前未启用）
 
-# 观察位姿：预备位姿等待 OBSERVE_WAIT 秒仍检测不到目标时，
-# 转到该观察位姿寻找，检测到目标即停并在该位姿继续抓取
+# 灵巧手备用观察位姿：预备位姿等待 OBSERVE_WAIT 秒仍检测不到目标时，
+# 转到该观察位姿寻找，检测到目标即停并在该位姿继续抓取。
+# 二指/柔触不使用该位姿，只使用下面的 TWO_FINGER_GROUND_OBSERVE_POSES。
 OBSERVE_POSES = [
     [-0.038397, 0.308923, -1.619919, -1.680604, 1.712094, 1.504874],
 ]
-# 二指/柔触夹爪地面拍照位姿（车前地面瓶子，2026-08-05 实测标定）
-# 对 two_finger 和 soft_touch 生效；灵巧手仍使用上面的 OBSERVE_POSES
+# 二指/柔触夹爪唯一观察/拍照位姿（车前地面瓶子，2026-08-05 实测标定）。
+# two_finger 和 soft_touch 直接从该位姿开始识别并抓取，不再回 READY/OBSERVE 位姿。
 TWO_FINGER_GROUND_OBSERVE_POSES = [
     [-0.041888, -1.021018, -1.664225, -1.188569, 1.586504, 0.022689],
 ]
@@ -162,7 +164,8 @@ HOME_JOINTS_SOFT_TOUCH = [-0.038, 0.344, -2.702, -1.083, 1.642, 1.470]
 HOME2_JOINTS = [-0.0384, 0.3438, -2.7018, -1.5062, 1.6424, 1.4696]
 # 柔触三指专用 Home2 位（抓取/识别失败后的归位；其他夹爪仍用上面的 HOME2_JOINTS 不变）
 HOME2_JOINTS_SOFT_TOUCH = [-0.038, 0.344, -2.702, -1.083, 1.642, 1.470]
-# 抓取预备位姿这个是灵巧手抓取的时候的第一个观察位姿（角度: -2.2, -38.3, -124.8, -16.3, 102.1, 94.2）
+# 灵巧手抓取预备位姿（也是灵巧手第一个观察位姿）。
+# 二指/柔触不使用该位姿，而是直接使用 TWO_FINGER_GROUND_OBSERVE_POSES。
 READY_JOINTS = [-0.0384, 0.4503, -2.702, -0.525, 1.6424, 1.634]
 SHOULDER_Z = 0.1625
 ARM_REACH = 0.92
@@ -339,10 +342,12 @@ class YoloGrasp:
         return response
 
     def _srv_ready(self, request, response):
-        self.robot.get_logger().info('[服务] 收到预备位姿指令')
+        self.robot.get_logger().info('[服务] 收到观察位姿指令')
         self.go_ready()
         response.success = True
-        response.message = '已到抓取预备位姿'
+        response.message = ('已到地面拍照观察位姿'
+                            if self.gripper.name in ('two_finger', 'soft_touch')
+                            else '已到抓取预备位姿')
         return response
 
     def _srv_place(self, request, response):
@@ -863,12 +868,26 @@ class YoloGrasp:
             return 'qwen'
         return 'yolo'
 
-    def _search_observe_poses(self, backend='yolo'):
-        """依次转到观察位姿找目标，检测到即停（留在该位姿）。"""
-        poses = list(OBSERVE_POSES)
+    def _observe_pose(self):
+        """当前夹爪的初始观察位姿。
+
+        二指/柔触只使用地面拍照位姿 TWO_FINGER_GROUND_OBSERVE_POSES；
+        灵巧手仍使用 READY_JOINTS 作为预备/第一个观察位姿。
+        """
         if self.gripper.name in ('two_finger', 'soft_touch'):
-            # 二指/柔触夹爪：先试地面拍照位姿，再退回旧观察位姿
-            poses = list(TWO_FINGER_GROUND_OBSERVE_POSES) + poses
+            return list(TWO_FINGER_GROUND_OBSERVE_POSES[0])
+        return list(READY_JOINTS)
+
+    def _search_observe_poses(self, backend='yolo'):
+        """灵巧手: 预备位姿检测不到时依次转备用观察位姿。
+
+        二指/柔触只有 TWO_FINGER_GROUND_OBSERVE_POSES 一个观察位姿，
+        且 grasp() 已直接到达该位姿，所以这里不再移动。
+        """
+        if self.gripper.name in ('two_finger', 'soft_touch'):
+            print("   [观察] 二指/柔触仅使用地面拍照位姿，无其他备用观察位姿")
+            return
+        poses = list(OBSERVE_POSES)
         for i, pose in enumerate(poses):
             print(f"   [观察] 预备位姿无目标，转观察位姿 "
                   f"{i+1}/{len(poses)}...")
@@ -896,12 +915,16 @@ class YoloGrasp:
         backend = self._get_backend()
         print(f"   当前识别后端: {backend}")
 
-        # 0. 先到抓取预备位姿，此位姿下相机视野最好
-        print("0. movej 到抓取预备位姿...")
-        self.send_movej(READY_JOINTS)
+        # 0. 先到当前夹爪的观察位姿
+        observe_pose = self._observe_pose()
+        if self.gripper.name in ('two_finger', 'soft_touch'):
+            print("0. movej 到地面拍照观察位姿...")
+        else:
+            print("0. movej 到抓取预备位姿...")
+        self.send_movej(observe_pose)
         if not self.wait_motion_done():
-            print("   !! 到预备位姿超时，放弃")
-            return False, "到预备位姿超时"
+            print("   !! 到观察位姿超时，放弃")
+            return False, "到观察位姿超时"
         self.spin(10)  # 等机械臂完全停稳
 
         # 1. 清空旧目标，开启按需识别：只用开启后拍的新帧，
@@ -914,7 +937,8 @@ class YoloGrasp:
         if not self._set_perception(True):
             return False, "感知节点未响应（识别未开启，放弃）"
         try:
-            # 2. 默认（预备）位姿等检测；检测不到则遍历观察位姿，
+            # 2. 当前观察位姿等检测；灵巧手检测不到再遍历备用观察位姿。
+            #    二指/柔触只有地面拍照位姿，检测不到则直接失败。
             #    哪个位姿检测到就在哪个位姿继续抓取。
             #    大模型模式必须等模型返回结果后再移动/超时/回位，
             #    YOLO 保持原来的短等待。
@@ -1341,10 +1365,15 @@ class YoloGrasp:
             print("已到 Home2 位姿")
 
     def go_ready(self):
-        print("移动到抓取预备位姿...")
-        self.send_movej(READY_JOINTS)
+        joints = self._observe_pose()
+        if self.gripper.name in ('two_finger', 'soft_touch'):
+            print("移动到地面拍照观察位姿...")
+        else:
+            print("移动到抓取预备位姿...")
+        self.send_movej(joints)
         if self.wait_motion_done():
-            print("已到预备位姿")
+            print("已到观察位姿" if self.gripper.name in (
+                'two_finger', 'soft_touch') else "已到预备位姿")
 
     def place(self):
         """移动到示教放置位姿 → 张手放下 → 退回 Home2 收拢位姿。返回 (成功与否, 描述)。"""
