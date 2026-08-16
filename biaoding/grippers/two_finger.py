@@ -2,16 +2,16 @@
 """Inspire 4B4C 二指夹爪控制。
 
 控制通道：12 个 ROS 2 服务（串口→ROS 桥接节点 inspire_gripper）。
-写命令通过 subprocess 调用 ros2 service call，不依赖服务接口包编译；
-读反馈（开口度/状态码）走直接 rclpy 客户端（毫秒级，可轮询），用于
-动作到位确认与空夹检测。反馈通道不可用时自动降级为盲发（旧行为）。
+读写命令统一走 rclpy 持久化 client（首次使用时创建，之后复用），
+避免每次命令启动 ros2 CLI 子进程；读反馈（开口度/状态码）用于
+动作到位确认与空夹检测。反馈通道不可用时自动降级为盲发。
 
 重试策略：开/合命令无应答（回执丢失）或未确认到位时自动重发，
 最多 COMMAND_RETRIES 次。重发幂等（重复开/合无副作用），
 真到位与否以开口度反馈为准，回执丢失不视为失败。
 """
 
-import subprocess
+import threading
 import time
 import numpy as np
 
@@ -25,20 +25,6 @@ CONFIRM_POLL = 0.15         # 确认轮询间隔（秒）
 COMMAND_RETRIES = 10        # 开/合无应答或未到位时的最大尝试次数
 CMD_ACK_TIMEOUT = 3.0       # 单次发令回执等待（秒）: 回执仅用于尽早发现
                             # 死服务, 丢了靠重发补上, 到位判断看开口度
-
-
-def _call_service(service: str, srv_type: str, request: str,
-                  timeout: float = 10.0) -> bool:
-    """调用 ros2 service call，返回是否成功。
-    超时 10s: 高负载下仅子进程启动 + DDS 发现就要 2~5s，
-    超时过短会丢回执误报失败（命令实际已执行）。"""
-    cmd = ["ros2", "service", "call", service, srv_type, request]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
 
 
 class TwoFingerGripper(GripperBase):
@@ -67,12 +53,22 @@ class TwoFingerGripper(GripperBase):
         self._close_speed = close_speed
         self._close_force = close_force
         self._tip_length = tip_length
-        # 直接 rclpy 客户端（读反馈用，首次使用时惰性创建）
+        # 夹爪 service 请求串行锁（RLock：open 内部轮询开口度时同线程可重入）
+        self._cmd_lock = threading.RLock()
+        # 直接 rclpy 客户端（读写均用，首次使用时惰性创建）
         self._cli_ready = None
         self._getcopen_cli = None
         self._getstatus_cli = None
+        self._setclearerror_cli = None
+        self._setmovemax_cli = None
+        self._setmovemin_cli = None
+        self._setmoveminhold_cli = None
         self._Getcopen = None
         self._Getstatus = None
+        self._Setclearerror = None
+        self._Setmovemax = None
+        self._Setmovemin = None
+        self._Setmoveminhold = None
 
     @property
     def name(self) -> str:
@@ -95,42 +91,95 @@ class TwoFingerGripper(GripperBase):
     def tool_length(self) -> float:
         return self._tip_length
 
-    # ---------------- 读反馈（直接 rclpy 客户端） ----------------
+    # ---------------- 持久化 service client 管理 ----------------
 
     def _ensure_clients(self) -> bool:
-        """惰性创建 Getcopen/Getstatus 客户端。失败则降级为盲发。"""
-        if self._cli_ready is not None:
+        """惰性创建读写服务客户端，之后复用。失败时当前命令返回失败。"""
+        if self._cli_ready is True:
+            return True
+        with self._cmd_lock:
+            if self._cli_ready is True:
+                return True
+            try:
+                from service_interfaces.srv import (
+                    Getcopen, Getstatus,
+                    Setclearerror, Setmovemax, Setmovemin, Setmoveminhold,
+                )
+                self._Getcopen = Getcopen
+                self._Getstatus = Getstatus
+                self._Setclearerror = Setclearerror
+                self._Setmovemax = Setmovemax
+                self._Setmovemin = Setmovemin
+                self._Setmoveminhold = Setmoveminhold
+            except Exception as exc:
+                self._node.get_logger().warn(
+                    f"[{self.name}] service_interfaces 导入失败({exc})")
+                self._cli_ready = False
+                return False
+
+            try:
+                if self._getcopen_cli is None:
+                    self._getcopen_cli = self._node.create_client(
+                        Getcopen, '/Getcopen')
+                if self._getstatus_cli is None:
+                    self._getstatus_cli = self._node.create_client(
+                        Getstatus, '/Getstatus')
+                if self._setclearerror_cli is None:
+                    self._setclearerror_cli = self._node.create_client(
+                        Setclearerror, '/Setclearerror')
+                if self._setmovemax_cli is None:
+                    self._setmovemax_cli = self._node.create_client(
+                        Setmovemax, '/Setmovemax')
+                if self._setmovemin_cli is None:
+                    self._setmovemin_cli = self._node.create_client(
+                        Setmovemin, '/Setmovemin')
+                if self._setmoveminhold_cli is None:
+                    self._setmoveminhold_cli = self._node.create_client(
+                        Setmoveminhold, '/Setmoveminhold')
+                self._cli_ready = True
+            except Exception as exc:
+                self._node.get_logger().warn(
+                    f"[{self.name}] 夹爪服务客户端创建失败({exc})")
+                self._cli_ready = False
             return self._cli_ready
-        try:
-            from service_interfaces.srv import Getcopen, Getstatus
-            self._Getcopen = Getcopen
-            self._Getstatus = Getstatus
-            self._getcopen_cli = self._node.create_client(
-                Getcopen, '/Getcopen')
-            self._getstatus_cli = self._node.create_client(
-                Getstatus, '/Getstatus')
-            self._cli_ready = True
-        except Exception as exc:
-            self._node.get_logger().warn(
-                f"[{self.name}] 反馈通道不可用({exc})，动作确认降级为盲发")
-            self._cli_ready = False
-        return self._cli_ready
 
     def _rc_call(self, client, req, timeout=1.5):
-        """阻塞等响应（后台 MultiThreadedExecutor 在 spin），超时返回 None。"""
-        try:
-            fut = client.call_async(req)
-        except Exception:
+        """阻塞等响应（后台 MultiThreadedExecutor 在 spin），超时返回 None。
+
+        夹爪所有 service 请求通过 _cmd_lock 串行发送，避免开/合命令穿插。
+        """
+        if client is None:
             return None
-        t0 = time.time()
-        while not fut.done():
-            if time.time() - t0 > timeout:
+        with self._cmd_lock:
+            try:
+                fut = client.call_async(req)
+            except Exception:
                 return None
-            time.sleep(0.02)
+            t0 = time.time()
+            while not fut.done():
+                if time.time() - t0 > timeout:
+                    return None
+                time.sleep(0.02)
+            try:
+                return fut.result()
+            except Exception:
+                return None
+
+    def _call_client(self, client, request, ack_field,
+                     timeout=CMD_ACK_TIMEOUT) -> bool:
+        """调用持久化 client，并检查服务端 ack 字段。"""
+        if not self._ensure_clients() or client is None:
+            return False
+        res = self._rc_call(client, request, timeout)
+        if res is None:
+            return False
         try:
-            return fut.result()
-        except Exception:
-            return None
+            ack = bool(getattr(res, ack_field))
+        except AttributeError:
+            ack = True
+        return ack
+
+    # ---------------- 读反馈 ----------------
 
     def get_aperture(self, timeout=1.5):
         """读当前开口度（0~1000）。失败返回 None。"""
@@ -194,77 +243,113 @@ class TwoFingerGripper(GripperBase):
 
     # ---------------- 指令（写命令） ----------------
 
-    def _send_with_retry(self, service, srv_type, request,
+    def _send_with_retry(self, service_name, client, request, ack_field,
                          retries=COMMAND_RETRIES) -> bool:
-        """发命令，无应答自动重发，最多 retries 次。返回最终是否有应答。
-        重发幂等；单次回执只等 CMD_ACK_TIMEOUT（回执丢了靠重发补上）。"""
+        """发命令，无应答/未确认时自动重发，最多 retries 次。"""
         for attempt in range(1, retries + 1):
-            if _call_service(service, srv_type, request,
-                             timeout=CMD_ACK_TIMEOUT):
+            if self._call_client(client, request, ack_field):
                 return True
             if attempt < retries:
                 self._node.get_logger().warn(
-                    f"[{self.name}] {service} 无应答，重发 "
+                    f"[{self.name}] {service_name} 无应答/未确认，重发 "
                     f"{attempt}/{retries - 1}...")
         return False
 
     def setup(self):
-        """清除故障、设置张开限位。"""
-        _call_service("/Setclearerror",
-                      "service_interfaces/srv/Setclearerror",
-                      f"{{gripper_id: {self._id}, status: 'set_clearerror'}}")
-        self._node.get_logger().info(f"[{self.name}] 已清除故障")
+        """清除故障（如需开口限位，请另行调用 Setopenlimit 服务）。"""
+        with self._cmd_lock:
+            if not self._ensure_clients():
+                self._node.get_logger().error(
+                    f"[{self.name}] 夹爪服务客户端不可用，无法执行 setup")
+                return
+            req = self._Setclearerror.Request()
+            req.gripper_id = self._id
+            req.status = 'set_clearerror'
+            if self._call_client(self._setclearerror_cli, req,
+                                 'clearerror_accepted'):
+                self._node.get_logger().info(f"[{self.name}] 已清除故障")
+            else:
+                self._node.get_logger().warn(f"[{self.name}] 清除故障失败")
 
     def open(self):
         """张开并确认到位；未确认自动重发重试，最多 COMMAND_RETRIES 次。
         返回是否最终确认到位（反馈不可用时按盲发成功处理）。"""
-        req = (f"{{speed: {self._open_speed}, "
-               f"gripper_id: {self._id}, status: 'set_movemax'}}")
-        for attempt in range(1, COMMAND_RETRIES + 1):
-            _call_service("/Setmovemax", "service_interfaces/srv/Setmovemax",
-                          req, timeout=CMD_ACK_TIMEOUT)
-            if self.wait_opened():
-                if attempt > 1:
-                    self._node.get_logger().info(
-                        f"[{self.name}] 第 {attempt} 次尝试张开到位")
-                return True
+        with self._cmd_lock:
+            if not self._ensure_clients():
+                self._node.get_logger().error(
+                    f"[{self.name}] 夹爪服务客户端不可用，无法张开")
+                return False
+            for attempt in range(1, COMMAND_RETRIES + 1):
+                req = self._Setmovemax.Request()
+                req.speed = self._open_speed
+                req.gripper_id = self._id
+                req.status = 'set_movemax'
+                ack_ok = self._call_client(self._setmovemax_cli, req,
+                                           'movemax_accepted')
+                if not ack_ok:
+                    self._node.get_logger().warn(
+                        f"[{self.name}] Setmovemax 无应答/未确认"
+                        f"（第 {attempt}/{COMMAND_RETRIES} 次）")
+                if self.wait_opened():
+                    if attempt > 1:
+                        self._node.get_logger().info(
+                            f"[{self.name}] 第 {attempt} 次尝试张开到位")
+                    return True
+                self._node.get_logger().warn(
+                    f"[{self.name}] 张开未到位，重试 "
+                    f"{attempt}/{COMMAND_RETRIES}...")
             self._node.get_logger().warn(
-                f"[{self.name}] 张开未到位，重试 "
-                f"{attempt}/{COMMAND_RETRIES}...")
-        self._node.get_logger().warn(
-            f"[{self.name}] 张开未确认到位（已重试 {COMMAND_RETRIES} 次）")
-        return False
+                f"[{self.name}] 张开未确认到位（已重试 {COMMAND_RETRIES} 次）")
+            return False
 
     def close(self):
         # 闭到最小位置（力度 600，范围 50~1000；原来 200 偏小，瓶子容易滑）
-        ok = self._send_with_retry(
-            "/Setmovemin", "service_interfaces/srv/Setmovemin",
-            f"{{speed: {self._close_speed}, "
-            f"power: {self._close_force}, "
-            f"gripper_id: {self._id}, status: 'set_movemin'}}")
-        if not ok:
-            self._node.get_logger().warn(
-                f"[{self.name}] 闭合命令无应答（已重试 {COMMAND_RETRIES} 次）")
-        # 闭合后持续保持抓取力，防止搬运/放置过程中回退松手
-        time.sleep(0.1)
-        ok = self._send_with_retry(
-            "/Setmoveminhold", "service_interfaces/srv/Setmoveminhold",
-            f"{{speed: {self._close_speed}, "
-            f"power: {self._close_force}, "
-            f"gripper_id: {self._id}, status: 'set_moveminhold'}}")
-        if not ok:
-            self._node.get_logger().warn(
-                f"[{self.name}] 保持力命令无应答（已重试 {COMMAND_RETRIES} 次）")
+        with self._cmd_lock:
+            if not self._ensure_clients():
+                self._node.get_logger().error(
+                    f"[{self.name}] 夹爪服务客户端不可用，无法闭合")
+                return
+            req = self._Setmovemin.Request()
+            req.speed = self._close_speed
+            req.power = self._close_force
+            req.gripper_id = self._id
+            req.status = 'set_movemin'
+            ok = self._send_with_retry(
+                "/Setmovemin", self._setmovemin_cli, req, 'movemin_accepted')
+            if not ok:
+                self._node.get_logger().warn(
+                    f"[{self.name}] 闭合命令无应答/未确认"
+                    f"（已重试 {COMMAND_RETRIES} 次）")
+            # 闭合后持续保持抓取力，防止搬运/放置过程中回退松手
+            time.sleep(0.1)
+            req = self._Setmoveminhold.Request()
+            req.speed = self._close_speed
+            req.power = self._close_force
+            req.gripper_id = self._id
+            req.status = 'set_moveminhold'
+            ok = self._send_with_retry(
+                "/Setmoveminhold", self._setmoveminhold_cli, req,
+                'moveminhold_accepted')
+            if not ok:
+                self._node.get_logger().warn(
+                    f"[{self.name}] 保持力命令无应答/未确认"
+                    f"（已重试 {COMMAND_RETRIES} 次）")
 
     def validate(self) -> bool:
         """检查夹爪服务是否在线。"""
-        ok = _call_service("/Getstatus",
-                           "service_interfaces/srv/Getstatus",
-                           f"{{gripper_id: {self._id}, status: 'get_status'}}",
-                           timeout=10.0)
-        if ok:
-            self._node.get_logger().info(f"[{self.name}] 服务在线")
-        else:
+        with self._cmd_lock:
+            if not self._ensure_clients():
+                self._node.get_logger().warn(
+                    f"[{self.name}] service_interfaces 不可用，"
+                    "请确认已安装并 source install/setup.bash")
+                return False
+            req = self._Getstatus.Request()
+            req.gripper_id = self._id
+            req.status = 'get_status'
+            res = self._rc_call(self._getstatus_cli, req, timeout=10.0)
+            if res is not None:
+                self._node.get_logger().info(f"[{self.name}] 服务在线")
+                return True
             self._node.get_logger().warn(
                 f"[{self.name}] 服务不在线，请确认 Gripper_control_node 已启动")
-        return ok
+            return False
