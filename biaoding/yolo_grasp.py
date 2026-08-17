@@ -5,7 +5,9 @@
   1. 取 YOLO 感知节点发布的目标点（/target_object_pose，基座系）
   2. 抓取点 = 目标点 + 世界系偏移（由夹爪类型决定语义）
   3. 抓取姿态由夹爪定义（gripper.grasp_rotation）：直装夹爪法兰 Z
-     朝下竖直抓；灵巧手法兰面朝世界 X+、手水平伸出、手心朝下
+     朝下竖直抓；灵巧手法兰面朝世界 X+、手水平伸出、手心朝下。
+     二指抓躺倒瓶子时 yaw 跟随感知估计的瓶子长轴朝向
+     （_bottle_aligned_rotation，开合轴垂直瓶身），估计不到才回退默认
   4. movej 到预抓取点 = 目标点正上方 10cm（世界系）
   5. movel 竖直下降到抓取点
   6. 闭合夹爪
@@ -155,6 +157,11 @@ OBSERVE_POSES = [
 TWO_FINGER_GROUND_OBSERVE_POSES = [
     [-0.041888, -1.021018, -1.664225, -1.188569, 1.586504, 0.022689],
 ]
+# 二指夹爪手指开合方向在法兰系下的轴（'x' 或 'y'）。
+# 抓躺倒瓶子时，该轴会被转到"垂直于瓶子长轴"的水平方向，
+# 让两指从瓶身两侧合拢。若实测发现夹爪顺着瓶子长轴合拢（夹不住/打滑），
+# 把这里改成另一个轴即可。
+TWO_FINGER_PINCH_AXIS = 'y'
 OBSERVE_WAIT = 5.0         # 观察位姿等待检测的时间（秒）
 
 HOME_JOINTS = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
@@ -203,6 +210,7 @@ class YoloGrasp:
             String, '/yolo/target_class', 10)
         self.latest_target = None
         self.latest_target_time = 0.0
+        self.latest_target_quat = None   # 目标姿态（二指瓶子长轴朝向）
         self._locked_target = None
         self._target_locked = False
         self.robot.create_subscription(
@@ -378,6 +386,8 @@ class YoloGrasp:
     def _target_cb(self, msg):
         self.latest_target = np.array([
             msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        q = msg.pose.orientation
+        self.latest_target_quat = (q.x, q.y, q.z, q.w)
         self.latest_target_time = time.time()
 
     def _qwen_done_cb(self, msg):
@@ -669,6 +679,48 @@ class YoloGrasp:
         return self.latest_target.copy()
 
     # ---------------- 补拍精定位 ----------------
+    def _bottle_aligned_rotation(self, R_now):
+        """二指抓躺倒瓶子：按感知发布的瓶子长轴朝向构造抓取姿态。
+
+        法兰 Z 竖直朝下，夹爪开合轴（TWO_FINGER_PINCH_AXIS）转到与瓶子
+        长轴垂直的水平方向，让两指从瓶身两侧合拢。长轴有 180° 歧义，
+        选离当前法兰姿态（R_now）最近的分支，手腕少转。
+        无有效朝向信息（旧版感知/直立瓶/估计失败）返回 None，走原默认逻辑。
+        """
+        q = self.latest_target_quat
+        if q is None:
+            return None
+        n = math.sqrt(sum(v * v for v in q))
+        if n < 1e-6:
+            return None
+        q = [v / n for v in q]
+        if abs(q[3]) > 1.0 - 1e-3:
+            return None   # identity = 感知端未给出朝向
+        bottle_x = Rot.from_quat(q).as_matrix()[:, 0]  # 瓶子长轴（基座系）
+        z = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
+        pinch = np.cross(z, bottle_x)  # 同时⊥竖直轴和长轴 = 开合轴该朝的方向
+        pn = np.linalg.norm(pinch)
+        if pn < 1e-6:
+            return None
+        pinch /= pn
+        # 180° 歧义：选与当前法兰对应轴同向的分支，手腕转角最小
+        if R_now is not None:
+            ref = (R_now[:, 1] if TWO_FINGER_PINCH_AXIS == 'y'
+                   else R_now[:, 0])
+            if float(pinch @ ref) < 0:
+                pinch = -pinch
+        if TWO_FINGER_PINCH_AXIS == 'y':
+            y = pinch
+            x = np.cross(y, z)
+        else:
+            x = pinch
+            y = np.cross(z, x)
+        yaw_deg = math.degrees(math.atan2(bottle_x @ WORLD_Y_IN_BASE,
+                                          bottle_x @ WORLD_X_IN_BASE))
+        print(f"   [瓶子朝向] 长轴世界水平角 {yaw_deg:.1f}°，"
+              f"夹爪开合轴(法兰{TWO_FINGER_PINCH_AXIS.upper()})垂直瓶身")
+        return np.column_stack([x, y, z])
+
     def _plan_reshoot_pose(self, obj):
         """规划补拍关节角，按抓取模式生成候选相机位姿，逐个试 IK：
         table   - 相机在目标上方尽量陡（俯角候选自动降级），修正视角滑动；
@@ -759,6 +811,7 @@ class YoloGrasp:
         time.sleep(RESHOOT_SETTLE)
         # 等补拍位姿下的新检测帧
         self.latest_target = None
+        self.latest_target_quat = None
         start = time.time()
         while self.latest_target is None and time.time() - start < 3.0:
             time.sleep(0.05)
@@ -814,6 +867,7 @@ class YoloGrasp:
     def _wait_target(self, timeout):
         """清空旧目标，等待新检测结果。返回是否在超时内检测到。"""
         self.latest_target = None
+        self.latest_target_quat = None
         self.latest_target_time = 0.0
         start = time.time()
         while self.latest_target is None and time.time() - start < timeout:
@@ -829,6 +883,7 @@ class YoloGrasp:
         """
         if reset:
             self.latest_target = None
+            self.latest_target_quat = None
             self.latest_target_time = 0.0
             self.latest_qwen_done = None
             self.latest_qwen_done_time = 0.0
@@ -930,6 +985,7 @@ class YoloGrasp:
         # 1. 清空旧目标，开启按需识别：只用开启后拍的新帧，
         #    避免混入导航/摆臂过程中的旧检测结果导致抓取点跑偏
         self.latest_target = None
+        self.latest_target_quat = None
         self.latest_target_time = 0.0
         self.latest_qwen_done = None
         self.latest_qwen_done_time = 0.0
@@ -1038,23 +1094,30 @@ class YoloGrasp:
             # 抓取姿态由夹爪定义：直装夹爪法兰 Z 朝下竖直抓；
             # 灵巧手法兰面朝世界 X+、手水平伸出、手心朝下
             grasp_rot = gripper.grasp_rotation(WORLD_X_IN_BASE, V_UP_IN_BASE)
-            # 二指地面抓取：拍照位姿的法兰已经竖直朝下，且 yaw 与默认抓取姿态
-            # 相差约 94°。直接沿用当前朝向（拍照→预抓取全程不再转 90°），
-            # 仅当当前法兰 Z 接近世界下时才沿用，否则回退默认姿态。
+            # 二指地面抓取：优先按感知发布的瓶子长轴朝向旋转法兰 yaw，
+            # 让夹爪开合轴垂直于瓶子长轴（躺倒瓶子任意朝向都能抓）。
             if gripper.name == 'two_finger':
                 q_now = self.robot.get_joint_positions()
+                R_now = None
                 if q_now is not None:
                     _, R_now = cs66_forward_kinematics(q_now)
+                bottle_rot = self._bottle_aligned_rotation(R_now)
+                if bottle_rot is not None:
+                    grasp_rot = bottle_rot
+                elif R_now is not None:
+                    # 无瓶子朝向信息时的旧行为：拍照位姿的法兰已竖直朝下
+                    # 就沿用其 yaw（拍照→预抓取全程不再转 90°），
+                    # 仅当当前法兰 Z 接近世界下时才沿用，否则回退默认姿态。
                     down = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
                     z_angle = math.degrees(math.acos(np.clip(
                         R_now[:, 2] @ down, -1.0, 1.0)))
                     if z_angle < 20.0:
-                        print(f"   [诊断] 沿用拍照位姿朝向（法兰Z与竖直差 "
-                              f"{z_angle:.1f}°），不再转 yaw")
+                        print(f"   [诊断] 无瓶子朝向，沿用拍照位姿 yaw"
+                              f"（法兰Z与竖直差 {z_angle:.1f}°）")
                         grasp_rot = R_now
                     else:
-                        print(f"   [诊断] 当前法兰Z与竖直差 {z_angle:.1f}°，"
-                              f"回退默认朝下姿态")
+                        print(f"   [诊断] 无瓶子朝向且法兰Z与竖直差 "
+                              f"{z_angle:.1f}°，回退默认朝下姿态")
             tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 工具伸出方向
             L = gripper.tool_length
             print(f"   [诊断] 法兰Z轴: {np.round(tool_dir, 3)}  "
@@ -1162,6 +1225,7 @@ class YoloGrasp:
                         return False, "快速接近收回超时"
                     # 重拍：清空旧目标，等感知节点发来新检测帧
                     self.latest_target = None
+                    self.latest_target_quat = None
                     self.latest_target_time = 0.0
                     if not self._wait_target(3.0):
                         return False, "重拍未检测到目标"

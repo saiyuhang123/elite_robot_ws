@@ -269,7 +269,11 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 
 注：`grasp_orientation_*.json` 示教姿态文件已废弃不再使用。抓取姿态现在是代码构造的固定姿态：
 灵巧手 = 法兰面朝世界 X+、手水平伸出、手心朝下（`linkerhand.py`）；
-二指/柔触 = 法兰 Z 朝世界正下方竖直抓（`base.py` 默认）。
+柔触 = 法兰 Z 朝世界正下方竖直抓（`base.py` 默认）；
+二指 = 法兰 Z 竖直朝下，yaw 跟随感知估计的瓶子长轴朝向（`yolo_grasp.py`
+的 `_bottle_aligned_rotation`：夹爪开合轴转到垂直于瓶子长轴，躺倒瓶子任意
+朝向都能抓；估计不到朝向时回退沿用拍照位姿 yaw）。开合轴与法兰轴的对应关系
+由 `TWO_FINGER_PINCH_AXIS` 配置（默认 'y'，实测反了改 'x'）。
 
 ### 夹爪参数速查
 
@@ -277,7 +281,7 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 |---|---|---|---|
 | 控制方式 | topic (JointState) | 服务 (serial→ROS) | 服务 (Modbus TCP) |
 | IK 模式 | 6dof | 6dof | 5dof（旋转对称） |
-| 抓取姿态 | 法兰面朝世界X+，手心朝下 | 法兰Z朝下 | 法兰Z朝下 |
+| 抓取姿态 | 法兰面朝世界X+，手心朝下 | 法兰Z朝下，yaw跟随瓶子长轴 | 法兰Z朝下 |
 | tool_length | 0.13 | 0.12 | 0.15 |
 | grasp_offset Z | 0.06（压物调大/抓空调小） | 0.0（对准中心） | 0.02（略高） |
 | close_delay | 1.5s | 1.0s | 2.0s |

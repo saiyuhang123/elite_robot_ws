@@ -37,6 +37,31 @@ DEFAULT_TARGET_CLASSES = {'apple'}
 # 置信度阈值：低于此值的检测框直接忽略
 CONF_THRESHOLD = 0.25
 
+# 倾斜安装实测：世界系"上"在基座系下的方向
+# （与 biaoding/yolo_grasp.py 同一份，calibrate_vertical.py 可重测）。
+# 二指模式估计躺倒瓶子的水平朝向时用。
+V_UP_IN_BASE = np.array([-0.7431, 0.0120, 0.6691])
+
+
+def _build_world_axes(v_up):
+    up = np.asarray(v_up, dtype=float)
+    up /= np.linalg.norm(up)
+    y = np.array([0.0, 1.0, 0.0])
+    y = y - (y @ up) * up
+    y /= np.linalg.norm(y)
+    return np.cross(y, up), y, up
+
+
+WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
+
+# ---- 二指模式：躺倒瓶子长轴朝向估计（离地高度掩码 + PCA）----
+BOTTLE_AXIS_MIN_PIXELS = 60     # 瓶身掩码最少像素，少了不可靠
+BOTTLE_AXIS_ABOVE_GROUND_M = 0.015  # 高出地面这么多(米)才算瓶身
+BOTTLE_AXIS_RING_PX = 30        # bbox 外扩取样地面的环宽（像素）
+BOTTLE_AXIS_MIN_ELONG = 1.8     # PCA 长/短轴标准差比，小了说明方向不可靠
+BOTTLE_AXIS_STANDING_COS = 0.7  # 长轴与世界"上"的 |cos| 超过它 = 接近直立，
+                                # 水平朝向无意义（抓取端回退默认朝向）
+
 # 深度帧新鲜度：只要求是"识别开启之后新到的深度帧"。
 # 拍照时机械臂已停稳，0.8fps 图漾的 color/depth 时间戳差天然很大，
 # 做时间戳差校验只会把好帧丢掉（灵巧手时代也没有这道校验）。
@@ -56,6 +81,116 @@ def load_hand_eye_matrix(path):
     T[:3, :3] = np.array(calib['R_cam2tool'])
     T[:3, 3] = np.array(calib['t_cam2tool']).flatten()
     return T
+
+
+def estimate_bottle_axis(xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base):
+    """估计躺倒瓶子长轴的水平朝向（二指模式用）。
+
+    做法：bbox 外环带像素反投影到基座系，取世界"上"方向投影的中位数
+    作当地地面高度（用 3D 高度而非深度，天然免疫透视坡度）；bbox 内
+    高出地面一截的像素作瓶身掩码 → PCA 第一主成分 = 瓶子长轴 →
+    投影到世界水平面得朝向。瓶身完全缺深度时掩码为空返回 None，
+    不会给出假象方向。
+
+    参数:
+      xyxy    目标检测框（像素）
+      depth_img 深度图（原始值，0.25mm/LSB）
+      T_cam_to_base 相机→基座 4x4 变换
+
+    返回 (quat, yaw_deg, elong, axis_h)：
+      quat    物体姿态四元数 (x,y,z,w)：R_obj 的 x=瓶子长轴(水平化)、
+              z=世界"上"、y=z×x；抓取端只取 x 列算 yaw。
+      yaw_deg 长轴在世界水平面内的角度（日志/画图用）
+      elong   掩码长/短轴比（日志用）
+      axis_h  水平化后的长轴单位向量（基座系，画图用）
+    无法可靠估计（深度太少/掩码太圆/接近直立）返回全 None。
+    """
+    x1, y1, x2, y2 = [int(v) for v in xyxy]
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(depth_img.shape[1], x2)
+    y2 = min(depth_img.shape[0], y2)
+    if x2 - x1 < 5 or y2 - y1 < 5:
+        return None, None, None, None
+    sub = depth_img[y1:y2, x1:x2].astype(np.float64) * 0.25 / 1000.0
+    if int((sub > 0).sum()) < BOTTLE_AXIS_MIN_PIXELS:
+        return None, None, None, None
+
+    up = V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
+    R_cb = T_cam_to_base[:3, :3]
+    t_cb = T_cam_to_base[:3, 3]
+
+    def _heights(xa, ya, xb, yb):
+        """区域有效像素反投影到基座系，返回世界"上"方向高度。"""
+        roi = depth_img[ya:yb, xa:xb].astype(np.float64) * 0.25 / 1000.0
+        ys, xs = np.nonzero(roi > 0)
+        if ys.size == 0:
+            return None
+        Z = roi[roi > 0]
+        u = xs.astype(np.float64) + xa
+        v = ys.astype(np.float64) + ya
+        pts = np.column_stack([(u - cx) * Z / fx,
+                               (v - cy) * Z / fy, Z])
+        return (pts @ R_cb.T + t_cb) @ up
+
+    # 1. bbox 外环带 → 当地地面高度（中位数，抗零散干扰）
+    r = BOTTLE_AXIS_RING_PX
+    rx1, ry1 = max(0, x1 - r), max(0, y1 - r)
+    rx2, ry2 = min(depth_img.shape[1], x2 + r), min(depth_img.shape[0], y2 + r)
+    ring_parts = []
+    if ry1 < y1:
+        ring_parts.append(_heights(rx1, ry1, rx2, y1))     # 上
+    if ry2 > y2:
+        ring_parts.append(_heights(rx1, y2, rx2, ry2))     # 下
+    if rx1 < x1:
+        ring_parts.append(_heights(rx1, ry1, x1, ry2))     # 左
+    if rx2 > x2:
+        ring_parts.append(_heights(x2, ry1, rx2, ry2))     # 右
+    ring_parts = [h for h in ring_parts if h is not None]
+    if not ring_parts:
+        return None, None, None, None
+    h_ring = np.concatenate(ring_parts)
+    if h_ring.size < BOTTLE_AXIS_MIN_PIXELS:
+        return None, None, None, None
+    h_ground = float(np.median(h_ring))
+
+    # 2. bbox 内高出地面的像素 = 瓶身掩码
+    ys, xs = np.nonzero(sub > 0)
+    Z = sub[sub > 0]
+    u = xs.astype(np.float64) + x1
+    v = ys.astype(np.float64) + y1
+    pts = np.column_stack([(u - cx) * Z / fx,
+                           (v - cy) * Z / fy, Z])
+    pts = pts @ R_cb.T + t_cb                    # 基座系
+    keep = (pts @ up) > h_ground + BOTTLE_AXIS_ABOVE_GROUND_M
+    n = int(keep.sum())
+    if n < BOTTLE_AXIS_MIN_PIXELS:
+        return None, None, None, None
+    pts = pts[keep]
+
+    # 3. PCA 第一主成分 = 瓶子长轴
+    pts = pts - pts.mean(axis=0)
+    eigvals, eigvecs = np.linalg.eigh(pts.T @ pts / n)   # 特征值升序
+    if eigvals[1] <= 1e-12:
+        return None, None, None, None
+    elong = float(np.sqrt(eigvals[2] / eigvals[1]))
+    if elong < BOTTLE_AXIS_MIN_ELONG:
+        return None, None, None, None
+    axis = eigvecs[:, 2]            # 瓶子长轴（基座系）
+
+    if abs(float(axis @ up)) > BOTTLE_AXIS_STANDING_COS:
+        return None, None, None, None   # 接近直立：水平朝向无意义
+    axis_h = axis - (axis @ up) * up
+    axis_h /= np.linalg.norm(axis_h)
+    if float(axis_h @ WORLD_X_IN_BASE) < 0:
+        axis_h = -axis_h            # 长轴有 180° 歧义，定号统一
+    z = up
+    x = axis_h
+    y = np.cross(z, x)
+    quat = R.from_matrix(np.column_stack([x, y, z])).as_quat()
+    yaw_deg = float(np.degrees(np.arctan2(axis_h @ WORLD_Y_IN_BASE,
+                                          axis_h @ WORLD_X_IN_BASE)))
+    return quat, yaw_deg, elong, axis_h
 
 
 class YoloGraspPerceptionNode(Node):
@@ -542,6 +677,19 @@ class YoloGraspPerceptionNode(Node):
             self.annotated_img_pub.publish(self.bridge.cv2_to_imgmsg(color_img, encoding='bgr8'))
             return
 
+        # 二指模式：估计躺倒瓶子的水平朝向（长轴 PCA），随姿态四元数发布。
+        # 估计失败/接近直立时 bottle_quat=None，姿态发 identity（旧行为）。
+        bottle_quat = None
+        axis_h = None
+        if self.mode == 'two_finger':
+            T_cam_to_base = T_tool_to_base @ self.T_cam_to_tool
+            bottle_quat, yaw_deg, elong, axis_h = estimate_bottle_axis(
+                xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base)
+            if bottle_quat is not None:
+                self.get_logger().info(
+                    f'瓶子长轴朝向: 世界水平面 {yaw_deg:.1f}°，'
+                    f'长/短轴比 {elong:.1f}')
+
         self.get_logger().info(
             f'识别到 [{cls_name}] (可信度:{conf:.2f}) -> '
             f'相机系: [{X_c:.3f}, {Y_c:.3f}, {Z_c:.3f}]m | '
@@ -560,6 +708,19 @@ class YoloGraspPerceptionNode(Node):
         # ---------------- 图像上绘制调试信息 ----------------
         cv2.rectangle(color_img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
         cv2.circle(color_img, (u_center, v_center), 5, (0, 0, 255), -1)
+        if axis_h is not None:
+            # 画出估计的瓶子长轴（基座系中心 ±6cm 两端点反投影回图像）
+            T_base_to_cam = np.linalg.inv(T_cam_to_base)
+            pts_px = []
+            for s in (-0.06, 0.06):
+                p_cam = T_base_to_cam @ np.array(
+                    [X_b + s * axis_h[0], Y_b + s * axis_h[1],
+                     Z_b + s * axis_h[2], 1.0])
+                if p_cam[2] > 0.01:
+                    pts_px.append((int(fx * p_cam[0] / p_cam[2] + cx),
+                                   int(fy * p_cam[1] / p_cam[2] + cy)))
+            if len(pts_px) == 2:
+                cv2.line(color_img, pts_px[0], pts_px[1], (0, 255, 255), 2)
         if gate_pos is not None:
             label = (f'{cls_name}: Base[{gate_pos[0]:.2f}, '
                      f'{gate_pos[1]:.2f}, {gate_pos[2]:.2f}]m')
@@ -580,14 +741,20 @@ class YoloGraspPerceptionNode(Node):
         # ---------------- 发布 PoseStamped 消息与 TF 广播 ----------------
         now = self.get_clock().now().to_msg()
 
-        # 发布 Pose 消息
+        # 发布 Pose 消息（姿态：二指估计出的瓶子长轴朝向；无估计时 identity）
         pose_msg = PoseStamped()
         pose_msg.header.stamp = now
         pose_msg.header.frame_id = BASE_FRAME
         pose_msg.pose.position.x = X_b
         pose_msg.pose.position.y = Y_b
         pose_msg.pose.position.z = Z_b
-        pose_msg.pose.orientation.w = 1.0  # 默认姿态
+        if bottle_quat is not None:
+            pose_msg.pose.orientation.x = float(bottle_quat[0])
+            pose_msg.pose.orientation.y = float(bottle_quat[1])
+            pose_msg.pose.orientation.z = float(bottle_quat[2])
+            pose_msg.pose.orientation.w = float(bottle_quat[3])
+        else:
+            pose_msg.pose.orientation.w = 1.0  # 无朝向信息（旧行为）
         self.pose_pub.publish(pose_msg)
 
         # 广播 TF Transform (方便在 RViz2 里可视化)
@@ -598,7 +765,13 @@ class YoloGraspPerceptionNode(Node):
         t_tf.transform.translation.x = X_b
         t_tf.transform.translation.y = Y_b
         t_tf.transform.translation.z = Z_b
-        t_tf.transform.rotation.w = 1.0
+        if bottle_quat is not None:
+            t_tf.transform.rotation.x = float(bottle_quat[0])
+            t_tf.transform.rotation.y = float(bottle_quat[1])
+            t_tf.transform.rotation.z = float(bottle_quat[2])
+            t_tf.transform.rotation.w = float(bottle_quat[3])
+        else:
+            t_tf.transform.rotation.w = 1.0
         self.tf_broadcaster.sendTransform(t_tf)
 
 
