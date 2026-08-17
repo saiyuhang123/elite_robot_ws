@@ -97,12 +97,15 @@ def estimate_bottle_axis(xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base):
       depth_img 深度图（原始值，0.25mm/LSB）
       T_cam_to_base 相机→基座 4x4 变换
 
-    返回 (quat, yaw_deg, elong, axis_h)：
+    返回 (quat, yaw_deg, elong, axis_h, center)：
       quat    物体姿态四元数 (x,y,z,w)：R_obj 的 x=瓶子长轴(水平化)、
               z=世界"上"、y=z×x；抓取端只取 x 列算 yaw。
       yaw_deg 长轴在世界水平面内的角度（日志/画图用）
       elong   掩码长/短轴比（日志用）
       axis_h  水平化后的长轴单位向量（基座系，画图用）
+      center  瓶子中轴中心（基座系）：中轴投影过 bbox 中心（中心对称，
+              与视角无关）× 高度 = 地面+r（r 由顶脊估出）联立解出，
+              水平分量用于把抓取点修正到夹爪两指中心
     无法可靠估计（深度太少/掩码太圆/接近直立）返回全 None。
     """
     x1, y1, x2, y2 = [int(v) for v in xyxy]
@@ -111,10 +114,10 @@ def estimate_bottle_axis(xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base):
     x2 = min(depth_img.shape[1], x2)
     y2 = min(depth_img.shape[0], y2)
     if x2 - x1 < 5 or y2 - y1 < 5:
-        return None, None, None, None
+        return None, None, None, None, None
     sub = depth_img[y1:y2, x1:x2].astype(np.float64) * 0.25 / 1000.0
     if int((sub > 0).sum()) < BOTTLE_AXIS_MIN_PIXELS:
-        return None, None, None, None
+        return None, None, None, None, None
 
     up = V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
     R_cb = T_cam_to_base[:3, :3]
@@ -148,10 +151,10 @@ def estimate_bottle_axis(xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base):
         ring_parts.append(_heights(x2, ry1, rx2, ry2))     # 右
     ring_parts = [h for h in ring_parts if h is not None]
     if not ring_parts:
-        return None, None, None, None
+        return None, None, None, None, None
     h_ring = np.concatenate(ring_parts)
     if h_ring.size < BOTTLE_AXIS_MIN_PIXELS:
-        return None, None, None, None
+        return None, None, None, None, None
     h_ground = float(np.median(h_ring))
 
     # 2. bbox 内高出地面的像素 = 瓶身掩码
@@ -165,32 +168,74 @@ def estimate_bottle_axis(xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base):
     keep = (pts @ up) > h_ground + BOTTLE_AXIS_ABOVE_GROUND_M
     n = int(keep.sum())
     if n < BOTTLE_AXIS_MIN_PIXELS:
-        return None, None, None, None
+        return None, None, None, None, None
     pts = pts[keep]
-
-    # 3. PCA 第一主成分 = 瓶子长轴
-    pts = pts - pts.mean(axis=0)
+    pts_keep = pts                     # 绝对坐标（基座系），供中心估计用
+    centroid = pts.mean(axis=0)        # 掩码质心（仅 PCA 定心用）
+    h_abs = pts @ up                   # 各点高度（绝对，基座系）
+    pts = pts - centroid
     eigvals, eigvecs = np.linalg.eigh(pts.T @ pts / n)   # 特征值升序
     if eigvals[1] <= 1e-12:
-        return None, None, None, None
+        return None, None, None, None, None
     elong = float(np.sqrt(eigvals[2] / eigvals[1]))
     if elong < BOTTLE_AXIS_MIN_ELONG:
-        return None, None, None, None
+        return None, None, None, None, None
     axis = eigvecs[:, 2]            # 瓶子长轴（基座系）
 
     if abs(float(axis @ up)) > BOTTLE_AXIS_STANDING_COS:
-        return None, None, None, None   # 接近直立：水平朝向无意义
+        return None, None, None, None, None   # 接近直立：水平朝向无意义
     axis_h = axis - (axis @ up) * up
     axis_h /= np.linalg.norm(axis_h)
     if float(axis_h @ WORLD_X_IN_BASE) < 0:
         axis_h = -axis_h            # 长轴有 180° 歧义，定号统一
+
+    # ---- 瓶子中轴中心（3D）----
+    # 斜视角下深度图只覆盖瓶身朝相机一侧（远侧自遮挡），表面点/质心
+    # 都偏向相机，不能直接当中心。但瓶身在图像中的外轮廓关于中轴投影
+    # 中心对称（与视角无关），YOLO bbox 即外轮廓范围 → 中轴投影过
+    # bbox 中心。中轴是水平线：方向 axis_h、高度 = 地面 + r
+    # （r 由顶脊 ≈ 地面 + 2r 估出）。"投影到过 bbox 中心且 ⊥ 轴投影
+    # 方向的中线"在 3D 中是一个过相机中心的平面，与该水平线求交
+    # （线性方程）即得中轴横向位置；轴向取掩码两端范围中点。
+    lat_h = np.cross(up, axis_h)
+    r_est = float(np.percentile(h_abs, 99) - h_ground) / 2.0
+    r_est = min(max(r_est, 0.02), 0.06)          # 深度噪声防护
+    h_ref = h_ground + r_est
+
+    def _project(P):
+        pc = R_cb.T @ (P - t_cb)
+        return np.array([fx * pc[0] / pc[2] + cx, fy * pc[1] / pc[2] + cy])
+
+    p0 = _project(centroid)
+    p1 = _project(centroid + 0.05 * axis_h)
+    d2 = p1 - p0                                 # 中轴投影方向（图像 2D）
+    nd = np.linalg.norm(d2)
+    if nd < 1.0:
+        return None, None, None, None, None
+    d2 /= nd
+    n2 = np.array([-d2[1], d2[0]])               # 图像内 ⊥ 中轴投影
+    m0 = float(n2 @ np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0]))
+    # 中线平面：{P | n_hat·(P - 相机中心) = 0}（像素方程对 X/Z 是线性的）
+    n_cam = np.array([n2[0] * fx, n2[1] * fy,
+                      n2[0] * cx + n2[1] * cy - m0])
+    n_hat = R_cb @ n_cam
+    denom = float(n_hat @ lat_h)
+    if abs(denom) < 1e-9:
+        return None, None, None, None, None
+    s = float(n_hat @ (t_cb - h_ref * up)) / denom
+    axis_pt = h_ref * up + s * lat_h             # 中轴上一点（横向已修正）
+    s_ax_abs = pts_keep @ axis_h
+    mid_ax = float((np.percentile(s_ax_abs, 2)
+                    + np.percentile(s_ax_abs, 98)) / 2)
+    center = axis_pt + (mid_ax - float(axis_pt @ axis_h)) * axis_h
+
     z = up
     x = axis_h
     y = np.cross(z, x)
     quat = R.from_matrix(np.column_stack([x, y, z])).as_quat()
     yaw_deg = float(np.degrees(np.arctan2(axis_h @ WORLD_Y_IN_BASE,
                                           axis_h @ WORLD_X_IN_BASE)))
-    return quat, yaw_deg, elong, axis_h
+    return quat, yaw_deg, elong, axis_h, center
 
 
 class YoloGraspPerceptionNode(Node):
@@ -681,10 +726,12 @@ class YoloGraspPerceptionNode(Node):
         # 估计失败/接近直立时 bottle_quat=None，姿态发 identity（旧行为）。
         bottle_quat = None
         axis_h = None
+        bottle_center = None
         if self.mode == 'two_finger':
             T_cam_to_base = T_tool_to_base @ self.T_cam_to_tool
-            bottle_quat, yaw_deg, elong, axis_h = estimate_bottle_axis(
-                xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base)
+            bottle_quat, yaw_deg, elong, axis_h, bottle_center = \
+                estimate_bottle_axis(
+                    xyxy, depth_img, fx, fy, cx, cy, T_cam_to_base)
             if bottle_quat is not None:
                 self.get_logger().info(
                     f'瓶子长轴朝向: 世界水平面 {yaw_deg:.1f}°，'
@@ -738,6 +785,19 @@ class YoloGraspPerceptionNode(Node):
             return
 
         X_b, Y_b, Z_b = gate_pos
+        # 二指：把抓取点水平分量修正到瓶身掩码质心。原检测点落在瓶身
+        # 最近表面上，水平最多偏离中轴一个瓶径，直接抓瓶子会偏出两指
+        # 中心（下探时一侧手指提前蹭到瓶身触发停住）。高度保持原估计，
+        # 竖直方向本就走力控下探，不依赖精确高度。
+        if bottle_center is not None:
+            up_n = V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
+            p = np.array([X_b, Y_b, Z_b])
+            delta = bottle_center - p
+            delta_h = delta - (delta @ up_n) * up_n
+            p = p + delta_h
+            X_b, Y_b, Z_b = float(p[0]), float(p[1]), float(p[2])
+            self.get_logger().info(
+                f'抓取点水平修正 {np.linalg.norm(delta_h) * 1000:.0f}mm')
         # ---------------- 发布 PoseStamped 消息与 TF 广播 ----------------
         now = self.get_clock().now().to_msg()
 

@@ -110,7 +110,7 @@ MOVEL_A, MOVEL_V = 0.3, 0.05
 # 不再依赖精确的目标高度，防止压坏物体触发力报警
 FT_TOPIC = '/force_torque_sensor_broadcaster/wrench'
 FORCE_THRESHOLD = 2.0       # 硬保护阈值（N，力变化模长），任何方向大力即停
-FORCE_PROJ_THRESHOLD = 1.2   # 软接触阈值（N，下压方向投影），轻触也能检出
+FORCE_PROJ_THRESHOLD = 5.0   # 软接触阈值（N，下压方向投影）
 FORCE_PROJ_HITS = 3          # 投影连续超阈值次数，滤毛刺
 FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
 FORCE_DIVE_OVERSHOOT = 0.07   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
@@ -425,7 +425,7 @@ class YoloGrasp:
         停止判据（任一满足）：
           - 力变化模长 > threshold（硬保护，任意方向大力）
           - 力变化在接触方向上的投影 > proj_threshold 连续 FORCE_PROJ_HITS 次
-            （软接触，轻触也能检出；contact_dir_flange 为接触力方向在法兰系
+            （软接触判据；contact_dir_flange 为接触力方向在法兰系
             下的单位向量，None 则关闭投影判据）
         joint_space=True（two_finger 地面抓取）：每步用 IK+movej，
         不经过控制器 movel 的笛卡尔插补。
