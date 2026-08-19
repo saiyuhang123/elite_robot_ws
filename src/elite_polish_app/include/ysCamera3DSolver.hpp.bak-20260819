@@ -38,9 +38,7 @@ namespace elite_robot {
             void subCommandStateCB(const std_msgs::msg::Int32 cmd);
             void ys_subJointStateCB(const sensor_msgs::msg::JointState state);
             void ys_subEyePointCloudCB(const sensor_msgs::msg::PointCloud2 msg);
-            // 深度地面差分节点输出的板面点云。空云表示检测失败，随后走回退链。
-            void ys_subDepthBoardCloudCB(const sensor_msgs::msg::PointCloud2 msg);
-
+            
             bool ys_doPCLTemplateAlign();
 
         private:
@@ -93,24 +91,10 @@ namespace elite_robot {
             Eigen::Vector3f world_up_in_base_{-0.7431, 0.0120, 0.6691};
             int cloud_min_points_ = 100000;//点云最少点数门槛（低于则丢帧）
 
-            // ---- 深度地面差分 ROI（depth → cluster → fixed 三层回退的第一级）----
-            std::string roi_mode_ = "fixed";              // ROI 模式（构造时从参数加载）
-            std::string depth_board_request_topic_;
-            std::string depth_board_cloud_topic_;
-            double depth_detection_wait_timeout_ = 3.0;
-            rclcpp::Time depth_request_stamp_{0, 0, RCL_ROS_TIME};
-            rclcpp::Time depth_result_recv_stamp_{0, 0, RCL_ROS_TIME};
-            bool depth_result_received_ = false;
-            // 深度节点输出的是相机光学系点云；在拍照位用同一 FK×手眼变换到 base 系。
-            pcl::PointCloud<pcl::PointXYZ>::Ptr depth_target_cloud_eye_;
-            pcl::PointCloud<pcl::PointXYZ>::Ptr depth_target_cloud_base_;
-
             //topic and service
             rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_; 
             rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr ys_jointstates_sub_;      
-            rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr ys_pointcloud2_sub_;
-            rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr depth_board_cloud_sub_;
-            rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr depth_board_request_pub_;
+            rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr ys_pointcloud2_sub_;     
             rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr ys_polish_pose_publisher_;  
 
         };

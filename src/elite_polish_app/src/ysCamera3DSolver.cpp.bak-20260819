@@ -49,7 +49,7 @@ namespace elite_robot {
         target_box_max_ = v4(getv3("target_box_max", {0.720,  0.178, 0.740}));
 
         // ---- 动态 ROI / 聚类模式（移动平台停车容差扩展）----
-        roi_mode_ = this->declare_parameter<std::string>("roi_mode", "fixed");
+        this->declare_parameter<std::string>("roi_mode", "fixed");
         getv3("dynamic_coarse_box_min", {0.0, 0.0, 0.0});
         getv3("dynamic_coarse_box_max", {0.0, 0.0, 0.0});
         this->declare_parameter<double>("dynamic_voxel_size", 0.004);
@@ -64,22 +64,6 @@ namespace elite_robot {
         this->declare_parameter<double>("dynamic_roi_z_padding", 0.003);
         this->declare_parameter<bool>("dynamic_roi_fallback_to_fixed", true);
         this->declare_parameter<bool>("dynamic_origin_from_plane_centroid", true);
-
-        // ---- 深度地面差分 ROI（depth → cluster → fixed 三层回退的第一级）----
-        // depth_board_detect_node 直接从 organized 深度图生成板面相机系点云，
-        // 避免在驱动压缩成 height=1 的 registered point cloud 上做像素索引。
-        depth_board_request_topic_ = this->declare_parameter<std::string>(
-          "depth_board_request_topic", "/elite_polish/depth_board_request");
-        depth_board_cloud_topic_ = this->declare_parameter<std::string>(
-          "depth_board_cloud_topic", "/elite_polish/depth_board_points");
-        depth_detection_wait_timeout_ = this->declare_parameter<double>(
-          "depth_detection_wait_timeout", 3.0);
-        this->declare_parameter<bool>("depth_axis_from_plane_pca", true);
-        RCLCPP_INFO(this->get_logger(),
-          "roi_mode: %s depth_request_topic: %s depth_cloud_topic: %s wait_timeout: %.2fs",
-          roi_mode_.c_str(), depth_board_request_topic_.c_str(),
-          depth_board_cloud_topic_.c_str(),
-          depth_detection_wait_timeout_);
 
         auto zrange = getv3("plane_box_z_range", {0.45, 0.75});
         plane_box_zmin_ = zrange[0];  plane_box_zmax_ = zrange[1];
@@ -218,11 +202,6 @@ namespace elite_robot {
                 "/joint_states", 1, std::bind(&ysCamera3DSolver::ys_subJointStateCB, this, _1)); 
             ys_pointcloud2_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(       
                 "/camera/camera/depth/color/points", 1, std::bind(&ysCamera3DSolver::ys_subEyePointCloudCB, this, _1)); 
-            depth_board_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                depth_board_cloud_topic_, 1,
-                std::bind(&ysCamera3DSolver::ys_subDepthBoardCloudCB, this, _1));
-            depth_board_request_pub_ = this->create_publisher<std_msgs::msg::Int32>(
-                depth_board_request_topic_, 1);
             ys_polish_pose_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("elite_vision_pose_broadcaster/pose", 1); 
       }
 
@@ -233,17 +212,6 @@ namespace elite_robot {
         {
         case 1:
           app_cmd_ = EyeCommand::DO_CAMERA_VISION_JOB;
-          if (roi_mode_ == "depth") {
-            depth_target_cloud_eye_.reset();
-            depth_target_cloud_base_.reset();
-            depth_result_received_ = false;
-            depth_request_stamp_ = this->now();
-            std_msgs::msg::Int32 depth_request;
-            depth_request.data = 1;
-            depth_board_request_pub_->publish(depth_request);
-            RCLCPP_INFO(this->get_logger(),
-              "[roi] requested depth board detection after resetting result state");
-          }
           break;
         default:
           app_cmd_ = EyeCommand::NOTHING;
@@ -301,21 +269,6 @@ namespace elite_robot {
             return;
           }
 
-          // 深度节点与本节点同时收到视觉命令。等待它处理一帧新的深度图，避免
-          // 首个 compact point cloud 抢先触发 cluster/fixed 回退。
-          if (roi_mode_ == "depth" && !depth_result_received_) {
-            const double waited = (this->now() - depth_request_stamp_).seconds();
-            if (waited < depth_detection_wait_timeout_) {
-              RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[roi] waiting for depth board result (%.2f/%.2fs)",
-                waited, depth_detection_wait_timeout_);
-              return;
-            }
-            RCLCPP_WARN(this->get_logger(),
-              "[roi] depth board result timeout after %.2fs; use fallback chain",
-              waited);
-          }
-
           // RCLCPP_INFO(this->get_logger(),"sub ys eye point cloud size: %d", msg.);
           pcl::PCLPointCloud2 pcl_pc2;
           pcl_conversions::toPCL(msg,pcl_pc2);
@@ -335,18 +288,6 @@ namespace elite_robot {
             pcl::transformPointCloud (*eye_cloud_, *base_cloud_, transform);
             pcl::io::savePCDFileBinary (template_pathname_+"cameracapture.pcd", *eye_cloud_);
             pcl::io::savePCDFileBinary (template_pathname_+"base.pcd", *base_cloud_);
-            depth_target_cloud_base_.reset();
-            if (roi_mode_ == "depth" && depth_target_cloud_eye_
-                && depth_target_cloud_eye_->size() > 100) {
-              depth_target_cloud_base_ =
-                pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>);
-              pcl::transformPointCloud(
-                *depth_target_cloud_eye_, *depth_target_cloud_base_, transform);
-              if (!depth_target_cloud_base_->empty()) {
-                pcl::io::savePCDFileBinary(
-                  template_pathname_+"depth_target.pcd", *depth_target_cloud_base_);
-              }
-            }
             if ( ys_doPCLTemplateAlign() ){
               RCLCPP_INFO(this->get_logger(),"pcl cloud aligin successed.");
               app_cmd_ = EyeCommand::NOTHING;
@@ -358,35 +299,10 @@ namespace elite_robot {
         }
       }
 
-      void ysCamera3DSolver::ys_subDepthBoardCloudCB(
-          const sensor_msgs::msg::PointCloud2 msg) {
-        // C++ 先清状态再通过内部 request topic 触发深度节点，因此当前视觉任务
-        // 收到的首个结果就是本轮结果。不能用相机 header 与 ROS now 比较：现场
-        // 相机硬件时间戳约落后 1.5s，会把请求后实际处理的新帧误判成 stale。
-        if (roi_mode_ != "depth" || app_cmd_ != EyeCommand::DO_CAMERA_VISION_JOB) {
-          return;
-        }
-        pcl::PCLPointCloud2 pcl_pc2;
-        pcl_conversions::toPCL(msg, pcl_pc2);
-        auto cloud = pcl::PointCloud<pcl::PointXYZ>::Ptr(
-          new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::fromPCLPointCloud2(pcl_pc2, *cloud);
-        depth_target_cloud_eye_ = cloud;
-        depth_result_recv_stamp_ = this->now();
-        depth_result_received_ = true;
-        if (cloud->empty()) {
-          RCLCPP_WARN(this->get_logger(),
-            "[roi] depth detector reported failure; fallback will be used");
-        } else {
-          RCLCPP_INFO(this->get_logger(),
-            "[roi] received depth board cloud: %zu points", cloud->size());
-        }
-      }
-
       bool ysCamera3DSolver::ys_doPCLTemplateAlign() {
         bool ret = true;
   
-        RCLCPP_INFO(this->get_logger(), "camera capture cloud size %zu\n", base_cloud_->size());
+        RCLCPP_INFO(this->get_logger(), "camera capture cloud size %d\n", base_cloud_->size());
         YsPCLCalcTransform calcFrame;
         // 注入参数化的裁剪盒/常数（config/polish_params.yaml）
         calcFrame.target_box_min = target_box_min_;
@@ -418,12 +334,7 @@ namespace elite_robot {
         calcFrame.world_up_in_base = world_up_in_base_;
 
         // ---- 动态 ROI / 聚类模式参数注入 ----
-        calcFrame.roi_mode = roi_mode_;
-        // 深度初检 ROI 已由深度节点提取，并在点云回调中变换到 base 系。
-        // 空云/超时自动回退 cluster/fixed。
-        calcFrame.depth_target_cloud = depth_target_cloud_base_;
-        calcFrame.depth_axis_from_plane_pca =
-          this->get_parameter("depth_axis_from_plane_pca").as_bool();
+        calcFrame.roi_mode = this->get_parameter("roi_mode").as_string();
         {
           const auto dmin = this->get_parameter("dynamic_coarse_box_min").as_double_array();
           const auto dmax = this->get_parameter("dynamic_coarse_box_max").as_double_array();

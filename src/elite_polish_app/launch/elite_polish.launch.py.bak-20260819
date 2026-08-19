@@ -1,6 +1,5 @@
 """
 Launch file for Elite CS66 force-controlled polishing system.
-
 Ported from ysrob_ws.
 
 Usage:
@@ -57,16 +56,6 @@ def generate_launch_description():
             output='screen',
             parameters=[params_file],
             remappings=[('/camera/camera/depth/color/points', '/camera/depth_registered/points')],
-        ),
-
-        # 深度地面差分节点：收到视觉命令后拟合地面、提取最大矩形板面，并发布
-        # 相机系板面点云。失败发布空云，由 C++ 侧回退 cluster（默认不使用旧 fixed 框）。
-        Node(
-            package='elite_polish_app',
-            executable='depth_board_detect_node.py',
-            name='depth_board_detect_node',
-            output='screen',
-            parameters=[params_file],
         ),
 
         # Interactive command line interface

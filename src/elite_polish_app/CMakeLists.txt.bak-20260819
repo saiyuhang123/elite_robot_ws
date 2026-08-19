@@ -80,11 +80,6 @@ install(TARGETS
   ysCamera3DSolver
   DESTINATION lib/${PROJECT_NAME})
 
-# Python 检测节点（深度地面差分 + 最大矩形板面检测）
-install(PROGRAMS
-  scripts/depth_board_detect_node.py
-  DESTINATION lib/${PROJECT_NAME})
-
 # =============================================
 # App command publisher
 # =============================================
@@ -101,7 +96,6 @@ install(TARGETS
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
@@ -112,10 +106,6 @@ if(BUILD_TESTING)
   add_test(NAME test_pcl_plane_fit COMMAND test_pcl_plane_fit)
   set_tests_properties(test_pcl_plane_fit PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-
-  add_test(
-    NAME test_depth_board_detector
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_depth_board_detector.py)
 endif()
 
 ament_package()

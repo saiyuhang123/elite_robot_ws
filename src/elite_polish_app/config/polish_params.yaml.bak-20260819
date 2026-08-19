@@ -159,18 +159,12 @@ ysCamera3DSolver:
     target_box_min: [0.813, -0.300, 0.202]
     target_box_max: [0.938,  0.071, 0.382]
 
-    # ---- 深度地面差分 / 动态 ROI（移动平台停车容差扩展）----
-    # 三种 roi_mode，失败按 depth → cluster → fixed 链式回退：
-    # depth:   从原始 organized 深度图自动拟合地面，按离地高度提取最大矩形板面，
-    #          输出板面点云后继续走精 RANSAC；不依赖固定像素框或 YOLO。
+    # ---- 动态 ROI / 聚类模式（移动平台停车容差扩展）----
+    # fixed:  完全沿用上方固定 target_box（旧行为）。
     # cluster: 先在 dynamic_coarse_box 内提取多个候选平面，按法向和质心先验选
     #          工件平面，再动态生成局部 ROI 交给精 RANSAC。粗框可比固定盒大很多。
-    # fixed:   完全沿用上方固定 target_box（旧行为）。
-    roi_mode: depth
-    depth_board_request_topic: /elite_polish/depth_board_request
-    depth_board_cloud_topic: /elite_polish/depth_board_points
-    depth_detection_wait_timeout: 3.0          # 发视觉命令后等待新深度检测结果的最长时间(s)
-    depth_axis_from_plane_pca: true            # 用矩形长轴决定扫掠方向，跟随板面平面内旋转
+    # 建议先用真实停车误差采集点云，标定下面这些参数。
+    roi_mode: cluster
     dynamic_coarse_box_min: [0.70, -0.42, 0.19]   # base系粗搜索盒，必须罩住最大停车误差
     dynamic_coarse_box_max: [1.05,  0.20, 0.42]
     dynamic_voxel_size: 0.004                      # 粗分割前降采样
@@ -183,9 +177,8 @@ ysCamera3DSolver:
     dynamic_center_z_tol: 0.06                     # z 容差：排除地面/其他水平面
     dynamic_roi_xy_padding: 0.010                  # 候选平面 bbox xy 回捞余量
     dynamic_roi_z_padding: 0.003                   # z 回捞余量（小，避免捞回地面）
-    # 动态工位下固定框可能指向旧位置；深度和 cluster 都失败时默认停止，不继续用旧框。
-    dynamic_roi_fallback_to_fixed: false
-    dynamic_origin_from_plane_centroid: true       # depth/cluster 原点跟随本次板面质心
+    dynamic_roi_fallback_to_fixed: true            # cluster 失败时回退固定盒
+    dynamic_origin_from_plane_centroid: true       # cluster 模式 planeFrame 原点跟随候选平面质心
 
     # ---- 工件平面拟合 (base_link 系) ----
     # 默认用 target_box 内全部候选点做带方向约束的 RANSAC，不再用三个10×10mm小框
@@ -217,61 +210,23 @@ ysCamera3DSolver:
     plane_point_x: [0.684,  0.111]
     plane_point_y: [0.638, -0.015]    # Y 参考测点
 
-    # ---- 板面局部盒（depth 模式以自动板心为原点、PCA 长轴为 x）----
-    # 范围略大于 34cm×15cm 实板；输入已经是深度差分后的板面点云，不会捞入地面。
-    curve_box_min: [-0.20, -0.10, -0.008]
-    curve_box_max: [ 0.20,  0.10,  0.005]
+    # ---- 圆弧盒 (工件平面系下, 圈打磨特征区域) ----
+    # 2026-08-02 地面板标定(基于19:26留底云): 板在平面系 x(扫掠,长边)±0.17、y(换道,短边)
+    # [-0.107,0.043]; z 只取板面薄层(法向穿进板内为正, 地面在z≈+0.02以下, 必须排除)。
+    curve_box_min: [-0.17, -0.11, -0.008]
+    curve_box_max: [ 0.17,  0.05,  0.005]
 
     # ---- 圆弧坐标系常数 ----
     curve_radius: 0.9306       # 与状态机 polishcurve_radius 一致
     curve_center_dz: 1.89539   # 与状态机 polishcurve_center_dz 一致
     curve_tool_offset: 0.183     # 打磨头(含沙盘)沿 tool z 伸出法兰长度(m)，2026-07-27 平贴实测 0.205；法兰目标=表面-此值×法向
-    curve_y_offset: 0.075      # max.y(约+0.075)-0.075=板宽中心，单行从中心通过
+    # 2026-08-01: 0.1 → 0.05。旧值按旧工件弧面 y 范围(-0.04~0.13)调，
+    # 新工件弧面 y 范围 [0.018, 0.128]，旧值导致打磨带整体偏低、第一道从弧面中间开始。
+    # 0.05 使三道 y≈0.118/0.078/0.038，第一道落在弧面上部（接近左上角）。
+    curve_y_offset: 0.075      # trans(1) = max.y - 此值; 地面板单行居中=板短边一半(0.15/2)
 
     # ---- 工具姿态 ----
     # false: 工具Z+跟随RANSAC工件法向；单行扫掠方向由世界竖直投影约束，避免绕法向翻转。
     # true: 仅作为诊断回退，强制工具Z+=世界X+，会忽略工件实际倾角。
     tool_align_world: false
     world_up_in_base: [-0.7431, 0.0120, 0.6691]
-
-# ---------------- 深度地面差分节点 ----------------
-depth_board_detect_node:
-  ros__parameters:
-    depth_topic: /camera/depth/image_raw
-    camera_info_topic: /camera/depth/camera_info
-    board_cloud_topic: /elite_polish/depth_board_points
-    board_info_topic: /elite_polish/depth_board_info
-    debug_mask_topic: /elite_polish/depth_board_mask
-    request_topic: /elite_polish/depth_board_request
-    show_debug_image: true
-    max_attempts: 5
-
-    # Camport C16 深度单位；若相机改发 32FC1，节点自动按米读取，不使用此倍率。
-    depth_scale: 0.00025
-    min_depth_m: 0.20
-    max_depth_m: 2.50
-    sample_stride: 4
-
-    # 地面主平面
-    ransac_iterations: 160
-    floor_distance_threshold_m: 0.004
-    floor_min_inlier_ratio: 0.45
-    floor_max_rms_m: 0.004
-
-    # 2026-08-19 现场深度实测：板面比地面高约 112.9mm，使用 90~140mm 质量门。
-    board_height_min_m: 0.090
-    board_height_max_m: 0.140
-    board_plane_threshold_m: 0.003
-    board_max_rms_m: 0.003
-    board_max_parallel_angle_deg: 8.0
-
-    # 最大矩形及真实尺寸门。当前板约 0.34m×0.15m，范围故意留有余量。
-    board_min_pixels: 2500
-    board_min_points: 1500
-    board_min_rectangularity: 0.60
-    board_length_min_m: 0.25
-    board_length_max_m: 0.45
-    board_width_min_m: 0.10
-    board_width_max_m: 0.25
-    morphology_close_px: 9
-    morphology_open_px: 3

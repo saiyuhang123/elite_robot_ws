@@ -2,7 +2,6 @@
 #define ysPCLCalcTransform_HPP
 
 #include <Eigen/Core>
-#include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -90,13 +89,6 @@ class YsPCLCalcTransform
     double dynamic_roi_z_padding = 0.003;              // z 方向回捞余量（避免捞回地面）
     bool dynamic_roi_fallback_to_fixed = true;         // cluster 失败后回退固定盒
     bool dynamic_origin_from_plane_centroid = true;    // cluster 模式用候选平面质心作为 planeFrame 原点
-    // ---- 深度地面差分 ROI（depth → cluster → fixed 三层回退的第一级）----
-    // depth_board_detect_node 从 organized 深度图拟合地面并提取矩形板面，
-    // ysCamera3DSolver 完成手眼变换后注入。非空时直接作为 targetCloud，后续
-    // 精 RANSAC + refit + 覆盖质量门不变。
-    PointCloud::Ptr depth_target_cloud;
-    bool depth_axis_from_plane_pca = true;  // 用板面长轴决定扫掠方向，支持平面内旋转
-    std::string roi_actual = "none";  // 本次实际生效的 ROI 分支: depth/cluster/fixed/none
     // 三测点盒: x/y ±5mm, z 贯通
     double plane_box_zmin = 0.45, plane_box_zmax = 0.75;
     double plane_ox = 0.590, plane_oy = -0.120;  // 原点测点
@@ -136,39 +128,9 @@ class YsPCLCalcTransform
     void getTargetCloud() {
       std::cout<<"base cloud size "<<baseCloud_->points.size()<<std::endl;
       targetCloud_->clear();
-      roi_actual = "none";
 
-      if (roi_mode == "depth") {
-        // 第一级: 地面差分得到的板面云（已经转换到 base 系）。
-        if (depth_target_cloud && depth_target_cloud->points.size() > 100) {
-          pcl::copyPointCloud(*depth_target_cloud, *targetCloud_);
-          roi_actual = "depth";
-          std::cout<<"[roi] depth mode succeeded, board target cloud size "
-                   <<targetCloud_->points.size()<<std::endl;
-          return;
-        }
-        std::cout<<"[roi] depth mode failed (no valid board cloud); try cluster fallback"<<std::endl;
-        // 第二级: cluster（要求 dynamic_coarse_box 已配置）
-        if (dynamic_coarse_box_enabled) {
-          if (getTargetCloudCluster()) {
-            roi_actual = "cluster";
-            std::cout<<"[roi] cluster fallback succeeded, dynamic target cloud size "
-                     <<targetCloud_->points.size()<<std::endl;
-            return;
-          }
-          std::cout<<"[roi] cluster fallback failed"<<std::endl;
-        } else {
-          std::cout<<"[roi] cluster fallback skipped: dynamic_coarse_box not configured"<<std::endl;
-        }
-        // 第三级: fixed
-        std::cout<<"[roi] fallback_to_fixed="
-                 <<(dynamic_roi_fallback_to_fixed ? "true" : "false")<<std::endl;
-        if (!dynamic_roi_fallback_to_fixed) {
-          return;
-        }
-      } else if (roi_mode == "cluster") {
+      if (roi_mode == "cluster") {
         if (getTargetCloudCluster()) {
-          roi_actual = "cluster";
           std::cout<<"[roi] cluster mode succeeded, dynamic target cloud size "
                    <<targetCloud_->points.size()<<std::endl;
           return;
@@ -181,7 +143,6 @@ class YsPCLCalcTransform
       }
 
       std::cout<<"[roi] using fixed target box"<<std::endl;
-      roi_actual = "fixed";
       ///---------------直通滤波
       pcl::CropBox<pcl::PointXYZ> boxFilter;
       boxFilter.setMin(target_box_min);
@@ -531,56 +492,20 @@ class YsPCLCalcTransform
         }
       }
 
-      // 默认局部轴由世界参考方向确定；depth 模式稍后可用矩形板面 PCA 长轴
-      // 覆盖 plane_x，使停车/放件产生的平面内旋转也能被跟随。
-      Eigen::Vector3f default_plane_y = up_reference;
-      default_plane_y.normalize();
-      default_plane_y -= default_plane_y.dot(normal) * normal;
-      if (default_plane_y.norm() < 1e-6f) {
+      // 平面局部坐标轴(与下方建系同一套): x=扫掠向, y=换道/竖直向, z=法向
+      Eigen::Vector3f plane_y = up_reference;
+      plane_y.normalize();
+      plane_y -= plane_y.dot(normal) * normal;
+      if (plane_y.norm() < 1e-6f) {
         std::cout<<"[plane fit] FAIL: world-up projection degenerates"<<std::endl;
         failed_ = true;
         return;
       }
-      default_plane_y.normalize();
-      Eigen::Vector3f default_plane_x = default_plane_y.cross(normal);
-      default_plane_x.normalize();
-      Eigen::Vector3f plane_x = default_plane_x;
-      Eigen::Vector3f plane_y = normal.cross(plane_x);
       plane_y.normalize();
-
-      if (roi_actual == "depth" && depth_axis_from_plane_pca
-          && fitted_plane->size() >= 100) {
-        Eigen::Vector4f pca_centroid;
-        pcl::compute3DCentroid(*fitted_plane, pca_centroid);
-        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
-        for (const auto &p : fitted_plane->points) {
-          const Eigen::Vector3f delta = p.getVector3fMap() - pca_centroid.head<3>();
-          covariance.noalias() += delta * delta.transpose();
-        }
-        covariance /= static_cast<float>(fitted_plane->size());
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig(covariance);
-        if (eig.info() == Eigen::Success) {
-          Eigen::Vector3f long_axis = eig.eigenvectors().col(2);
-          long_axis -= long_axis.dot(normal) * normal;
-          const float major = eig.eigenvalues()(2);
-          const float minor = eig.eigenvalues()(1);
-          const float axis_ratio = major / std::max(1e-9f, minor);
-          if (long_axis.norm() > 1e-6f && axis_ratio >= 1.30f) {
-            long_axis.normalize();
-            if (long_axis.dot(default_plane_x) < 0.0f) {
-              long_axis = -long_axis;
-            }
-            plane_x = long_axis;
-            plane_y = normal.cross(plane_x).normalized();
-            std::cout<<"[plane fit] depth PCA axis accepted: variance_ratio="
-                     <<axis_ratio<<" x_base=("<<plane_x.x()<<","<<plane_x.y()
-                     <<","<<plane_x.z()<<")"<<std::endl;
-          } else {
-            std::cout<<"[plane fit] depth PCA axis rejected: variance_ratio="
-                     <<axis_ratio<<"; keep configured reference"<<std::endl;
-          }
-        }
-      }
+      Eigen::Vector3f plane_x = plane_y.cross(normal);
+      plane_x.normalize();
+      plane_y = normal.cross(plane_x);
+      plane_y.normalize();
 
       // 2026-08-02 内点覆盖面校验: 内点数量够但只是一窄条(板边/棱)时角度位置都会歪,
       // 此前只查数量不查形状直接放行。用 1%/99% 分位边界抗飞点, 不足判失败宁可重拍。
@@ -619,12 +544,10 @@ class YsPCLCalcTransform
       // 拟合平面，使现有 curve_box 的局部坐标范围不因内点质心而整体漂移。
       // cluster 模式：工件可能随停车误差整体平移，原点直接取本次拟合平面质心，
       // 让 curve_box 跟着工件走（要求 curve_box 是围绕板面中心标定的）。
-      // depth/cluster 实际生效时都跟随本次板面质心；fixed 才使用旧锚点。
       Eigen::Vector3f origin_guess;
-      if ((roi_actual == "cluster" || roi_actual == "depth")
-          && dynamic_origin_from_plane_centroid) {
+      if (roi_mode == "cluster" && dynamic_origin_from_plane_centroid) {
         origin_guess = centroid4.head<3>();
-        std::cout<<"[plane fit] "<<roi_actual<<" mode: origin from fitted plane centroid=("
+        std::cout<<"[plane fit] cluster mode: origin from fitted plane centroid=("
                  <<origin_guess.x()<<","<<origin_guess.y()<<","<<origin_guess.z()<<")"<<std::endl;
       } else {
         origin_guess = Eigen::Vector3f(
