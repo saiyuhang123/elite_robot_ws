@@ -45,6 +45,7 @@ class ysAppCommand : public rclcpp::Node
                         "2: AGV GO POLISH \r\n"
                         "3: DO CAMERA VISION \r\n"
                         "4: DO FORCE POLISH \r\n"
+                        "5: CANCEL POLISH SAFELY \r\n"
                         "51: CLOSE Polish Tool \r\n"
                         "52: OPEN Polish Tool \r\n"
                         "Current Step: %d.\r\n"
@@ -71,7 +72,13 @@ class ysAppCommand : public rclcpp::Node
                     sendCmd_ = true;
                 }
             } else {
-                if (result_-100 == cmd_)
+                // 命令3是“视觉完成后继续自动打磨”的原子流程。103 只是中间
+                // 进度，不能提前重新开放输入，否则可能在接触/打磨中插入新命令。
+                const bool command_done =
+                    (cmd_ == 3 && result_ == 104)
+                    || (cmd_ != 3 && result_-100 == cmd_)
+                    || result_ == 204 || result_ == 205;
+                if (command_done)
                 {
                     sendCmd_ = true;
                 }

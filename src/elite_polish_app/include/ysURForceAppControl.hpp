@@ -92,6 +92,11 @@ namespace elite_robot {
             double maxJointSpeed() const;
             bool forceModeWatchdog(const KDL::Frame &nominal_frame);
             void logForceDiagnostics(const std::string &reason);
+            void resetPolishOutcome();
+            void markPolishFailure(const std::string &reason);
+            void abortPolishing(const std::string &reason, bool safe_retract);
+            void cancelPolishing(const std::string &reason);
+            void publishPolishResult(int32_t code, const std::string &detail);
 
             void goHome();
             void goHome_pubMoveHome();
@@ -103,6 +108,9 @@ namespace elite_robot {
             //app
             int app_cmd_;
             int sub_step_;
+            bool polish_failed_ = false;
+            bool polish_cancelled_ = false;
+            std::string polish_result_detail_;
             std::mutex ys_mutex_;
             KDL::JntArray ys_home_q_;
             KDL::JntArray ys_cameraCapture_q_;
@@ -231,6 +239,7 @@ namespace elite_robot {
             // 405 退刀须等响应+静置, 否则轨迹 goal 在 deactivate 转换期被取消(收工不退刀)。
             bool force_mode_disable_pending_ = false;
             bool force_mode_disable_done_ = false;
+            bool force_mode_disable_ok_ = true;
             std::chrono::steady_clock::time_point force_mode_disable_done_time_;
             bool polish_end_disable_sent_ = false;
             std::chrono::steady_clock::time_point polish_end_disable_start_;
@@ -246,6 +255,10 @@ namespace elite_robot {
             bool polish_tool_open_pending_ = false;
             bool polish_tool_open_done_ = false;
             bool polish_tool_open_ok_ = false;
+            bool polish_tool_close_pending_ = false;
+            bool polish_tool_close_done_ = false;
+            bool polish_tool_close_ok_ = false;
+            std::chrono::steady_clock::time_point polish_tool_close_request_start_;
             std::chrono::steady_clock::time_point polish_tool_open_request_start_;
             std::chrono::steady_clock::time_point polish_tool_spinup_start_;
             //polish data
@@ -311,7 +324,8 @@ namespace elite_robot {
             //topic and service
             //app cmd
             rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr cmd_sub_; 
-            rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_result_publisher_;  
+            rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr cmd_result_publisher_;
+            rclcpp::Publisher<std_msgs::msg::String>::SharedPtr polish_result_detail_publisher_;
             //ur
             rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr ys_jointstates_sub_;      
             rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr ys_traj_publisher_; 

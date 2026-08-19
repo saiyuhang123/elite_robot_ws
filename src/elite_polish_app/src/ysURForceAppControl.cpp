@@ -273,6 +273,8 @@ namespace elite_robot {
             cmd_sub_ = this->create_subscription<std_msgs::msg::Int32>(       
                 "/elite_forceapp_cmd", 1, std::bind(&ysURForceAppControl::subCommandStateCB, this, _1)); 
             cmd_result_publisher_ = this->create_publisher<std_msgs::msg::Int32>("/elite_forceapp_cmd_result", 1);
+            polish_result_detail_publisher_ = this->create_publisher<std_msgs::msg::String>(
+                "/elite_forceapp_result_detail", 10);
             //vision
             vision_job_publisher_ = this->create_publisher<std_msgs::msg::Int32>("/elite_vision_job_cmd", 1);
             vision_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(       
@@ -301,11 +303,79 @@ namespace elite_robot {
                 4ms, std::bind(&ysURForceAppControl::timer_callback, this));
       }
 
+      void ysURForceAppControl::resetPolishOutcome() {
+        polish_failed_ = false;
+        polish_cancelled_ = false;
+        polish_result_detail_.clear();
+      }
+
+      void ysURForceAppControl::markPolishFailure(const std::string &reason) {
+        if (polish_cancelled_) {
+          return;
+        }
+        if (polish_failed_) {
+          return;
+        }
+        polish_failed_ = true;
+        polish_result_detail_ = reason;
+        RCLCPP_ERROR(this->get_logger(), "polish result marked FAILED: %s", reason.c_str());
+      }
+
+      void ysURForceAppControl::abortPolishing(
+          const std::string &reason, bool safe_retract) {
+        markPolishFailure(reason);
+        ysPolishTool_Close();
+        disableForceMode();
+        if (safe_retract) {
+          publishCurrentPositionHold(contact_hold_time_);
+          sub_step_ = 405;
+        } else {
+          app_cmd_ = AppCommand::GO_HOME;
+          sub_step_ = 0;
+        }
+      }
+
+      void ysURForceAppControl::cancelPolishing(const std::string &reason) {
+        polish_cancelled_ = true;
+        polish_failed_ = false;
+        polish_result_detail_ = reason;
+        RCLCPP_WARN(this->get_logger(), "polish result marked CANCELED: %s", reason.c_str());
+        ysPolishTool_Close();
+        disableForceMode();
+
+        // 402 起机械臂可能已经接近/接触工件，必须走 405→406 的安全退刀；
+        // 视觉和预备阶段尚未接触，可直接回 Home2。
+        if (app_cmd_ == AppCommand::DO_CURVE_POLISHING
+            && sub_step_ >= 402 && sub_step_ <= 404) {
+          publishCurrentPositionHold(contact_hold_time_);
+          sub_step_ = 405;
+        } else if (app_cmd_ == AppCommand::DO_CURVE_POLISHING
+                   && sub_step_ >= 405 && sub_step_ <= 407) {
+          // 已在安全收尾路径上，不把步骤倒回去。
+        } else {
+          app_cmd_ = AppCommand::GO_HOME;
+          sub_step_ = 0;
+        }
+      }
+
+      void ysURForceAppControl::publishPolishResult(
+          int32_t code, const std::string &detail) {
+        std_msgs::msg::String detail_msg;
+        detail_msg.data = detail;
+        polish_result_detail_publisher_->publish(detail_msg);
+        std_msgs::msg::Int32 result_msg;
+        result_msg.data = code;
+        cmd_result_publisher_->publish(result_msg);
+        RCLCPP_INFO(this->get_logger(),
+          "pub polish result: code=%d detail=%s", code, detail.c_str());
+      }
+
       bool ysURForceAppControl::initDataQ(){
           // 示教姿态从参数加载（config/polish_params.yaml）。
           // 注意单位: home 为角度制，cameraCapture/polishBase 为弧度制（与示教来源一致）。
           auto home_deg = this->declare_parameter<std::vector<double>>(
-              "home_q_deg", {8.2, -93.6, -110.2, 57.4, 91.7, 91.6});
+              "home_q_deg", {-2.2001579333, 19.6982889966, -154.8017370884,
+                              -86.2989031026, 94.1025882723, 84.2018775724});
           ys_home_q_.resize(joint_size_);
           for (int i=0;i<joint_size_;i++){
             ys_home_q_(i) = home_deg[i]*M_PI/180;
@@ -331,8 +401,14 @@ namespace elite_robot {
         switch (cmd)
         {
         case 0:
-          app_cmd_ = AppCommand::GO_HOME;
-          sub_step_ = app_cmd_*100;
+          if (app_cmd_ == AppCommand::DO_CAMERA_VISION_JOB
+              || app_cmd_ == AppCommand::DO_CURVE_POLISHING) {
+            cancelPolishing("收到命令0，取消当前打磨并回 Home2");
+          } else {
+            resetPolishOutcome();
+            app_cmd_ = AppCommand::GO_HOME;
+            sub_step_ = app_cmd_*100;
+          }
           break;
         case 1:
           app_cmd_ = AppCommand::DO_AGV_GO_HOME;
@@ -348,14 +424,24 @@ namespace elite_robot {
           // 显示上次的elapsed、watchdog过力确认计时器残留致一过线即瞬间停摆。
           disableForceMode();
           resetForceContactState();
+          resetPolishOutcome();
           app_cmd_ = AppCommand::DO_CAMERA_VISION_JOB;
           sub_step_ = app_cmd_*100;
           break;
         case 4:
           disableForceMode();
           resetForceContactState();
+          resetPolishOutcome();
           app_cmd_ = AppCommand::DO_CURVE_POLISHING;
           sub_step_ = app_cmd_*100;
+          break;
+        case 5:
+          if (app_cmd_ == AppCommand::DO_CAMERA_VISION_JOB
+              || app_cmd_ == AppCommand::DO_CURVE_POLISHING) {
+            cancelPolishing("收到命令5，安全取消打磨");
+          } else {
+            RCLCPP_WARN(this->get_logger(), "cancel ignored: no polishing job active");
+          }
           break;
         case 51:
           ysPolishTool_Close();
@@ -454,8 +540,13 @@ namespace elite_robot {
         std::string id=result.header.frame_id;
         if (id=="failed")
         {
-          app_cmd_ = AppCommand::GO_HOME;
-          sub_step_ = app_cmd_*100;
+          if (app_cmd_ == AppCommand::DO_CAMERA_VISION_JOB && sub_step_ == 303) {
+            abortPolishing("深度视觉定位失败", false);
+          } else {
+            RCLCPP_WARN(this->get_logger(),
+              "ignored stale vision failure (app_cmd_=%d, sub_step_=%d)",
+              app_cmd_, sub_step_);
+          }
           return;
         }
         
@@ -933,8 +1024,7 @@ namespace elite_robot {
               ys_polishBase_q_(0)*180/M_PI, ys_polishBase_q_(1)*180/M_PI, ys_polishBase_q_(2)*180/M_PI, ys_polishBase_q_(3)*180/M_PI, ys_polishBase_q_(4)*180/M_PI, ys_polishBase_q_(5)*180/M_PI);
             RCLCPP_ERROR(this->get_logger()," ik resultJnt,    %f, %f, %f, %f, %f, %f",
               ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
-            app_cmd_ = AppCommand::NOTHING;
-            sub_step_ = 9999;
+            abortPolishing("打磨预备目标 IK 不可达或发生跳支", false);
             return;
           }
           RCLCPP_INFO(this->get_logger()," polish start up target, %f, %f, %f, %f, %f, %f", 
@@ -996,6 +1086,9 @@ namespace elite_robot {
         polish_tool_open_pending_ = false;
         polish_tool_open_done_ = false;
         polish_tool_open_ok_ = false;
+        polish_tool_close_pending_ = false;
+        polish_tool_close_done_ = false;
+        polish_tool_close_ok_ = false;
         debug_approach_started_ = false;
         control_dt_index_ = 0;
         // 每次新打磨命令必须从轨迹起点开始，否则上次中断残留的步进索引
@@ -1063,8 +1156,7 @@ namespace elite_robot {
         const int rc = ys_tcp_tracik_solver_->CartToJnt(ys_polishBase_q_, upFrame, targetJnt);
         if (rc != 1) {
           RCLCPP_ERROR(this->get_logger(), "polish start-up IK failed while waiting; polish aborted");
-          app_cmd_ = AppCommand::NOTHING;
-          sub_step_ = 9999;
+          abortPolishing("等待打磨预备位时 IK 求解失败", false);
           return;
         }
 
@@ -1202,6 +1294,7 @@ namespace elite_robot {
           // 没有活动力控: 无可等待的切换, 直接置完成(405 的静置计时从当前起算)
           force_mode_disable_pending_ = false;
           force_mode_disable_done_ = true;
+          force_mode_disable_ok_ = true;
           force_mode_disable_done_time_ = std::chrono::steady_clock::now();
           return true;
         }
@@ -1213,6 +1306,7 @@ namespace elite_robot {
           // 服务不可用(驱动重启等)时直接清状态，不阻塞退刀
           force_mode_disable_pending_ = false;
           force_mode_disable_done_ = true;
+          force_mode_disable_ok_ = false;
           force_mode_disable_done_time_ = std::chrono::steady_clock::now();
           return false;
         }
@@ -1222,14 +1316,21 @@ namespace elite_robot {
         // 并静置, 让驱动侧控制器完成 deactivate/activate 切换后再发轨迹。
         force_mode_disable_pending_ = true;
         force_mode_disable_done_ = false;
+        force_mode_disable_ok_ = false;
         force_mode_client_->async_send_request(req,
           [this](rclcpp::Client<eli_common_interface::srv::ForceMode>::SharedFuture future) {
             if (!force_mode_disable_pending_) {
               return;
             }
             try {
-              future.get();
+              auto res = future.get();
+              force_mode_disable_ok_ = res->success;
+              if (!res->success) {
+                RCLCPP_ERROR(this->get_logger(),
+                  "disable force mode failed: %s", res->message.c_str());
+              }
             } catch (const std::exception &e) {
+              force_mode_disable_ok_ = false;
               RCLCPP_WARN(this->get_logger(), "force mode disable response error: %s", e.what());
             }
             force_mode_disable_pending_ = false;
@@ -1252,8 +1353,7 @@ namespace elite_robot {
               int rc = ys_tcp_tracik_solver_->CartToJnt(ys_cur_q_, startPos, targetJnt);
               if (rc != 1) {
                 RCLCPP_ERROR(this->get_logger(),"DEBUG approach IK failed (rc=%d), abort", rc);
-                app_cmd_ = AppCommand::NOTHING;
-                sub_step_ = 9999;
+                abortPolishing("空跑接近目标 IK 求解失败", false);
                 return;
               }
               trajectory_msgs::msg::JointTrajectory traj;
@@ -1287,15 +1387,14 @@ namespace elite_robot {
               auto elapsed = std::chrono::steady_clock::now() - force_mode_enable_start_;
               if (elapsed > std::chrono::seconds(3)) {
                 RCLCPP_ERROR(this->get_logger(), "enable force mode: response timeout, polish aborted");
-                disableForceMode();
-                sub_step_ = 405;
+                abortPolishing("启用力控服务响应超时", true);
               }
               return;
             }
             force_mode_enable_pending_ = false;
             if (!force_mode_enable_ok_) {
               RCLCPP_ERROR(this->get_logger(), "enable force mode failed, polish aborted");
-              sub_step_ = 405;
+              abortPolishing("启用力控失败", true);
               return;
             }
             force_mode_enabled_ = true;
@@ -1328,9 +1427,7 @@ namespace elite_robot {
             if (relative_fz <= force_mode_abort_fz_) {
               RCLCPP_ERROR(this->get_logger(),
                 "force-mode verification: excessive force %.3f N; aborting before polish", relative_fz);
-              disableForceMode();
-              publishCurrentPositionHold(contact_hold_time_);
-              sub_step_ = 405;
+              abortPolishing("力控建立前检测到过力", true);
               return;
             }
 
@@ -1367,9 +1464,7 @@ namespace elite_robot {
                 "force-mode verification timeout: relative_fz=%.3f expected=%.3f +/- %.3f; "
                 "aborting before tangential motion",
                 relative_fz, expected_reaction_fz, force_mode_verify_tolerance_);
-              disableForceMode();
-              publishCurrentPositionHold(contact_hold_time_);
-              sub_step_ = 405;
+              abortPolishing("力控在规定时间内未稳定", true);
             }
             return;
           }
@@ -1473,7 +1568,7 @@ namespace elite_robot {
               sendEnableForceModeRequest();
               if (!force_mode_enable_pending_) {
                 RCLCPP_ERROR(this->get_logger(), "failed to send force mode command; polish aborted");
-                sub_step_ = 405;
+                abortPolishing("力控命令发送失败", true);
               }
               return;
             }
@@ -1496,8 +1591,7 @@ namespace elite_robot {
             RCLCPP_ERROR(this->get_logger(),
               "contact search watchdog: travel=%.4fm (limit %.4f), time=%.2fs (limit %.2f); polish aborted",
               approach_travel, contact_max_travel_, approach_elapsed, contact_timeout_);
-            app_cmd_ = AppCommand::NOTHING;
-            sub_step_ = 9999;
+            abortPolishing("接触搜索超过最大行程或超时", true);
             return;
           }
 
@@ -1602,8 +1696,7 @@ namespace elite_robot {
               RCLCPP_ERROR(this->get_logger(),
                 "contact endpoint IK failed for %d consecutive cycles; polish aborted",
                 contact_ik_failure_count_);
-              app_cmd_ = AppCommand::NOTHING;
-              sub_step_ = 9999;
+              abortPolishing("接触搜索连续 IK 求解失败", true);
             }
             return;
           }
@@ -1650,16 +1743,14 @@ namespace elite_robot {
               RCLCPP_ERROR(this->get_logger(),
                 "Polish tool open response timeout after %.2fs; polishing aborted", wait_elapsed);
               polish_tool_open_pending_ = false;
-              disableForceMode();
-              sub_step_ = 405;
+              abortPolishing("打开打磨头 IO 响应超时", true);
             }
             return;
           }
 
           if (!polish_tool_open_ok_) {
             RCLCPP_ERROR(this->get_logger(), "Polish tool failed to open; polishing aborted");
-            disableForceMode();
-            sub_step_ = 405;
+            abortPolishing("打开打磨头 IO 失败", true);
             return;
           }
 
@@ -1686,7 +1777,9 @@ namespace elite_robot {
           if (!polish_end_disable_sent_) {
             ysPolishTool_Close();
             // 退刀前关闭力控，406 抬刀回到纯位置控制
-            disableForceMode();
+            if (!disableForceMode()) {
+              markPolishFailure("退出力控服务不可用");
+            }
             polish_end_disable_sent_ = true;
             polish_end_disable_start_ = now;
             RCLCPP_INFO(this->get_logger(),
@@ -1701,11 +1794,26 @@ namespace elite_robot {
             ? std::chrono::duration<double>(now - force_mode_disable_done_time_).count()
             : 0.0;
           const double total = std::chrono::duration<double>(now - polish_end_disable_start_).count();
-          if ((force_mode_disable_done_ && settle >= retract_disable_settle_time_)
-              || total >= 5.0) {
+          const double close_total = std::chrono::duration<double>(
+            now - polish_tool_close_request_start_).count();
+          const bool close_ready = polish_tool_close_done_
+            || close_total >= polish_tool_io_timeout_;
+          const bool force_ready = (force_mode_disable_done_
+              && settle >= retract_disable_settle_time_) || total >= 5.0;
+          if (close_ready && force_ready) {
+            if (!polish_tool_close_done_) {
+              polish_tool_close_pending_ = false;
+              markPolishFailure("关闭打磨头 IO 响应超时");
+            } else if (!polish_tool_close_ok_) {
+              markPolishFailure("关闭打磨头 IO 失败");
+            }
             if (!force_mode_disable_done_) {
+              force_mode_disable_pending_ = false;
+              markPolishFailure("退出力控响应超时");
               RCLCPP_WARN(this->get_logger(),
                 "force-mode disable response timeout after %.1fs; retracting anyway", total);
+            } else if (!force_mode_disable_ok_) {
+              markPolishFailure("退出力控失败");
             }
             polish_end_disable_sent_ = false;
             RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
@@ -1759,9 +1867,11 @@ namespace elite_robot {
                 RCLCPP_FATAL(this->get_logger()," ys_resultJnt  target, %f, %f, %f, %f, %f, %f", 
                   ys_resultJnt(0)*180/M_PI, ys_resultJnt(1)*180/M_PI, ys_resultJnt(2)*180/M_PI, ys_resultJnt(3)*180/M_PI, ys_resultJnt(4)*180/M_PI, ys_resultJnt(5)*180/M_PI);
                 ys_resultJnt = lastQ;
+                markPolishFailure("安全退刀轨迹 IK 跳支");
               }
             } else {
               RCLCPP_INFO(this->get_logger()," back polish end up target %d, trac ik failed", i+1);
+              markPolishFailure("安全退刀轨迹 IK 求解失败");
             }
             //polish end up point
             trajectory_msgs::msg::JointTrajectoryPoint tmpPt;
@@ -1801,14 +1911,16 @@ namespace elite_robot {
         ) {
           RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
           sub_step_ = 9999;
-          std_msgs::msg::Int32 msg;
-          msg.data = 104;//100+ polish done
-          cmd_result_publisher_->publish(msg);
+          const int32_t result_code = polish_cancelled_ ? 205
+            : (polish_failed_ ? 204 : 104);
+          const std::string detail = !polish_result_detail_.empty()
+            ? polish_result_detail_
+            : (result_code == 104 ? "打磨成功并已回 Home2"
+                                  : "打磨安全收尾并已回 Home2");
+          publishPolishResult(result_code, detail);
           app_cmd_ = AppCommand::NOTHING;
           // app_cmd_ = AppCommand::DO_AGV_GO_HOME;  // Elite: no AGV
           sub_step_ = app_cmd_*100;
-          RCLCPP_INFO(this->get_logger(),
-              "pub the result of command: %d. ", msg.data);
         }
       }
 
@@ -1878,9 +1990,7 @@ namespace elite_robot {
                 "(limit %.3f N, avg=%.3f N)",
                 relative_fz, hard_for, force_mode_hard_abort_fz_, relative_fz_avg);
               logForceDiagnostics("hard_overforce");
-              disableForceMode();
-              publishCurrentPositionHold(contact_hold_time_);
-              sub_step_ = 405;
+              abortPolishing("持续瞬时硬过力", true);
               return false;
             }
           }
@@ -1906,9 +2016,7 @@ namespace elite_robot {
                 "(limit %.3f N, inst=%.3f N)",
                 relative_fz_avg, overforce_for, force_mode_abort_fz_, relative_fz);
               logForceDiagnostics("averaged_overforce");
-              disableForceMode();
-              publishCurrentPositionHold(contact_hold_time_);
-              sub_step_ = 405;
+              abortPolishing("持续平均过力", true);
               return false;
             }
           }
@@ -1941,9 +2049,7 @@ namespace elite_robot {
                 "(limit %.3f N, inst=%.3f N)",
                 lateral_f_avg, overforce_for, force_mode_abort_lateral_f_, lateral_f_inst);
               logForceDiagnostics("lateral_overforce");
-              disableForceMode();
-              publishCurrentPositionHold(contact_hold_time_);
-              sub_step_ = 405;
+              abortPolishing("持续侧向过力", true);
               return false;
             }
           }
@@ -1960,9 +2066,7 @@ namespace elite_robot {
               "force-mode watchdog: contact lost for %.2fs (relative_fz=%.3f N)",
               lost_for, relative_fz);
             logForceDiagnostics("contact_lost");
-            disableForceMode();
-            publishCurrentPositionHold(contact_hold_time_);
-            sub_step_ = 405;
+            abortPolishing("打磨过程中持续失去接触", true);
             return false;
           }
         }
@@ -1993,9 +2097,7 @@ namespace elite_robot {
             "force-mode watchdog: axial deviation %.4fm exceeds %.4fm (relative_fz=%.3f N)",
             axial_error, force_mode_max_axial_deviation_, relative_fz);
           logForceDiagnostics("axial_deviation");
-          disableForceMode();
-          publishCurrentPositionHold(contact_hold_time_);
-          sub_step_ = 405;
+          abortPolishing("力控轴向偏差超过上限", true);
           return false;
         }
         return true;
@@ -2111,6 +2213,7 @@ namespace elite_robot {
                 ys_resultJnt = lastQ;
                 // polish break
                 RCLCPP_INFO(this->get_logger()," polish job break");
+                markPolishFailure("打磨轨迹 IK 跳支");
                 RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
                 sub_step_++;
                 disableForceMode();
@@ -2131,6 +2234,8 @@ namespace elite_robot {
               lastQ = ys_resultJnt;
             } else {
               RCLCPP_FATAL(this->get_logger()," curve polish target %d, trac ik failed", i+1);
+              abortPolishing("打磨轨迹 IK 求解失败", true);
+              return;
             }
             //traj point
             trajectory_msgs::msg::JointTrajectoryPoint tmpPt;
@@ -2175,9 +2280,7 @@ namespace elite_robot {
                 "force-mode watchdog: feed gate stuck for %.1fs (fz_avg=%.2f N); aborting",
                 feed_gate_timeout_, fz_avg_gate);
               logForceDiagnostics("feed_gate_timeout");
-              disableForceMode();
-              publishCurrentPositionHold(contact_hold_time_);
-              sub_step_ = 405;
+              abortPolishing("过力进给门控持续超时", true);
               return;
             }
           } else {
@@ -2279,12 +2382,21 @@ namespace elite_robot {
         ) {
           RCLCPP_INFO(this->get_logger(), "sub step done: %d. ", sub_step_);
           sub_step_ = 9999;
-          std_msgs::msg::Int32 msg;
-          msg.data = 100;//go home done
-          cmd_result_publisher_->publish(msg);
+          const int32_t result_code = polish_cancelled_ ? 205
+            : (polish_failed_ ? 204 : 100);
+          if (result_code == 100) {
+            std_msgs::msg::Int32 msg;
+            msg.data = result_code;
+            cmd_result_publisher_->publish(msg);
+            RCLCPP_INFO(this->get_logger(),
+                "pub the result of command: %d. ", msg.data);
+          } else {
+            publishPolishResult(
+              result_code,
+              polish_result_detail_.empty()
+                ? "打磨安全中止并已回 Home2" : polish_result_detail_);
+          }
           app_cmd_ = AppCommand::NOTHING;
-          RCLCPP_INFO(this->get_logger(),
-              "pub the result of command: %d. ", msg.data);
         }
       }
 
@@ -2332,26 +2444,40 @@ namespace elite_robot {
         polish_tool_open_pending_ = false;
         polish_tool_open_done_ = false;
         polish_tool_open_ok_ = false;
+        polish_tool_close_pending_ = false;
+        polish_tool_close_done_ = false;
+        polish_tool_close_ok_ = false;
+        polish_tool_close_request_start_ = std::chrono::steady_clock::now();
         if (!polish_tool_io_client_ || !polish_tool_io_client_->service_is_ready()) {
           RCLCPP_ERROR(this->get_logger(), "SetIO service not available for tool close");
+          polish_tool_close_done_ = true;
           return;
         }
         auto req = std::make_shared<eli_common_interface::srv::SetIO::Request>();
         req->fun = eli_common_interface::srv::SetIO::Request::FUN_SET_CONFIGURE_OUT;  // fun=2
         req->pin = 7;
         req->state = eli_common_interface::srv::SetIO::Request::STATE_OFF;
+        polish_tool_close_pending_ = true;
         polish_tool_io_client_->async_send_request(
           req,
           [this](rclcpp::Client<eli_common_interface::srv::SetIO>::SharedFuture future) {
+            if (!polish_tool_close_pending_) {
+              RCLCPP_WARN(this->get_logger(), "Ignoring stale polish tool close response");
+              return;
+            }
             try {
-              if (future.get()->success) {
+              polish_tool_close_ok_ = future.get()->success;
+              if (polish_tool_close_ok_) {
                 RCLCPP_INFO(this->get_logger(), "Polish tool close confirmed: fun=2 pin=7 state=false");
               } else {
                 RCLCPP_ERROR(this->get_logger(), "Polish tool close rejected by SetIO service");
               }
             } catch (const std::exception & e) {
+              polish_tool_close_ok_ = false;
               RCLCPP_ERROR(this->get_logger(), "Polish tool close SetIO exception: %s", e.what());
             }
+            polish_tool_close_pending_ = false;
+            polish_tool_close_done_ = true;
           });
         RCLCPP_INFO(this->get_logger(), "Polish tool close command sent: fun=2 pin=7 state=false");
       }
