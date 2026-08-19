@@ -99,7 +99,9 @@ ysURForceAppControl:
     force_mode_abort_lateral_f: 35.0 # 20帧平均侧向合力相对值sqrt((fx-fx0)^2+(fy-fy0)^2)的阈值(N);
                                      # 按实测侧向拖拽保护阈值调整为35N
     force_mode_lateral_abort_confirm_time: 0.12 # 侧向过力需持续多久才退出(s)
-    force_mode_min_contact_fz: -0.08 # 高于此值视为失去接触(N); 2026-08-02 -0.15→-0.08: 工作压力降至-0.3N附近, 原值会误判脱接触
+    # 用户现场确认脱离工件不会造成事故；放宽到 +3N，避免轻载/悬空时误停。
+    # 判定仍为 relative_fz > 3N 持续超时才视为脱离。
+    force_mode_min_contact_fz: 3.0
     force_mode_contact_loss_timeout: 2.0  # 连续失去接触多久后退出(s)
     polish_tool_spinup_time: 1.0     # IO开启确认后原地稳压，期间不走切向轨迹(s)
     polish_tool_io_timeout: 2.0      # 等待打磨头SetIO开启响应的超时(s)
