@@ -113,8 +113,8 @@ FORCE_THRESHOLD = 2.0       # 硬保护阈值（N，力变化模长），任何�
 FORCE_PROJ_THRESHOLD = 5.0   # 软接触阈值（N，下压方向投影）
 FORCE_PROJ_HITS = 3          # 投影连续超阈值次数，滤毛刺
 FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
-FORCE_DIVE_OVERSHOOT = 0.07   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
-                                  # 下探总行程 = FORCE_APPROACH_H + 本值 = 0.10m (10cm)
+FORCE_DIVE_OVERSHOOT = 0.12   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
+                                  # 下探总行程 = FORCE_APPROACH_H + 本值 = 0.15m (15cm)
 FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
 FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
 FORCE_APPROACH_THRESHOLD = 20.0   # 快速接近段力保护阈值（N）：movej 加减速惯性
