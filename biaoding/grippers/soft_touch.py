@@ -56,13 +56,15 @@ class SoftTouchGripper(GripperBase):
         self._cmd_lock = threading.RLock()
 
         # 长驻 rclpy client：创建一次，后续所有命令复用。
-        # srv 类型在这里按需导入，避免未构建 gripper_control 时
-        # 影响二指/灵巧手等其他末端模式的 import。
+        # srv 类型在这里按需导入并保存到实例，避免未构建 gripper_control 时
+        # 影响二指/灵巧手等其他末端模式的 import，同时保证 _request() 可用。
         self._gripper_cli = None
+        self._srv_type = None
         try:
             from gripper_control.srv import GripperCommand
+            self._srv_type = GripperCommand
             self._gripper_cli = robot_node.create_client(
-                GripperCommand, '/gripper_command')
+                self._srv_type, '/gripper_command')
         except Exception as exc:
             self._node.get_logger().error(
                 f'[{self.name}] /gripper_command 客户端创建失败: {exc}')
@@ -130,8 +132,12 @@ class SoftTouchGripper(GripperBase):
         """向 /gripper_command 发送一次请求，返回 Response 或 None。"""
         if not self._wait_service_ready():
             return None
+        if self._srv_type is None:
+            self._node.get_logger().error(
+                f'[{self.name}] GripperCommand 类型未初始化')
+            return None
 
-        req = GripperCommand.Request()
+        req = self._srv_type.Request()
         req.command = command
         req.value = value
         req.slave_id = slave_id
