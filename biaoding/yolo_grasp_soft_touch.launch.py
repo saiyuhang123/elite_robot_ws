@@ -26,7 +26,7 @@ YOLO 视觉抓取一体化 Launch 文件（柔触三指气动夹爪版）。
 
   夹爪控制器地址不同时：
   ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp_soft_touch.launch.py \
-      device_ip:=192.168.1.194 device_port:=502
+      gripper_device_ip:=192.168.1.194 gripper_device_port:=502
 
 远程控制（无需终端交互，服务与二指版完全一致）：
   # 触发抓取（单机调试：抓完自动松开）
@@ -57,8 +57,8 @@ YOLO 视觉抓取一体化 Launch 文件（柔触三指气动夹爪版）。
   run_camera       启动 Percipio 相机（默认 true）
   run_grasp_main   自动启动抓取主程序 yolo_grasp.py --gripper soft_touch（默认 true）
   grasp_headless   抓取主程序无交互（默认 false；全程调度建议 true）
-  device_ip        柔触夹爪控制器 Modbus TCP 地址（默认 192.168.1.194）
-  device_port      柔触夹爪控制器 Modbus TCP 端口（默认 502）
+  gripper_device_ip   柔触夹爪控制器 Modbus TCP 地址（默认 192.168.1.194）
+  gripper_device_port 柔触夹爪控制器 Modbus TCP 端口（默认 502）
 """
 
 import os
@@ -122,12 +122,12 @@ def generate_launch_description():
             description="抓取主程序无交互（全程调度建议 true）",
         ),
         DeclareLaunchArgument(
-            "device_ip",
+            "gripper_device_ip",
             default_value="192.168.1.194",
             description="柔触夹爪控制器 Modbus TCP 地址",
         ),
         DeclareLaunchArgument(
-            "device_port",
+            "gripper_device_port",
             default_value="502",
             description="柔触夹爪控制器 Modbus TCP 端口",
         ),
@@ -140,8 +140,8 @@ def generate_launch_description():
     run_camera = LaunchConfiguration("run_camera")
     run_grasp_main = LaunchConfiguration("run_grasp_main")
     grasp_headless = LaunchConfiguration("grasp_headless")
-    device_ip = LaunchConfiguration("device_ip")
-    device_port = LaunchConfiguration("device_port")
+    gripper_device_ip = LaunchConfiguration("gripper_device_ip")
+    gripper_device_port = LaunchConfiguration("gripper_device_port")
 
     # ============================================================
     # 1. 机械臂驱动（无头模式）
@@ -175,6 +175,8 @@ def generate_launch_description():
             ]
         ),
         launch_arguments={
+            # 必须显式保持为空，让驱动自动发现相机。不能与夹爪 IP 共用参数名。
+            "device_ip": "",
             "color_resolution": "1280x960",
             "depth_resolution": "1280x960",
         }.items(),
@@ -193,9 +195,9 @@ def generate_launch_description():
             "bash", "-c",
             [TextSubstitution(text="ros2 launch gripper_control "
                                    "soft_touch.launch.py device_ip:="),
-             device_ip,
+             gripper_device_ip,
              TextSubstitution(text=" device_port:="),
-             device_port,
+             gripper_device_port,
              TextSubstitution(text="; exec bash")],
         ],
         output="screen",

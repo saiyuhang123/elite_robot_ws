@@ -128,7 +128,7 @@ python3 yolo_grasp.py
 
 ---
 
-柔触
+## 柔触
 source /opt/ros/humble/setup.bash
 source ~/Documents/elite_robot_ws/install/setup.bash
 
