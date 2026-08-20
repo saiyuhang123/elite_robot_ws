@@ -12,7 +12,7 @@ ros2 run gripper_control gripper_server
 ros2 run gripper_control gripper_server --ros-args \
   -p device_ip:=192.168.2.100 \
   -p device_port:=502 \
-  -p poll_rate_hz:=10.0
+  -p poll_rate_hz:=5.0
 ```
 
 ## 服务调用 — 写操作

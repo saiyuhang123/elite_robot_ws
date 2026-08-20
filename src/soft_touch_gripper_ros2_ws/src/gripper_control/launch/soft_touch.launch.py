@@ -20,8 +20,8 @@ def generate_launch_description():
     )
     poll_rate_hz = DeclareLaunchArgument(
         "poll_rate_hz",
-        default_value="10.0",
-        description="气压反馈轮询频率",
+        default_value="5.0",
+        description="气压反馈轮询频率（降低默认值，减少与 /gripper_command 服务争抢执行线程）",
     )
 
     node = Node(

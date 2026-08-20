@@ -358,16 +358,25 @@ class YoloGrasp:
 
     def _srv_open(self, request, response):
         self.robot.get_logger().info('[服务] 收到张开指令')
-        self.gripper.open()
-        response.success = True
-        response.message = '已张开'
+        result = self.gripper.open()
+        # result is False 表示夹爪明确返回失败；None 表示该夹爪无确认机制。
+        if result is False:
+            response.success = False
+            response.message = '夹爪张开失败（柔触可能未确认松气）'
+        else:
+            response.success = True
+            response.message = '已张开'
         return response
 
     def _srv_close(self, request, response):
         self.robot.get_logger().info('[服务] 收到闭合指令')
-        self.gripper.close()
-        response.success = True
-        response.message = '已闭合'
+        result = self.gripper.close()
+        if result is False:
+            response.success = False
+            response.message = '夹爪闭合失败'
+        else:
+            response.success = True
+            response.message = '已闭合'
         return response
 
     def _srv_home(self, request, response):
@@ -542,7 +551,14 @@ class YoloGrasp:
         一小段卸力。防止收拢时挤压物体导致力控报警。返回累计上抬量（米）；
         柔触实际正压未达到设定值时返回 None，且不执行任何上抬。"""
         base = self._force_baseline(0.3)
-        self.gripper.close()
+        if self.gripper.name == 'soft_touch':
+            # 柔触 close() 现在返回真实 ack 结果；失败时保持当前位姿，
+            # 不进入压力等待，也不允许任何上抬。
+            if not self.gripper.close():
+                print("   !! 柔触闭合命令失败，保持当前位姿")
+                return None
+        else:
+            self.gripper.close()
         lifted = 0.0
         if self.gripper.name == 'soft_touch':
             lower = (self.gripper.pressure_limit
@@ -1105,7 +1121,10 @@ class YoloGrasp:
         # 抓取成功且已归位后，按调用方式决定是否松开机械手
         if ok and (release_after ):  #or self.gripper.name == 'linkerhand'
             print("   [归位] 抓取成功，松开机械手...")
-            self.gripper.open()
+            open_result = self.gripper.open()
+            if open_result is False:
+                print("   !! 归位后松开机械手失败，物体可能仍被夹持")
+                return False, "归位后松开机械手失败"
         elif ok:
             print("   [归位] 抓取成功，保持夹持（等待 place 放下）")
 
@@ -1268,7 +1287,9 @@ class YoloGrasp:
 
             # 3. 张开，movej 到预抓取点
             print(f"4. 张开 [{gripper.name}]，movej 到预抓取点...")
-            gripper.open()
+            if gripper.open() is False:
+                print("   !! 夹爪张开失败，放弃")
+                return False, "夹爪张开失败"
             time.sleep(0.5)
             self.send_movej(joint_target)
             if not self.wait_motion_done():
@@ -1481,7 +1502,9 @@ class YoloGrasp:
 
         # 1. 张开，movej 到侧后方预抓取点
         print("1. 张开，movej 到预抓取点...")
-        gripper.open()
+        if gripper.open() is False:
+            print("   !! 夹爪张开失败，放弃")
+            return False, "夹爪张开失败"
         time.sleep(0.5)
         self.send_movej(joint_target)
         if not self.wait_motion_done():
@@ -1496,7 +1519,9 @@ class YoloGrasp:
 
         # 3. 闭合（无桌面，直接握紧即可）
         print(f"3. 闭合 [{gripper.name}]...")
-        gripper.close()
+        if gripper.close() is False:
+            print("   !! 夹爪闭合失败")
+            return False, "夹爪闭合失败"
         time.sleep(gripper.close_delay)
 
         # 4. 摘取：movel 下拉拽断果柄（已注释：不需要下拉动作）
@@ -1562,7 +1587,9 @@ class YoloGrasp:
 
         # 2. 张手放下
         print(f"2. 张开 [{self.gripper.name}] 放下物体...")
-        self.gripper.open()
+        if self.gripper.open() is False:
+            print("   !! 张开失败，禁止回 Home2（物体可能仍被夹持）")
+            return False, "张开放置失败，禁止回 Home2（物体可能仍被夹持）"
         time.sleep(self.gripper.close_delay)
 
         # 3. 退回 Home2 收拢位姿（底盘导航期间的安全姿态）
@@ -1613,11 +1640,29 @@ def main():
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
-    # 初始化夹爪：先等服务上线（USB 串口可能启动较慢），再清故障
-    if not g.gripper.wait_ready(timeout=30.0):
-        print("错误：夹爪控制通道未就绪（超过 30s），请检查 Gripper_control_node / 串口")
+    # 初始化夹爪：先等服务上线（USB 串口可能启动较慢），再清故障。
+    # 柔触控制通道是后续抓取/放置的安全前提：初始化失败时直接退出，
+    # 避免创建出一套“机械臂在线、但柔触没配置”的半初始化服务。
+    # 柔触给更长初始化窗口：导航/定位同时启动时 CPU 峰值会拉长服务发现时间。
+    gripper_wait_timeout = 45.0 if g.gripper.name == 'soft_touch' else 30.0
+    gripper_ready = g.gripper.wait_ready(timeout=gripper_wait_timeout)
+    if not gripper_ready:
+        print(f"错误：夹爪控制通道未就绪（超过 {gripper_wait_timeout:.0f}s），"
+              "请检查 Gripper_control_node / 串口")
+        if g.gripper.name == 'soft_touch':
+            print("柔触控制通道未就绪，yolo_grasp 退出（fail-fast）")
+            executor.shutdown()
+            g.robot.destroy_node()
+            rclpy.shutdown()
+            return
     else:
-        g.gripper.setup()
+        setup_result = g.gripper.setup()
+        if setup_result is False:
+            print("错误：夹爪初始化失败（例如柔触压力参数下发失败），yolo_grasp 退出")
+            executor.shutdown()
+            g.robot.destroy_node()
+            rclpy.shutdown()
+            return
 
     # 同步检测类别给臂上 YOLO 感知（默认 apple；二指抓瓶用 bottle）
     g.set_target_class(args.target_class)
@@ -1656,11 +1701,11 @@ def main():
                         ok, msg = g.grasp()
                         print(f"  结果: {'成功' if ok else '失败'} - {msg}")
                     elif cmd == 'o':
-                        g.gripper.open()
-                        print("  已张开")
+                        open_ok = g.gripper.open()
+                        print("  已张开" if open_ok is not False else "  张开失败")
                     elif cmd == 'c':
-                        g.gripper.close()
-                        print("  已闭合")
+                        close_ok = g.gripper.close()
+                        print("  已闭合" if close_ok is not False else "  闭合失败")
                     elif cmd == 'p':
                         if g.latest_target is None:
                             print("  无目标")

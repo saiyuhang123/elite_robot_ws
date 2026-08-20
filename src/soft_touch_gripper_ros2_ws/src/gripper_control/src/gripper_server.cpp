@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -37,6 +38,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include "rclcpp/callback_group.hpp"
+#include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -87,17 +90,23 @@ public:
   }
 
   bool connectServer(const std::string& ip, uint16_t port) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
+    if (sockfd_ != INVALID_SOCKET) {
+      return true;
+    }
+
     sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd_ == INVALID_SOCKET) {
       RCLCPP_ERROR(rclcpp::get_logger("modbus"), "创建socket失败");
       return false;
     }
 
-    // 设置接收超时 500ms
+    // 设置收/发超时 500ms，避免设备异常时阻塞调用线程
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 500000;
     setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sockfd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
@@ -107,6 +116,8 @@ public:
     if (connect(sockfd_, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
       RCLCPP_ERROR(rclcpp::get_logger("modbus"),
         "连接服务器失败: %s:%d", ip.c_str(), port);
+      close(sockfd_);
+      sockfd_ = INVALID_SOCKET;
       return false;
     }
     RCLCPP_INFO(rclcpp::get_logger("modbus"),
@@ -115,6 +126,7 @@ public:
   }
 
   void disconnect() {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (sockfd_ != INVALID_SOCKET) {
       close(sockfd_);
       sockfd_ = INVALID_SOCKET;
@@ -122,6 +134,7 @@ public:
   }
 
   bool isConnected() const {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     return sockfd_ != INVALID_SOCKET;
   }
 
@@ -293,6 +306,7 @@ public:
 
 private:
   sock_t sockfd_;
+  mutable std::recursive_mutex io_mutex_;  // Modbus socket 并发访问保护
 
   std::vector<uint8_t> buildHeader(uint16_t length) {
     std::vector<uint8_t> header;
@@ -312,6 +326,7 @@ private:
 
   bool sendAndRecv(const std::vector<uint8_t>& frame,
                    std::vector<uint8_t>* response) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (sockfd_ == INVALID_SOCKET) {
       RCLCPP_ERROR(rclcpp::get_logger("modbus"), "未连接服务器");
       return false;
@@ -346,7 +361,8 @@ private:
       snprintf(tmp, sizeof(tmp), "%02X ", b);
       oss << tmp;
     }
-    RCLCPP_INFO(rclcpp::get_logger("modbus"), "%s", oss.str().c_str());
+    // 气压轮询逐帧 INFO 会刷屏并占 CPU；需要排查 Modbus 时再开 debug 日志。
+    RCLCPP_DEBUG(rclcpp::get_logger("modbus"), "%s", oss.str().c_str());
   }
 };
 
@@ -358,7 +374,7 @@ public:
   GripperServer() : Node("gripper_server") {
     this->declare_parameter<std::string>("device_ip", "192.168.1.194");
     this->declare_parameter<int>("device_port", 502);
-    this->declare_parameter<double>("poll_rate_hz", 10.0);
+    this->declare_parameter<double>("poll_rate_hz", 5.0);
 
     std::string ip = this->get_parameter("device_ip").as_string();
     int port = this->get_parameter("device_port").as_int();
@@ -369,11 +385,20 @@ public:
         "启动时无法连接设备 %s:%d, 将在服务调用时自动重连", ip.c_str(), port);
     }
 
+    // 服务与气压轮询放入不同 callback group，由 MultiThreadedExecutor 并行处理，
+    // 避免阻塞式 Modbus 轮询饿死 /gripper_command 服务回调。
+    service_cb_group_ = this->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+    poll_cb_group_ = this->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
     // 服务
     service_ = this->create_service<GripperCommand>(
       "gripper_command",
       std::bind(&GripperServer::handleCommand, this,
-                std::placeholders::_1, std::placeholders::_2));
+                std::placeholders::_1, std::placeholders::_2),
+      rmw_qos_profile_services_default,
+      service_cb_group_);
 
     // 气压话题 (轮询)
     pressure_pub_ = this->create_publisher<std_msgs::msg::Float32>(
@@ -384,7 +409,8 @@ public:
     auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / rate));
     poll_timer_ = this->create_wall_timer(
       period,
-      std::bind(&GripperServer::pollPressure, this));
+      std::bind(&GripperServer::pollPressure, this),
+      poll_cb_group_);
 
     RCLCPP_INFO(this->get_logger(),
       "抓手控制服务已就绪\n"
@@ -395,12 +421,16 @@ public:
 
 private:
   ModbusTcpClient client_;
+  rclcpp::CallbackGroup::SharedPtr service_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr poll_cb_group_;
   rclcpp::Service<GripperCommand>::SharedPtr service_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pressure_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pressure_info_pub_;
   rclcpp::TimerBase::SharedPtr poll_timer_;
+  std::mutex connect_mutex_;
 
   bool ensureConnected() {
+    std::lock_guard<std::mutex> lock(connect_mutex_);
     if (client_.isConnected()) return true;
     std::string ip = this->get_parameter("device_ip").as_string();
     int port = this->get_parameter("device_port").as_int();
@@ -525,7 +555,14 @@ private:
 int main(int argc, char* argv[]) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<GripperServer>();
-  rclcpp::spin(node);
+
+  // 两条执行线程分别服务 /gripper_command 与气压轮询 callback group，
+  // ModbusTcpClient 内部用 recursive_mutex 串行化 socket 收发。
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), 2);
+  executor.add_node(node);
+  executor.spin();
+
   rclcpp::shutdown();
   return 0;
 }

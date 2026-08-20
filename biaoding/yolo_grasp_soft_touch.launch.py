@@ -186,7 +186,7 @@ def generate_launch_description():
     # ============================================================
     # 3. 柔触三指气动夹爪控制节点（gripper_server，Modbus TCP）
     #    gripper_control 包在本工作区，服务名 /gripper_command。
-    #    独立终端窗口启动：10Hz 气压轮询日志量大，避免刷爆主终端
+    #    独立终端窗口启动：默认 5Hz 气压轮询，Modbus 帧日志已降为 debug。
     # ============================================================
     soft_touch_gripper = ExecuteProcess(
         cmd=[

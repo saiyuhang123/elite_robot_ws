@@ -2,29 +2,28 @@
 """柔触三指气动夹爪控制。
 
 控制通道：/gripper_command 服务（Modbus TCP→ROS 桥接节点 gripper_server）。
-通过 subprocess 调用 ros2 service call。
+使用 rclpy 长驻 client 调用服务，不再每次命令启动 ros2 CLI 子进程，
+避免高 CPU 负载下临时进程创建/DDS 发现被 3 秒超时误杀。
 """
 
-import subprocess
+import threading
 import time
+
 import numpy as np
 from std_msgs.msg import Float32
 
 from .base import GripperBase
 
 
-def _call_gripper(command: int, value: int = 0, slave_id: int = 1,
-                  timeout: float = 3.0) -> bool:
-    """调用 /gripper_command 服务。"""
-    cmd = ["ros2", "service", "call", "/gripper_command",
-           "gripper_control/srv/GripperCommand",
-           f"{{command: {command}, value: {value}, slave_id: {slave_id}}}"]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+# 服务调用超时参数（秒）。CPU 高时服务响应可能变慢，这里留足余量。
+SERVICE_READY_TIMEOUT = 5.0
+CMD_ACK_TIMEOUT = 8.0
+SERVICE_READY_POLL = 0.05
+
+# 张开确认：正压压力低于该值才认为已经松气（防止带压回 Home2）。
+OPEN_RELEASE_PRESSURE_MAX_KPA = 80.0
+OPEN_RELEASE_TIMEOUT = 10.0
+OPEN_RELEASE_POLL = 0.1
 
 
 class SoftTouchGripper(GripperBase):
@@ -52,6 +51,21 @@ class SoftTouchGripper(GripperBase):
         self._pressure_seq = 0
         self._pressure_sub = robot_node.create_subscription(
             Float32, '/gripper_pressure', self._pressure_cb, 10)
+
+        # 柔触命令串行锁（RLock：open/close 整体持锁时内部调用可重入）。
+        self._cmd_lock = threading.RLock()
+
+        # 长驻 rclpy client：创建一次，后续所有命令复用。
+        # srv 类型在这里按需导入，避免未构建 gripper_control 时
+        # 影响二指/灵巧手等其他末端模式的 import。
+        self._gripper_cli = None
+        try:
+            from gripper_control.srv import GripperCommand
+            self._gripper_cli = robot_node.create_client(
+                GripperCommand, '/gripper_command')
+        except Exception as exc:
+            self._node.get_logger().error(
+                f'[{self.name}] /gripper_command 客户端创建失败: {exc}')
 
     def _pressure_cb(self, msg):
         """缓存柔触控制器轮询发布的实际正压值（kPa）。"""
@@ -89,27 +103,157 @@ class SoftTouchGripper(GripperBase):
     def tool_length(self) -> float:
         return self._tip_length
 
+    # ---------------- 长驻 service client 调用 ----------------
+
+    def _wait_service_ready(self, timeout: float = SERVICE_READY_TIMEOUT) -> bool:
+        """等待 /gripper_command 服务上线。后台 MultiThreadedExecutor 在 spin，
+        这里只轮询，不临时启动任何进程。"""
+        if self._gripper_cli is None:
+            self._node.get_logger().error(
+                f'[{self.name}] /gripper_command 客户端不可用')
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self._gripper_cli.service_is_ready():
+                    return True
+            except Exception:
+                pass
+            time.sleep(SERVICE_READY_POLL)
+        self._node.get_logger().error(
+            f'[{self.name}] 等待 /gripper_command 服务超时'
+            f'（{timeout:.1f}s），请确认 gripper_server 已启动')
+        return False
+
+    def _request(self, command: int, value: int = 0, slave_id: int = 1,
+                 timeout: float = CMD_ACK_TIMEOUT):
+        """向 /gripper_command 发送一次请求，返回 Response 或 None。"""
+        if not self._wait_service_ready():
+            return None
+
+        req = GripperCommand.Request()
+        req.command = command
+        req.value = value
+        req.slave_id = slave_id
+
+        try:
+            future = self._gripper_cli.call_async(req)
+        except Exception as exc:
+            self._node.get_logger().error(
+                f'[{self.name}] /gripper_command 请求发送失败: {exc}')
+            return None
+
+        done = threading.Event()
+        future.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout):
+            self._node.get_logger().error(
+                f'[{self.name}] /gripper_command 无应答'
+                f'（command={command}, timeout={timeout:.1f}s）')
+            try:
+                self._gripper_cli.remove_pending_request(future)
+            except Exception:
+                pass
+            return None
+
+        try:
+            res = future.result()
+        except Exception as exc:
+            self._node.get_logger().error(
+                f'[{self.name}] /gripper_command 响应异常: {exc}')
+            return None
+
+        if not res.success:
+            self._node.get_logger().error(
+                f'[{self.name}] /gripper_command 执行失败'
+                f'（command={command}）: {res.message}')
+            return None
+        return res
+
+    def _call_gripper(self, command: int, value: int = 0, slave_id: int = 1,
+                      timeout: float = CMD_ACK_TIMEOUT) -> bool:
+        """调用 /gripper_command 服务。返回服务端 ack 是否成功。"""
+        return self._request(command, value, slave_id, timeout) is not None
+
+    # ---------------- 指令 ----------------
+
     def setup(self):
-        """设置压力参数。"""
-        _call_gripper(4, self._pressure_limit)  # 正压上限
-        _call_gripper(5, self._vacuum_value)     # 负压值
-        self._node.get_logger().info(
-            f"[{self.name}] 压力参数已设置: +{self._pressure_limit}/"
-            f"{self._vacuum_value} kPa")
+        """设置压力参数。返回是否两条参数命令均 ack 成功。"""
+        with self._cmd_lock:
+            ok1 = self._call_gripper(4, self._pressure_limit)  # 正压上限
+            ok2 = self._call_gripper(5, self._vacuum_value)     # 负压值
+            if ok1 and ok2:
+                self._node.get_logger().info(
+                    f'[{self.name}] 压力参数已设置: +{self._pressure_limit}/'
+                    f'{self._vacuum_value} kPa')
+                return True
+            self._node.get_logger().error(
+                f'[{self.name}] 压力参数设置失败，柔触可能未初始化')
+            return False
+
+    def wait_pressure_released(self,
+                               timeout: float = OPEN_RELEASE_TIMEOUT,
+                               max_pressure: float = OPEN_RELEASE_PRESSURE_MAX_KPA) -> bool:
+        """等待实际正压降到 max_pressure 以下（松气确认）。"""
+        deadline = time.time() + timeout
+        last_log = 0.0
+        while time.time() < deadline:
+            now = time.time()
+            value = self._pressure_value
+            fresh = value is not None and now - self._pressure_time <= 1.0
+            if fresh and value <= max_pressure:
+                self._node.get_logger().info(
+                    f'[{self.name}] 已松气（当前 {value:.0f} kPa ≤ '
+                    f'{max_pressure:.0f} kPa）')
+                return True
+            if now - last_log >= 1.0:
+                last_log = now
+                text = (f'{value:.0f} kPa' if fresh else '无新鲜气压数据')
+                self._node.get_logger().info(
+                    f'[{self.name}] 等待正压释放到 {max_pressure:.0f} kPa '
+                    f'以下，当前 {text}')
+            time.sleep(OPEN_RELEASE_POLL)
+        self._node.get_logger().error(
+            f'[{self.name}] 正压未在 {timeout:.0f}s 内释放，'
+            f'禁止后续运动')
+        return False
 
     def open(self):
-        """负压张开（松掉正压，短暂抽负压把手指撑开，再松气）。"""
-        _call_gripper(1)  # 正压松气（防止还保持着闭合压力）
-        _call_gripper(2)  # 启动负压，手指张开
-        time.sleep(0.3)
-        _call_gripper(3)  # 负压松气
-        self._node.get_logger().info(f"[{self.name}] 已张开")
+        """负压张开（松掉正压，短暂抽负压把手指撑开，再松气）。
+
+        返回 True 仅当三条命令均 ack 且 /gripper_pressure 确认正压已释放；
+        否则返回 False，调用方不得继续带压运动。
+        """
+        with self._cmd_lock:
+            ok = True
+            ok &= self._call_gripper(1)  # 正压松气（防止还保持着闭合压力）
+            ok &= self._call_gripper(2)  # 启动负压，手指张开
+            time.sleep(0.3)
+            ok &= self._call_gripper(3)  # 负压松气
+            if not ok:
+                self._node.get_logger().error(f'[{self.name}] 张开命令失败')
+                return False
+            if not self.wait_pressure_released():
+                self._node.get_logger().error(
+                    f'[{self.name}] 张开后未确认松气，按失败处理')
+                return False
+            self._node.get_logger().info(f'[{self.name}] 已张开')
+            return True
 
     def close(self):
-        """正压闭合（手指充气卷曲，保持压力夹住物体）。"""
-        _call_gripper(3)  # 负压松气（防止还保持着张开负压）
-        _call_gripper(0)  # 启动正压，保持不松气
-        self._node.get_logger().info(f"[{self.name}] 已闭合（正压保持）")
+        """正压闭合（手指充气卷曲，保持压力夹住物体）。
+
+        返回 True 表示两条命令均 ack；实际压力是否达标由
+        wait_pressure_ready() 在抓取流程中进一步确认。
+        """
+        with self._cmd_lock:
+            ok = True
+            ok &= self._call_gripper(3)  # 负压松气（防止还保持着张开负压）
+            ok &= self._call_gripper(0)  # 启动正压，保持不松气
+            if not ok:
+                self._node.get_logger().error(f'[{self.name}] 闭合命令失败')
+                return False
+            self._node.get_logger().info(f'[{self.name}] 已闭合（正压保持）')
+            return True
 
     def wait_pressure_ready(self, timeout: float = 20.0,
                             stable_samples: int = 3,
@@ -156,7 +300,7 @@ class SoftTouchGripper(GripperBase):
 
     def validate(self) -> bool:
         """检查服务是否在线。"""
-        ok = _call_gripper(6, timeout=2.0)  # 读正压反馈
+        ok = self._call_gripper(6, timeout=2.0)  # 读正压反馈
         if ok:
             self._node.get_logger().info(f"[{self.name}] 服务在线")
         else:
