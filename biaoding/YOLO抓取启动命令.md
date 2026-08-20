@@ -134,6 +134,10 @@ source ~/Documents/elite_robot_ws/install/setup.bash
 
 ros2 launch ~/Documents/elite_robot_ws/biaoding/yolo_grasp_soft_touch.launch.py
 
+柔触抓取会先在观察位粗定位，再将相机移到目标世界正上方
+进行一次 90° 俯视补拍，用补拍的新坐标抓取。补拍位不可达或
+未获得新检测时，自动沿用第一次坐标；二指和灵巧手不启用该流程。
+
 ## 键盘操作（yolo_grasp.py 终端内）
 
 | 按键 | 作用 |
@@ -280,7 +284,7 @@ ros2 service call /io_and_status_controller/resend_external_script std_srvs/srv/
 | 参数 | linkerhand | two_finger | soft_touch |
 |---|---|---|---|
 | 控制方式 | topic (JointState) | 服务 (serial→ROS) | 服务 (Modbus TCP) |
-| IK 模式 | 6dof | 6dof | 5dof（旋转对称） |
+| IK 模式 | 6dof | 6dof | 6dof（锁定最近的竖直向下姿态） |
 | 抓取姿态 | 法兰面朝世界X+，手心朝下 | 法兰Z朝下，yaw跟随瓶子长轴 | 法兰Z朝下 |
 | tool_length | 0.13 | 0.12 | 0.15 |
 | grasp_offset Z | 0.06（压物调大/抓空调小） | 0.0（对准中心） | 0.02（略高） |

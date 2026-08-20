@@ -93,6 +93,32 @@ def _build_world_axes(v_up):
 
 WORLD_X_IN_BASE, WORLD_Y_IN_BASE, _ = _build_world_axes(V_UP_IN_BASE)
 
+
+def _nearest_vertical_down_rotation(current_rot, v_up=V_UP_IN_BASE):
+    """保留当前法兰水平自转角，只把法兰 Z 轴校正为世界竖直向下。
+
+    柔触观察位姿与默认抓取姿态的自转角可能相差很大；直接使用
+    默认 X/Y 轴会导致腕部不必要地大幅扭转。这里将当前法兰 X 轴
+    投影到与世界竖直方向正交的平面，得到离当前姿态最近的完整向下姿态。
+    """
+    current_rot = np.asarray(current_rot, dtype=float)
+    z = -np.asarray(v_up, dtype=float)
+    z /= np.linalg.norm(z)
+
+    x = current_rot[:, 0] - float(current_rot[:, 0] @ z) * z
+    x_norm = np.linalg.norm(x)
+    if x_norm < 1e-6:
+        # 极端姿态下 X 轴无法投影时，改用当前 Y 轴保留自转角。
+        y = current_rot[:, 1] - float(current_rot[:, 1] @ z) * z
+        y /= np.linalg.norm(y)
+        x = np.cross(y, z)
+    else:
+        x /= x_norm
+    y = np.cross(z, x)
+    y /= np.linalg.norm(y)
+    x = np.cross(y, z)  # 再正交化一次，抑制浮点误差
+    return np.column_stack([x, y, z])
+
 # 预抓取点偏移（世界系，米）：目标点 + 偏移 = 预抓取点
 PRE_GRASP_OFFSET_WORLD = np.array([0.0, 0.0, 0.10])
 
@@ -115,6 +141,7 @@ FORCE_PROJ_HITS = 3          # 投影连续超阈值次数，滤毛刺
 FORCE_APPROACH_H = 0.03      # 快速接近段终点 = 抓取点上方 3cm
 FORCE_DIVE_OVERSHOOT = 0.12   # 下探过冲：力反馈是必须条件，给足竖直搜索深度
                                   # 下探总行程 = FORCE_APPROACH_H + 本值 = 0.15m (15cm)
+SOFT_TOUCH_FORCE_DIVE_TOTAL = 0.20  # 柔触专用下探总行程 20cm
 FORCE_DIVE_STEP = 0.008      # 分段下探步长 8mm（stopl 失效时过冲也不超一步）
 FORCE_DIVE_V = 0.03          # 下探速度 m/s（越慢触力后过冲越小）
 FORCE_APPROACH_THRESHOLD = 20.0   # 快速接近段力保护阈值（N）：movej 加减速惯性
@@ -129,11 +156,16 @@ FORCE_RELIEF_MAX = 0.02       # 卸力累计上抬上限 2cm
 
 # 补拍精定位：首次估计后移动相机到更陡的视角再拍一次，用第二次结果抓取。
 # 相机在臂展允许内尽量抬高（俯角大则检测点高度误差小），光轴对准首次估计点。
-# 2026-08-02 停用：耗时长且副作用多，恢复时改回 True 即可。
+# 通用补拍仍关闭，不改变二指和灵巧手的现有流程。
 RESHOOT_ENABLED = False
+# 柔触专用：第一次只粗定位，相机到目标世界正上方后严格 90° 俯视补拍。
+# 俯视位不可达/没有新检测时，安全沿用第一次坐标。
+SOFT_TOUCH_TOPDOWN_RESHOOT_ENABLED = True
+SOFT_TOUCH_RESHOOT_ELEVATIONS = [90]
 RESHOOT_DIST = 0.40           # 相机到目标的拍照距离（米）
 RESHOOT_ELEVATIONS = [90, 70, 55]  # 俯角候选（度），逐个尝试直到 IK 可达
 RESHOOT_SETTLE = 0.8          # 到位后停稳时间（秒）
+RESHOOT_TARGET_TIMEOUT = 8.0  # 补拍等待新检测（低帧率相机留足余量）
 # 手眼标定文件（与感知节点同一份），用于把相机位姿换算成法兰位姿
 HAND_EYE_JSON = os.path.join(os.path.dirname(__file__), 'hand_eye_result.json')
 
@@ -148,14 +180,18 @@ HANG_RESHOOT_DIST = 0.30   # 悬挂模式补拍距离（米，沿光轴近拍，
 
 # 灵巧手备用观察位姿：预备位姿等待 OBSERVE_WAIT 秒仍检测不到目标时，
 # 转到该观察位姿寻找，检测到目标即停并在该位姿继续抓取。
-# 二指/柔触不使用该位姿，只使用下面的 TWO_FINGER_GROUND_OBSERVE_POSES。
+# 二指/柔触不使用该位姿，只使用各自的地面观察位姿。
 OBSERVE_POSES = [
     [-0.038397, 0.308923, -1.619919, -1.680604, 1.712094, 1.504874],
 ]
-# 二指/柔触夹爪唯一观察/拍照位姿（车前地面瓶子，2026-08-05 实测标定）。
-# two_finger 和 soft_touch 直接从该位姿开始识别并抓取，不再回 READY/OBSERVE 位姿。
+# 二指夹爪唯一观察/拍照位姿（车前地面瓶子，2026-08-05 实测标定）。
 TWO_FINGER_GROUND_OBSERVE_POSES = [
     [-0.041888, -1.021018, -1.664225, -1.188569, 1.586504, 0.022689],
+]
+# 柔触手抓唯一观察/拍照位姿。
+# 关节角（度）: [-2.275, -23.385, -112.752, -73.579, 93.586, 93.073]
+SOFT_TOUCH_GROUND_OBSERVE_POSES = [
+    [-0.039706240, -0.408145246, -1.967893638, -1.284195810, 1.633383834, 1.624430295],
 ]
 # 二指夹爪手指开合方向在法兰系下的轴（'x' 或 'y'）。
 # 抓躺倒瓶子时，该轴会被转到"垂直于瓶子长轴"的水平方向，
@@ -172,7 +208,7 @@ HOME2_JOINTS = [-0.0384, 0.3438, -2.7018, -1.5062, 1.6424, 1.4696]
 # 柔触三指专用 Home2 位（抓取/识别失败后的归位；其他夹爪仍用上面的 HOME2_JOINTS 不变）
 HOME2_JOINTS_SOFT_TOUCH = [-0.038, 0.344, -2.702, -1.083, 1.642, 1.470]
 # 灵巧手抓取预备位姿（也是灵巧手第一个观察位姿）。
-# 二指/柔触不使用该位姿，而是直接使用 TWO_FINGER_GROUND_OBSERVE_POSES。
+# 二指/柔触不使用该位姿，而是直接使用各自的地面观察位姿。
 READY_JOINTS = [-0.0384, 0.4503, -2.702, -0.525, 1.6424, 1.634]
 SHOULDER_Z = 0.1625
 ARM_REACH = 0.92
@@ -427,7 +463,7 @@ class YoloGrasp:
           - 力变化在接触方向上的投影 > proj_threshold 连续 FORCE_PROJ_HITS 次
             （软接触判据；contact_dir_flange 为接触力方向在法兰系
             下的单位向量，None 则关闭投影判据）
-        joint_space=True（two_finger 地面抓取）：每步用 IK+movej，
+        joint_space=True（two_finger/soft_touch 地面抓取）：每步用 IK+movej，
         不经过控制器 movel 的笛卡尔插补。
         返回 True=触力停止，False=走满行程未触力，None=出错。"""
         base = self._force_baseline()
@@ -503,11 +539,26 @@ class YoloGrasp:
                                 max_lift=FORCE_RELIEF_MAX,
                                 joint_space=False):
         """闭合夹爪（攥紧段），闭合过程中监测挤压力（模长），超阈值就上抬
-        一小段卸力。防止收拢时挤压物体导致力控报警。返回累计上抬量（米）。"""
+        一小段卸力。防止收拢时挤压物体导致力控报警。返回累计上抬量（米）；
+        柔触实际正压未达到设定值时返回 None，且不执行任何上抬。"""
         base = self._force_baseline(0.3)
         self.gripper.close()
         lifted = 0.0
-        t_end = time.time() + self.gripper.close_delay
+        if self.gripper.name == 'soft_touch':
+            lower = (self.gripper.pressure_limit
+                     - self.gripper.pressure_tolerance)
+            upper = (self.gripper.pressure_limit
+                     + self.gripper.pressure_tolerance)
+            print(f"   [柔触] 保持当前位姿，等待实际正压进入 "
+                  f"{lower:.0f}~{upper:.0f} kPa...")
+            if not self.gripper.wait_pressure_ready():
+                print("   !! 柔触正压未达标，禁止上抬")
+                return None
+            # 实际正压达标后，才允许原有卸力逻辑产生上抬。
+            t_end = time.time() + 0.5
+        else:
+            # 二指/灵巧手保持原有 close_delay 逻辑不变。
+            t_end = time.time() + self.gripper.close_delay
         while time.time() < t_end:
             if base is not None and self.latest_force is not None \
                     and lifted < max_lift:
@@ -543,7 +594,7 @@ class YoloGrasp:
     def send_movej_to_pose(self, pos, rot, a, v, label=""):
         """IK 解算并 movej 到目标法兰位姿（关节空间）。
 
-        二指地面抓取专用：不用控制器的 movel 笛卡尔插补，而是每一小步
+        二指/柔触地面抓取使用：不用控制器的 movel 笛卡尔插补，而是每一小步
         都本地 IK 成关节角再 movej，从根本上避开 movel 在该低位姿上的
         笛卡尔 IK 翻转/扭动问题（旧版 visual_grasp_test.py 全程 movej
         是正常的）。
@@ -581,7 +632,7 @@ class YoloGrasp:
                               joint_space=False, rot=None):
         """保持当前物理法兰姿态平移到位。
 
-        joint_space=True（two_finger 地面抓取）时走 IK+movej 小步，
+        joint_space=True（two_finger/soft_touch 地面抓取）时走 IK+movej 小步，
         rot 可显式传入目标旋转矩阵（默认为当前关节角的 FK）。
         其他夹爪保持原 movel 行为不变。
         """
@@ -721,7 +772,7 @@ class YoloGrasp:
               f"夹爪开合轴(法兰{TWO_FINGER_PINCH_AXIS.upper()})垂直瓶身")
         return np.column_stack([x, y, z])
 
-    def _plan_reshoot_pose(self, obj):
+    def _plan_reshoot_pose(self, obj, elevations=None):
         """规划补拍关节角，按抓取模式生成候选相机位姿，逐个试 IK：
         table   - 相机在目标上方尽量陡（俯角候选自动降级），修正视角滑动；
         hanging - 相机在目标世界 X- 侧，光轴沿 X+ 平视近拍（挂果高，
@@ -751,13 +802,15 @@ class YoloGrasp:
             T_cam[:3, 3] = obj - HANG_RESHOOT_DIST * z
             candidates.append(('原位姿态近拍', T_cam))
         else:
+            elevations = (RESHOOT_ELEVATIONS if elevations is None
+                          else elevations)
             # 水平方向取"目标指向当前相机一侧"：移动量小、臂展压力小
             h = np.array(tcp[0]) - obj
             h = h - (h @ V_UP_IN_BASE) * V_UP_IN_BASE
             if np.linalg.norm(h) < 1e-3:
                 h = WORLD_X_IN_BASE.copy()
             h = h / np.linalg.norm(h)
-            for el in RESHOOT_ELEVATIONS:
+            for el in elevations:
                 elr = math.radians(el)
                 cam_pos = obj + RESHOOT_DIST * (
                     math.sin(elr) * V_UP_IN_BASE + math.cos(elr) * h)
@@ -793,27 +846,41 @@ class YoloGrasp:
             return joints
         return None
 
-    def _reshoot_refine(self, obj):
+    def _reshoot_refine(self, obj, elevations=None):
         """移动到补拍位姿重新检测目标。成功返回新目标点，失败返回 None
         （调用方退回用首次估计，流程不死）。移动过机械臂时置
         self._reshoot_moved，调用方负责抓前回预备位姿。"""
         self._reshoot_moved = False
-        joints = self._plan_reshoot_pose(obj)
+        joints = self._plan_reshoot_pose(obj, elevations=elevations)
         if joints is None:
             print("   [补拍] 所有俯角候选不可达，沿用首次估计")
+            return None
+        # 移动过程暂停感知；到位后重新开启时，感知节点会记录
+        # 当前深度帧时间戳，从而只接受补拍位停稳后新到的帧。
+        # 否则低帧率相机的运动中帧可能在清空目标后才完成推理，
+        # 被误当成第二次精定位。
+        if not self._set_perception(False):
+            print("   [补拍] 无法暂停感知，为避免使用运动中旧帧，沿用首次估计")
             return None
         print("   [补拍] 移动到补拍位姿...")
         self._reshoot_moved = True
         self.send_movej(joints)
         if not self.wait_motion_done():
             print("   [补拍] 移动超时，沿用首次估计")
+            self._set_perception(True)
             return None
         time.sleep(RESHOOT_SETTLE)
-        # 等补拍位姿下的新检测帧
+        # 等补拍位姿下的新检测帧。先清空本地缓存，再重新开启
+        # 感知，避免任何首拍/运动中结果混入。
         self.latest_target = None
         self.latest_target_quat = None
+        self.latest_target_time = 0.0
+        if not self._set_perception(True):
+            print("   [补拍] 到位后无法重新开启感知，沿用首次估计")
+            return None
         start = time.time()
-        while self.latest_target is None and time.time() - start < 3.0:
+        while (self.latest_target is None
+               and time.time() - start < RESHOOT_TARGET_TIMEOUT):
             time.sleep(0.05)
         if self.latest_target is None:
             print("   [补拍] 补拍位姿下未检测到目标，沿用首次估计")
@@ -926,21 +993,23 @@ class YoloGrasp:
     def _observe_pose(self):
         """当前夹爪的初始观察位姿。
 
-        二指/柔触只使用地面拍照位姿 TWO_FINGER_GROUND_OBSERVE_POSES；
+        二指/柔触各自使用自己的地面拍照位姿；
         灵巧手仍使用 READY_JOINTS 作为预备/第一个观察位姿。
         """
-        if self.gripper.name in ('two_finger', 'soft_touch'):
+        if self.gripper.name == 'soft_touch':
+            return list(SOFT_TOUCH_GROUND_OBSERVE_POSES[0])
+        if self.gripper.name == 'two_finger':
             return list(TWO_FINGER_GROUND_OBSERVE_POSES[0])
         return list(READY_JOINTS)
 
     def _search_observe_poses(self, backend='yolo'):
         """灵巧手: 预备位姿检测不到时依次转备用观察位姿。
 
-        二指/柔触只有 TWO_FINGER_GROUND_OBSERVE_POSES 一个观察位姿，
-        且 grasp() 已直接到达该位姿，所以这里不再移动。
+        二指/柔触各自只有一个地面观察位姿，且 grasp() 已直接
+        到达对应位姿，所以这里不再移动。
         """
         if self.gripper.name in ('two_finger', 'soft_touch'):
-            print("   [观察] 二指/柔触仅使用地面拍照位姿，无其他备用观察位姿")
+            print("   [观察] 二指/柔触仅使用各自的地面拍照位姿，无其他备用观察位姿")
             return
         poses = list(OBSERVE_POSES)
         for i, pose in enumerate(poses):
@@ -968,6 +1037,7 @@ class YoloGrasp:
         示教放置位等待 /place；灵巧手则回 Home2 后自动松手。
         返回 (成功与否, 结果描述)。"""
         backend = self._get_backend()
+        self._suppress_auto_home = False
         print(f"   当前识别后端: {backend}")
 
         # 0. 先到当前夹爪的观察位姿
@@ -1012,6 +1082,12 @@ class YoloGrasp:
             # 目标已锁存（或抓取失败），关闭识别省算力
             self._set_perception(False)
 
+        # 柔触正压未达标时，禁止自动上抬/回 Home2；保持当前位姿
+        # 并返回失败，等待人工检查气路和压力反馈。
+        if self._suppress_auto_home:
+            print("   !! 安全保持：柔触正压未达标，机械臂不上抬、不归位")
+            return ok, msg
+
         # 二指 grasp_hold：直接去示教放置位（跳过 Home2），等 place 张开。
         # 灵巧手 grasp_hold：导航抓取后回 Home2 并松手，不执行放置动作。
         # 抓取失败或单机 grasp：同样先收拢到 Home2。
@@ -1053,10 +1129,18 @@ class YoloGrasp:
             return False, "无目标"
         print(f"1. 目标点(基座系): [{obj[0]:.4f}, {obj[1]:.4f}, {obj[2]:.4f}]")
 
-        # 1.5 补拍精定位（仅桌面模式）：移动到更陡的视角重拍一次，
-        # 修正"检测点随视角在物体表面滑动"导致的高度/水平偏差
-        if RESHOOT_ENABLED and GRASP_MODE != 'hanging':
-            new_obj = self._reshoot_refine(obj)
+        # 1.5 补拍精定位（仅桌面模式）。柔触始终只尝试 90°
+        # 世界正上方俯视补拍，修正倾斜观察时圆形物体表面点的水平偏差；
+        # 通用补拍开关仍默认关闭，因此二指/灵巧手流程不变。
+        reshoot_elevations = None
+        if (gripper.name == 'soft_touch'
+                and SOFT_TOUCH_TOPDOWN_RESHOOT_ENABLED):
+            reshoot_elevations = SOFT_TOUCH_RESHOOT_ELEVATIONS
+        elif RESHOOT_ENABLED:
+            reshoot_elevations = RESHOOT_ELEVATIONS
+        if reshoot_elevations is not None and GRASP_MODE != 'hanging':
+            new_obj = self._reshoot_refine(
+                obj, elevations=reshoot_elevations)
             if new_obj is not None:
                 obj = new_obj
                 print(f"1'. 精定位目标点(基座系): [{obj[0]:.4f}, "
@@ -1071,9 +1155,9 @@ class YoloGrasp:
         if GRASP_MODE == 'hanging':
             return self._grasp_hanging(obj)
 
-        # 二指：快速接近段带 10N 力保护——从拍照结束下探开始监控，
+        # 二指/柔触：快速接近段带 10N 力保护——从拍照结束下探开始监控，
         # 超过阈值说明位置不对，立即停止→收回预抓取点→重拍→重试（最多2次）。
-        # 其余夹爪保持原逻辑；慢速力控下探段不变。
+        # 灵巧手保持原逻辑；慢速力控下探段不变。
         approach_retries = FORCE_APPROACH_RETRIES
         while True:
             # 1. 抓取点 = 目标点 + 夹爪定义的偏移
@@ -1118,6 +1202,21 @@ class YoloGrasp:
                     else:
                         print(f"   [诊断] 无瓶子朝向且法兰Z与竖直差 "
                               f"{z_angle:.1f}°，回退默认朝下姿态")
+            elif gripper.name == 'soft_touch':
+                q_now = self.robot.get_joint_positions()
+                if q_now is None:
+                    print("   !! 无法读取当前关节角，不能安全生成柔触向下姿态")
+                    return False, "无法读取当前关节角"
+                _, R_now = cs66_forward_kinematics(q_now)
+                grasp_rot = _nearest_vertical_down_rotation(R_now)
+                down = -V_UP_IN_BASE / np.linalg.norm(V_UP_IN_BASE)
+                z_angle = math.degrees(math.acos(np.clip(
+                    R_now[:, 2] @ down, -1.0, 1.0)))
+                correction = math.degrees(float(
+                    Rot.from_matrix(R_now.T @ grasp_rot).magnitude()))
+                print(f"   [柔触姿态] 保留观察位自转角，"
+                      f"法兰Z校正为竖直向下 "
+                      f"(原偏差 {z_angle:.1f}°，最小校正 {correction:.1f}°)")
             tool_dir = grasp_rot[:, 2]   # 法兰 Z 轴 = 工具伸出方向
             L = gripper.tool_length
             print(f"   [诊断] 法兰Z轴: {np.round(tool_dir, 3)}  "
@@ -1175,9 +1274,9 @@ class YoloGrasp:
             if not self.wait_motion_done():
                 print("   !! 运动超时，放弃")
                 return False, "movej 运动超时"
-            # 二指地面抓取：控制器 movel 在这个低位姿会出现笛卡尔 IK 翻转，
+            # 二指/柔触地面抓取：控制器 movel 在这个低位姿会出现笛卡尔 IK 翻转，
             # 下降/上抬/退回全部改走 IK+movej 关节空间小步（旧版全程 movej 正常）。
-            joint_space = (gripper.name == 'two_finger')
+            joint_space = (gripper.name in ('two_finger', 'soft_touch'))
 
             self.spin(5)
             actual_tcp = self.robot.get_tcp_pose()
@@ -1186,7 +1285,7 @@ class YoloGrasp:
                 print(f"   [诊断] movej 后偏差: {tcp_err*1000:.1f}mm")
 
             # 4. 下降：先快速接近到抓取点上方，再慢速力控下探（触力即停）。
-            #    two_finger 走 IK+movej 关节空间；其余夹爪保持原 movel。
+            #    two_finger/soft_touch 走 IK+movej；其余夹爪保持原 movel。
             reach_flange = grasp_tip - L * tool_dir
             approach_tip = grasp_tip + FORCE_APPROACH_H * V_UP_IN_BASE
             approach_flange = approach_tip - L * tool_dir
@@ -1197,7 +1296,7 @@ class YoloGrasp:
                   f"{FORCE_APPROACH_H*100:.0f}cm）...")
 
             if joint_space:
-                # 二指：快速接近带力监控（10N），期间触力即停
+                # 二指/柔触：快速接近带力监控（10N），期间触力即停
                 base = self._force_baseline()
                 if base is None:
                     return False, "力传感器无数据"
@@ -1260,8 +1359,11 @@ class YoloGrasp:
         contact_dir_flange /= np.linalg.norm(contact_dir_flange)
 
         # 慢速力控下探：只下探一次，触力即进入闭合流程
+        dive_total = (SOFT_TOUCH_FORCE_DIVE_TOTAL
+                      if gripper.name == 'soft_touch'
+                      else FORCE_APPROACH_H + FORCE_DIVE_OVERSHOOT)
         contact = self.force_guided_descend(
-            -V_UP_IN_BASE, FORCE_APPROACH_H + FORCE_DIVE_OVERSHOOT,
+            -V_UP_IN_BASE, dive_total,
             contact_dir_flange=contact_dir_flange,
             joint_space=joint_space)
         if contact is None:
@@ -1296,7 +1398,12 @@ class YoloGrasp:
 
         # 5. 闭合（一次性攥紧，带力控卸力兜底）
         print(f"7. 闭合 [{gripper.name}]...")
-        self.close_with_force_relief(V_UP_IN_BASE, joint_space=joint_space)
+        close_lifted = self.close_with_force_relief(
+            V_UP_IN_BASE, joint_space=joint_space)
+        if close_lifted is None:
+            self._suppress_auto_home = True
+            return False, (f"柔触正压未达到 "
+                           f"{gripper.pressure_limit:.0f} kPa，已保持当前位姿")
 
         # 5'. 空夹检测：闭合停稳后开口度≈全闭 = 没夹到，退回放弃
         #     （读不到开口度的夹爪 is_grasping 恒真，不影响原流程）

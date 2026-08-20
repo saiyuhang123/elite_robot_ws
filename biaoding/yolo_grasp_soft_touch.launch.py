@@ -217,7 +217,7 @@ def generate_launch_description():
 
     yolo_perception = ExecuteProcess(
         cmd=["python3", yolo_perception_script,
-             "--target-class", "bottle",
+             "--target-class", "apple",
              "--mode", "two_finger"],
         cwd=yolo_dir,
         output="screen",
@@ -236,7 +236,7 @@ def generate_launch_description():
 
     grasp_cmd = (
         f"cd {grasp_main_dir} && python3 {grasp_main_script} "
-        f"--gripper soft_touch --target-class bottle"
+        f"--gripper soft_touch --target-class apple"
     )
     if grasp_headless == "true":
         grasp_cmd += " --headless"
