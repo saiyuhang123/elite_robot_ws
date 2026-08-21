@@ -52,11 +52,13 @@ namespace elite_robot {
           force_mode_max_axial_deviation_ = this->declare_parameter<double>("force_mode_max_axial_deviation", 0.040);
           force_mode_monitor_log_period_ = this->declare_parameter<double>("force_mode_monitor_log_period", 1.0);
           force_mode_abort_fz_ = this->declare_parameter<double>("force_mode_abort_fz", -15.0);
-          force_mode_hard_abort_fz_ = this->declare_parameter<double>("force_mode_hard_abort_fz", -15.0);
+          // 2026-08-21 放宽: 硬保护 -15→-18N/0.03→0.05s, 平均过力确认 0.12→0.5s
+          // (容忍力控回拉期间的瞬时爬升; 快速过力事件仍由硬保护兜底)。
+          force_mode_hard_abort_fz_ = this->declare_parameter<double>("force_mode_hard_abort_fz", -18.0);
           force_mode_hard_abort_confirm_time_ = this->declare_parameter<double>(
-            "force_mode_hard_abort_confirm_time", 0.03);
+            "force_mode_hard_abort_confirm_time", 0.05);
           force_mode_abort_confirm_time_ = this->declare_parameter<double>(
-            "force_mode_abort_confirm_time", 0.12);
+            "force_mode_abort_confirm_time", 0.5);
           // 2026-08-02: 侧向力保护。两次停摆六维力显示侧向Fx/Fy(10~15N)先于Fz失控，
           // 平均侧向合力持续超阈值即按同一流程退出，比等Fz耦合超限更早、损伤更小。
           force_mode_abort_lateral_f_ = this->declare_parameter<double>("force_mode_abort_lateral_f", 35.0);
@@ -75,8 +77,8 @@ namespace elite_robot {
           orient_adapt_max_rate_ = this->declare_parameter<double>("orient_adapt_max_rate", 0.009);
           // 2026-08-02: 进给门控。过载暂停推进轨迹索引, 消除尖峰后"压着走"的二次爬升。
           feed_gate_enabled_ = this->declare_parameter<bool>("feed_gate_enabled", true);
-          feed_gate_fz_ = this->declare_parameter<double>("feed_gate_fz", -5.5);
-          feed_gate_timeout_ = this->declare_parameter<double>("feed_gate_timeout", 3.0);
+          feed_gate_fz_ = this->declare_parameter<double>("feed_gate_fz", -8.0);
+          feed_gate_timeout_ = this->declare_parameter<double>("feed_gate_timeout", 5.0);
           // 2026-08-02: 405 退刀前等 endForceMode 响应并静置, 等驱动侧控制器完成切换。
           retract_disable_settle_time_ = this->declare_parameter<double>("retract_disable_settle_time", 1.0);
           force_mode_min_contact_fz_ = this->declare_parameter<double>("force_mode_min_contact_fz", -0.08);

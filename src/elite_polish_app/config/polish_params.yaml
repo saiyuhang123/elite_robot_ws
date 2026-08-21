@@ -81,9 +81,10 @@ ysURForceAppControl:
     # 把打磨头"压着走"造成二次爬升(历次 averaged_overforce 停摆的直接死因)。
     # 过载即暂停推进、目标保持当前点，等z向力控拉回带内再走；超时按正常流程退出。
     feed_gate_enabled: true
-    feed_gate_fz: -5.5               # 20帧平均力过载阈值(N)，需高于 force_mode_abort_fz(-15)的绝对值低侧
-                                     # 门控仍先于退出线介入
-    feed_gate_timeout: 3.0           # 门控最长持续(s)，防产线悬死
+    # 2026-08-21 放宽: -5.5→-8.0、超时 3→5s，减少振动/扰动造成的门控频繁介入与超时退出。
+    # 仍是软门控(只暂停进给)，幅值远在 force_mode_abort_fz(-15) 之下，门控仍先于退出线介入。
+    feed_gate_fz: -8.0               # 20帧平均力过载阈值(N)
+    feed_gate_timeout: 5.0           # 门控最长持续(s)，防产线悬死
     # startForceMode返回只表示socket写入成功；实测力稳定到目标附近后才开始切向运动。
     force_mode_sensor_target_fz: 0.0  # 应用层力控建立验证中心值(N)
     force_mode_verify_tolerance: 7.0  # 验证范围为 -7～+7N
@@ -93,9 +94,11 @@ ysURForceAppControl:
     force_mode_max_axial_deviation: 0.040 # 实际TCP相对接触偏置后名义路径的最大轴向偏移(m)
     force_mode_monitor_log_period: 1.0    # 每秒输出实际力和轴向补偿，确认第二行反向时是否回落
     force_mode_abort_fz: -15.0       # 20帧平均反作用力的持续过力阈值(N); 绝对值15N
-    force_mode_hard_abort_fz: -15.0  # 单帧瞬时硬保护阈值(N)
-    force_mode_hard_abort_confirm_time: 0.03 # 硬过力需持续多久才退出(s)；拒绝打磨振动/噪声的单帧尖峰
-    force_mode_abort_confirm_time: 0.12 # 平均力越过-15N需要持续的时间(s)
+    # 2026-08-21 放宽: 硬保护 -15→-18N/0.03→0.05s，平均过力确认 0.12→0.5s，
+    # 容忍力控 4mm/s 回拉期间的瞬时爬升；快速过力事件仍由硬保护兜底。
+    force_mode_hard_abort_fz: -18.0  # 单帧瞬时硬保护阈值(N)
+    force_mode_hard_abort_confirm_time: 0.05 # 硬过力需持续多久才退出(s)；拒绝打磨振动/噪声的单帧尖峰
+    force_mode_abort_confirm_time: 0.5  # 平均力越过-15N需要持续的时间(s)
     # 2026-08-02: 侧向力保护通道。侧向拖曳(法向不对齐/刮边)的Fx/Fy通常先于Fz失控，
     # 等Fz耦合超-5N时打磨头已别得很紧；平均侧向合力超阈值即提前按同一流程退出。
     # 判定用预备姿态去皮后的相对值(与fz同源采样)：重力模型残差实测5~10N，绝对值会误触发。

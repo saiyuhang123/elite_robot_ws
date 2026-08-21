@@ -191,9 +191,9 @@ namespace elite_robot {
             double force_mode_monitor_log_period_ = 1.0;//404 力/轴向补偿监控日志周期(s)
             std::chrono::steady_clock::time_point force_mode_monitor_last_log_;
             double force_mode_abort_fz_ = -15.0;//平均相对力超过此负值持续确认后退出(N); 绝对值15N
-            double force_mode_hard_abort_fz_ = -15.0;//单帧相对力硬保护阈值(N)
-            double force_mode_hard_abort_confirm_time_ = 0.03;//硬过力需持续多久才退出(s)，拒绝单帧尖峰
-            double force_mode_abort_confirm_time_ = 0.12;//平均过力持续确认时间(s)
+            double force_mode_hard_abort_fz_ = -18.0;//单帧相对力硬保护阈值(N); 2026-08-21 -15→-18
+            double force_mode_hard_abort_confirm_time_ = 0.05;//硬过力需持续多久才退出(s)，拒绝单帧尖峰
+            double force_mode_abort_confirm_time_ = 0.5;//平均过力持续确认时间(s); 2026-08-21 0.12→0.5
             bool force_mode_overforce_active_ = false;
             std::chrono::steady_clock::time_point force_mode_overforce_start_;
             bool force_mode_hard_overforce_active_ = false;
@@ -216,8 +216,8 @@ namespace elite_robot {
             // 2026-08-02 进给门控: 过载(20帧平均力<=feed_gate_fz)暂停推进轨迹索引,
             // 目标保持当前点等z向力控拉回, 消除尖峰后"压着走"的二次爬升。
             bool feed_gate_enabled_ = true;
-            double feed_gate_fz_ = -5.5;            // 过载判定阈值(N), 需高于-15N平均退出线
-            double feed_gate_timeout_ = 3.0;        // 门控最长持续(s), 超时按正常流程退出
+            double feed_gate_fz_ = -8.0;            // 过载判定阈值(N), 需高于-15N平均退出线; 2026-08-21 -5.5→-8
+            double feed_gate_timeout_ = 5.0;        // 门控最长持续(s), 超时按正常流程退出
             int feed_gate_hold_count_ = 0;
             std::chrono::steady_clock::time_point feed_gate_hold_start_;
             int last_polish_step_ = 0;              // 当前打磨轨迹步数(0=切向未开始)，过力诊断用
