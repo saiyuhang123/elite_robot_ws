@@ -31,8 +31,9 @@
   （二指/柔触直接到地面拍照位姿；灵巧手到预备位姿）→ 开启按需识别
   （/yolo_perception/set_enabled）→ 只用停稳后的新帧锁存目标 →
   关闭识别 → 抓取；失败时收拢到 Home2。
-  调 /yolo_grasp/grasp_hold：抓取成功夹住后直接去示教放置位
-  （跳过 Home2），等 /yolo_grasp/place 张开放下。
+  调 /yolo_grasp/grasp_hold：抓取成功后保持夹持。二指直接去示教
+  放置位等待；柔触/灵巧手先收回 Home2，等到放置点再由
+  /yolo_grasp/place 张开放下。
   response.success/message 为真实结果。
   调 /yolo_grasp/place（Trigger）执行放置：movej 到示教放置位姿
   （按 j 示教，存 place_pose.json）→ 张手放下 → 退回 Home2。
@@ -348,7 +349,7 @@ class YoloGrasp:
         """调度抓取入口。
 
         二指抓取后保持夹持并去示教放置位，等待调度器调用 place；
-        灵巧手抓取后回 Home2 并松手，不执行放置动作。
+        柔触和灵巧手抓取后保持夹持并回 Home2，到放置点后再调用 place。
         """
         self.robot.get_logger().info('[服务] 收到抓取保持指令 (grasp_hold)')
         ok, msg = self.grasp(release_after=False)
@@ -576,7 +577,8 @@ class YoloGrasp:
             # 二指/灵巧手保持原有 close_delay 逻辑不变。
             t_end = time.time() + self.gripper.close_delay
         while time.time() < t_end:
-            if base is not None and self.latest_force is not None \
+            if self.gripper.name != 'linkerhand' \
+                    and base is not None and self.latest_force is not None \
                     and lifted < max_lift:
                 df = float(np.linalg.norm(self.latest_force - base))
                 if df > threshold:
@@ -1050,7 +1052,8 @@ class YoloGrasp:
         → 锁存目标后关闭识别 → 抓取；
         release_after=True 时抓取成功归位（Home2）后自动松开机械手（单机调试用）；
         release_after=False（/yolo_grasp/grasp_hold）时，二指抓取成功后直接去
-        示教放置位等待 /place；灵巧手则回 Home2 后自动松手。
+        示教放置位等待 /place；柔触和灵巧手保持夹持并回 Home2，等到放置点
+        再调用 /place。
         返回 (成功与否, 结果描述)。"""
         backend = self._get_backend()
         self._suppress_auto_home = False
@@ -1105,10 +1108,11 @@ class YoloGrasp:
             return ok, msg
 
         # 二指 grasp_hold：直接去示教放置位（跳过 Home2），等 place 张开。
-        # 灵巧手 grasp_hold：导航抓取后回 Home2 并松手，不执行放置动作。
+        # 柔触/灵巧手 grasp_hold：抓取后保持夹持并回 Home2，等到放置点
+        # 再由 place 移到示教放置位、松爪并重新收回 Home2。
         # 抓取失败或单机 grasp：同样先收拢到 Home2。
         if (ok and not release_after
-                and self.gripper.name != 'linkerhand'
+                and self.gripper.name == 'two_finger'
                 and self.place_joints is not None):
             print("   [归位] 抓取成功，直接去示教放置位...")
             self.send_movej(self.place_joints)
@@ -1119,7 +1123,7 @@ class YoloGrasp:
             self.home2()
 
         # 抓取成功且已归位后，按调用方式决定是否松开机械手
-        if ok and (release_after ):  #or self.gripper.name == 'linkerhand'
+        if ok and release_after:
             print("   [归位] 抓取成功，松开机械手...")
             open_result = self.gripper.open()
             if open_result is False:
@@ -1400,12 +1404,14 @@ class YoloGrasp:
             self.wait_motion_done()
             return False, "未触到物体（抓空）"
 
-        # 触到力后上抬卸掉接触力，再进入闭合流程
-        print(f"   [力控] 触力到位，上抬 {LIFT_BEFORE_CLOSE*1000:.0f}mm 再闭合...")
+        # 灵巧手闭手前上抬 3mm，其他末端保持原来的上抬量。
+        lift_before_close = (0.003 if gripper.name == 'linkerhand'
+                             else LIFT_BEFORE_CLOSE)
+        print(f"   [力控] 触力到位，上抬 {lift_before_close*1000:.0f}mm 再闭合...")
         tcp = self.robot.get_tcp_pose()
         if tcp is None:
             return False, "无法读取当前位姿"
-        lift_flange = np.array(tcp[0]) + LIFT_BEFORE_CLOSE * V_UP_IN_BASE
+        lift_flange = np.array(tcp[0]) + lift_before_close * V_UP_IN_BASE
         if joint_space:
             ok = self.move_keep_orientation(lift_flange, a=0.3, v=0.05,
                                             joint_space=True, rot=grasp_rot)

@@ -2,6 +2,7 @@
 """LinkerHand O6 灵巧手控制。"""
 
 import json
+import time
 import numpy as np
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
@@ -14,11 +15,14 @@ class LinkerHandGripper(GripperBase):
 
     控制通道:
       - /cb_right_hand_control_cmd   (JointState, 0~255)
-      - /cb_right_hand_setting_cmd   (String, JSON)
+      - /cb_hand_setting_cmd         (String, JSON，SDK 的公共设置入口)
+      - /cb_right_hand_state         (JointState，SDK/CAN 实时状态)
     """
 
+    HAND_TYPE = "right"
     HAND_CMD_TOPIC = "/cb_right_hand_control_cmd"
-    HAND_SETTING_TOPIC = "/cb_right_hand_setting_cmd"
+    HAND_SETTING_TOPIC = "/cb_hand_setting_cmd"
+    HAND_STATE_TOPIC = "/cb_right_hand_state"
 
     # 关节顺序: [大拇指弯曲, 大拇指横摆, 食指, 中指, 无名指, 小拇指]
     HAND_OPEN_POSE = [255.0] * 6                    # 五指张开
@@ -29,10 +33,13 @@ class LinkerHandGripper(GripperBase):
         self._node = robot_node
         self._speed = speed
         self._torque = torque
+        self._last_state_at = 0.0
         self._hand_pub = robot_node.create_publisher(
             JointState, self.HAND_CMD_TOPIC, 10)
         self._setting_pub = robot_node.create_publisher(
             String, self.HAND_SETTING_TOPIC, 10)
+        self._state_sub = robot_node.create_subscription(
+            JointState, self.HAND_STATE_TOPIC, self._on_hand_state, 10)
 
     def default_grasp_rotation(self, v_up_in_base):
         return None  # 灵巧手必须手动示教，不能自动构造
@@ -60,6 +67,11 @@ class LinkerHandGripper(GripperBase):
         return "6dof"  # 手心朝向重要 
 
     @property
+    def close_delay(self) -> float:
+        """闭合后等待手指抓稳，再允许机械臂上抬。"""
+        return 4.0
+
+    @property
     def grasp_offset_world(self) -> np.ndarray:
         # 掌心 Z 偏移（相对 YOLO 检测到的物体上表面）。
         # 手水平伸出、手心朝下姿态下，握拳后指尖会低于手心平面，
@@ -71,11 +83,18 @@ class LinkerHandGripper(GripperBase):
         return 0.13
 
     def setup(self):
-        for cmd, params in (("set_speed", {"speed": [self._speed] * 6}),
-                            ("set_torque", {"torque": [self._torque] * 6})):
+        # 当前 LinkerHand SDK 的设置入口要求 params.hand_type，并使用
+        # set_max_torque_limits 作为扭矩命令名。
+        for cmd, values in (
+                ("set_speed", {"speed": [self._speed] * 6}),
+                ("set_max_torque_limits",
+                 {"torque": [self._torque] * 6})):
             msg = String()
+            params = {"hand_type": self.HAND_TYPE}
+            params.update(values)
             msg.data = json.dumps({"setting_cmd": cmd, "params": params})
             self._setting_pub.publish(msg)
+        return True
 
     def open(self):
         self._publish_positions(self.HAND_OPEN_POSE)
@@ -93,7 +112,12 @@ class LinkerHandGripper(GripperBase):
         msg.position = [float(p) for p in positions]
         self._hand_pub.publish(msg)
 
+    def _on_hand_state(self, _msg):
+        self._last_state_at = time.monotonic()
+
     def validate(self) -> bool:
-        """检查 SDK 是否在运行（topic 是否有发布者）。"""
-        # 简单检查：topic 存在即可（不要求一定有发布者，因为可能还没连接）
-        return True
+        """命令有 SDK 接收且持续收到状态帧，才认为 SDK/CAN 已就绪。"""
+        state_age = time.monotonic() - self._last_state_at
+        return (self._node.count_subscribers(self.HAND_CMD_TOPIC) > 0
+                and self._last_state_at > 0.0
+                and state_age <= 3.0)
